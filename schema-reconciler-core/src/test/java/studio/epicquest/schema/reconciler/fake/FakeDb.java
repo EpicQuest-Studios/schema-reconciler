@@ -31,12 +31,12 @@ import studio.epicquest.schema.reconciler.model.SchemaObject;
  * tests without a real database. The fake understands a minimal DDL language:
  *
  * <pre>
- *   CREATE &lt;KIND&gt; &lt;parent.&gt;?&lt;name&gt; [REQUIRES &lt;KIND&gt;:&lt;name&gt;,...] [DEF &lt;canonical&gt;]
+ *   CREATE &lt;KIND&gt; &lt;parent.&gt;?&lt;name&gt; [REQUIRES &lt;KIND&gt;:&lt;name&gt;,...] [COMPARED] [DEF &lt;canonical&gt;]
  *   DROP   &lt;KIND&gt; &lt;parent.&gt;?&lt;name&gt;
  *   ALTER  &lt;KIND&gt; &lt;parent.&gt;?&lt;name&gt; DEF &lt;canonical&gt;
  * </pre>
  *
- * A {@code CREATE} stores a {@link SchemaObject} whose canonical definition is
+ * {@code COMPARED} sets the content-compared attribute (spec 5.4). A {@code CREATE} stores a {@link SchemaObject} whose canonical definition is
  * the {@code DEF} token (empty when absent); {@code ALTER} replaces it.
  * Transactions copy the committed state on first write and merge on commit.
  */
@@ -153,7 +153,11 @@ public final class FakeDb {
                 }
                 final var parsed = parseTail(tokens, 3);
                 objects.put(id, new SchemaObject(id,
-                        new Definition(parsed.def.orElse("")), parsed.requires, Map.of()));
+                        new Definition(parsed.def.orElse("")), parsed.requires,
+                        parsed.compared
+                                ? Map.of(studio.epicquest.schema.reconciler.spi.Dialect
+                                        .CONTENT_COMPARED_ATTRIBUTE, "true")
+                                : Map.of()));
             }
             case "DROP" -> {
                 final var id = parseObjectId(tokens[1], tokens[2]);
@@ -179,13 +183,16 @@ public final class FakeDb {
         }
     }
 
-    private record Parsed(Set<ObjectId> requires, Optional<String> def) { }
+    private record Parsed(Set<ObjectId> requires, Optional<String> def, boolean compared) { }
 
     private static Parsed parseTail(String[] tokens, int from) {
         final var requires = new LinkedHashSet<ObjectId>();
         var def = Optional.<String>empty();
+        var compared = false;
         for (var i = from; i < tokens.length; i++) {
-            if (tokens[i].equals("REQUIRES") && i + 1 < tokens.length) {
+            if (tokens[i].equals("COMPARED")) {
+                compared = true;
+            } else if (tokens[i].equals("REQUIRES") && i + 1 < tokens.length) {
                 for (final var ref : tokens[i + 1].split(",")) {
                     requires.add(parseReference(ref));
                 }
@@ -198,7 +205,7 @@ public final class FakeDb {
                 def = Optional.of(text.toString());
             }
         }
-        return new Parsed(requires, def);
+        return new Parsed(requires, def, compared);
     }
 
     /** Parses {@code KIND:parent.name} or {@code KIND:name} (last dot splits parent). */
@@ -237,6 +244,10 @@ public final class FakeDb {
                 }
                 sql.append(reference(deps.get(i)));
             }
+        }
+        if ("true".equals(object.attributes().get(
+                studio.epicquest.schema.reconciler.spi.Dialect.CONTENT_COMPARED_ATTRIBUTE))) {
+            sql.append(" COMPARED");
         }
         if (!object.definition().canonical().isEmpty()) {
             sql.append(" DEF ").append(object.definition().canonical());

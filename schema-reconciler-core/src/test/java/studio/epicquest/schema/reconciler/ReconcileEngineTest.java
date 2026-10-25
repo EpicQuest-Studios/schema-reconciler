@@ -459,4 +459,53 @@ class ReconcileEngineTest {
         assertInstanceOf(SchemaReconcilerException.class, new PlanningException("x"));
         assertInstanceOf(SchemaReconcilerException.class, new LockTimeoutException("x"));
     }
+
+    /** Spec 5.4: a content-compared object of an unsupported kind that the target already holds is no difference. */
+    @Test
+    void contentComparedUnsupportedObjectEqualInTargetIsNoDifference() {
+        final var narrow = new FakeDialect(db,
+                Set.of(ObjectKind.TABLE, ObjectKind.COLUMN, ObjectKind.INDEX, ObjectKind.VIEW,
+                        ObjectKind.SEQUENCE, ObjectKind.PRIMARY_KEY, ObjectKind.UNIQUE,
+                        ObjectKind.FOREIGN_KEY, ObjectKind.CHECK, ObjectKind.TRIGGER));
+        final var id = new ObjectId(ObjectKind.ROUTINE, "f");
+        final var compared = java.util.Map.of(
+                studio.epicquest.schema.reconciler.spi.Dialect.CONTENT_COMPARED_ATTRIBUTE, "true");
+        final var report = ReconcilePolicy.defaults().withUnsupported(Decision.REPORT);
+        final java.util.function.BiFunction<String, ReconcilePolicy, ReconcileReport> run =
+                (script, policy) -> SchemaReconciler.builder()
+                        .dataSource(db.dataSource()).namespace(NS)
+                        .desiredState(DesiredState.ofScript(script))
+                        .dialect(narrow).policy(policy).build().reconcile();
+
+        // (a) equal in the target: nothing to report, and the default FAIL policy does not fire
+        db.putObject(NS, new studio.epicquest.schema.reconciler.model.SchemaObject(id,
+                new studio.epicquest.schema.reconciler.model.Definition("f_v1"), Set.of(), compared));
+        final var equal = run.apply("CREATE ROUTINE f COMPARED DEF f_v1", ReconcilePolicy.defaults());
+        assertEquals(ReconcileOutcome.UP_TO_DATE, equal.outcome());
+        assertTrue(equal.unsupported().isEmpty(), equal.unsupported().toString());
+
+        // (c) the content differs: still reported, with the target's definition attached
+        final var differs = run.apply("CREATE ROUTINE f COMPARED DEF f_v2", report);
+        assertEquals(1, differs.unsupported().size());
+        assertTrue(differs.unsupported().get(0).actual().isPresent());
+
+        // (d) without the marker the same equal object is still reported
+        final var unmarked = run.apply("CREATE ROUTINE f DEF f_v1", report);
+        assertEquals(1, unmarked.unsupported().size());
+    }
+
+    @Test
+    void contentComparedUnsupportedObjectMissingInTargetIsStillReported() {
+        final var narrow = new FakeDialect(db,
+                Set.of(ObjectKind.TABLE, ObjectKind.COLUMN, ObjectKind.INDEX, ObjectKind.VIEW,
+                        ObjectKind.SEQUENCE, ObjectKind.PRIMARY_KEY, ObjectKind.UNIQUE,
+                        ObjectKind.FOREIGN_KEY, ObjectKind.CHECK, ObjectKind.TRIGGER));
+        final var result = SchemaReconciler.builder()
+                .dataSource(db.dataSource()).namespace(NS)
+                .desiredState(DesiredState.ofScript("CREATE ROUTINE f COMPARED DEF f_v1"))
+                .dialect(narrow).policy(ReconcilePolicy.defaults().withUnsupported(Decision.REPORT))
+                .build().reconcile();
+        assertEquals(1, result.unsupported().size());
+        assertTrue(result.unsupported().get(0).actual().isEmpty());
+    }
 }

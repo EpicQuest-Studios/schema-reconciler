@@ -992,18 +992,26 @@ public final class PgCatalog {
                     }
                 }
             }
-            // granted privileges: object acl columns are NULL until a GRANT
+            // granted privileges: object acl columns are NULL until a GRANT. The
+            // definition is the sorted ACL, with the owner written as <owner>, so a
+            // target that already holds the same grants compares equal (5.4).
             try (PreparedStatement ps = conn.prepareStatement("""
-                    SELECT 'privileges:' || c.relname AS name, c.oid
+                    SELECT 'privileges:' || c.relname AS name, c.oid,
+                           """ + aclTokens("c.relacl", "c.relowner") + """
+                           AS acl
                     FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
                     WHERE n.nspname = ? AND c.relacl IS NOT NULL
                     UNION ALL
                     SELECT 'privileges:' || p.proname || '('
-                            || pg_get_function_identity_arguments(p.oid) || ')', p.oid
+                            || pg_get_function_identity_arguments(p.oid) || ')', p.oid,
+                           """ + aclTokens("p.proacl", "p.proowner") + """
+                           AS acl
                     FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
                     WHERE n.nspname = ? AND p.proacl IS NOT NULL
                     UNION ALL
-                    SELECT 'privileges:' || t.typname, t.oid
+                    SELECT 'privileges:' || t.typname, t.oid,
+                           """ + aclTokens("t.typacl", "t.typowner") + """
+                           AS acl
                     FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace
                     WHERE n.nspname = ? AND t.typacl IS NOT NULL
                     ORDER BY 1
@@ -1015,7 +1023,8 @@ public final class PgCatalog {
                             continue;
                         }
                         define(new ObjectId(ObjectKind.OTHER, rs.getString("name")),
-                                "privileges", Map.of());
+                                "privileges=" + rs.getString("acl"),
+                                Map.of(Dialect.CONTENT_COMPARED_ATTRIBUTE, "true"));
                     }
                 }
             }
@@ -1467,6 +1476,23 @@ public final class PgCatalog {
                     }
                 }
             }
+        }
+
+        /**
+         * SQL for a deterministic rendering of an ACL column: one
+         * {@code grantor>grantee:PRIVILEGE[*]} token per entry (PUBLIC for
+         * grantee 0, {@code <owner>} for the object's owner, {@code *} for
+         * grantable), sorted, so grant order cannot cause drift.
+         */
+        private static String aclTokens(String acl, String owner) {
+            return "(SELECT string_agg(tok, ',' ORDER BY tok) FROM (SELECT"
+                    + " CASE WHEN a.grantor = " + owner + " THEN '<owner>'"
+                    + " ELSE a.grantor::regrole::text END || '>' ||"
+                    + " CASE WHEN a.grantee = 0 THEN 'PUBLIC'"
+                    + " WHEN a.grantee = " + owner + " THEN '<owner>'"
+                    + " ELSE a.grantee::regrole::text END || ':' || a.privilege_type ||"
+                    + " CASE WHEN a.is_grantable THEN '*' ELSE '' END AS tok"
+                    + " FROM aclexplode(" + acl + ") a) toks)";
         }
 
         // ---- helpers ----------------------------------------------------

@@ -386,7 +386,7 @@ public record SchemaSnapshot(
         String fingerprint) { }                   // see 5.7
 ```
 
-`attributes` carry dialect-specific details such as a column's type or nullability, for display and diagnostics. Comparison must use `definition` only, so that the core stays vendor-neutral.
+`attributes` carry dialect-specific details such as a column's type or nullability, for display and diagnostics. Comparison must use `definition` only, so that the core stays vendor-neutral. The only attributes the core reads are the markers `Dialect.EXTERNAL_DEPENDENT_ATTRIBUTE` (5.8.3) and `Dialect.CONTENT_COMPARED_ATTRIBUTE` (5.4); neither takes part in equality.
 
 ### 4.3 Differences
 
@@ -480,7 +480,7 @@ Two objects are equal if and only if their `ObjectId`s and canonical definitions
 
 - `MISSING`: present in desired, absent in actual.
 - `DRIFTED`: present in both with different canonical definitions.
-- `UNSUPPORTED`: present in desired with a kind the dialect does not support (`ObjectKind.OTHER`, or a kind absent from `capabilities().supportedKinds()`). It takes precedence over `MISSING` and `DRIFTED` for such an object, and the dialect is never asked to render it. Policy `unsupported` governs these as differences (3.3); `APPLY` is not permitted.
+- `UNSUPPORTED`: present in desired with a kind the dialect does not support (`ObjectKind.OTHER`, or a kind absent from `capabilities().supportedKinds()`). It takes precedence over `MISSING` and `DRIFTED` for such an object, and the dialect is never asked to render it. One exception: a dialect may mark an unsupported-kind object whose canonical definition is a faithful rendering of its content (`Dialect.CONTENT_COMPARED_ATTRIBUTE`, 4.2); when the actual snapshot holds an object with the same `ObjectId` and an equal definition, no difference is reported for it. When the object is absent from the actual snapshot or its definition differs, the `UNSUPPORTED` difference stands, with the actual definition attached when there is one. Policy `unsupported` governs these as differences (3.3); `APPLY` is not permitted.
 
 A dialect must detect every object in the scratch namespace, including kinds it does not manage, so that nothing created by the script is silently ignored.
 
@@ -809,8 +809,7 @@ statistics (`pg_statistic_ext`), collations (`pg_collation`), conversions
 (`pg_conversion`), text-search objects (`pg_ts_config`, `pg_ts_dict`,
 `pg_ts_parser`, `pg_ts_template`), operators, operator classes and families
 (`pg_operator`, `pg_opclass`, `pg_opfamily`), comments (`pg_description`),
-security labels (`pg_seclabel`), granted privileges (non-null `relacl`,
-`proacl`, `typacl`), ownership changed away from the connecting role
+security labels (`pg_seclabel`), granted privileges (non-null `relacl`, `proacl`, `typacl`; compared by content: the ACL entries as sorted `grantor>grantee:PRIVILEGE[*]` tokens, with the owner written `<owner>` and `*` marking a grant option, so a target holding the same grants reports no difference), ownership changed away from the connecting role
 (`relowner`, `proowner`, `typowner`) and publication bindings
 (`pg_publication_rel` for tables, `pg_publication_sequences` for sequences
 on PostgreSQL 19+). Three catalog object kinds have no namespace of their

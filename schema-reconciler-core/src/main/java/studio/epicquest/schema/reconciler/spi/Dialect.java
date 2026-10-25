@@ -26,6 +26,15 @@ public interface Dialect {
      */
     String EXTERNAL_DEPENDENT_ATTRIBUTE = "externalDependent";
 
+    /**
+     * Attributes key marking an object of an unsupported kind whose canonical
+     * definition is a faithful rendering of its content. When the actual
+     * snapshot holds an object with the same id and an equal definition, the
+     * core reports no {@code UNSUPPORTED} difference for it (5.4); without
+     * the marker an unsupported object is always reported.
+     */
+    String CONTENT_COMPARED_ATTRIBUTE = "contentCompared";
+
     /** Stable identifier, for example {@code "postgresql"}. */
     String id();
 

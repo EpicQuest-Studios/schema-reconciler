@@ -25,6 +25,10 @@ final class Differ {
             final var id = want.id();
             final var have = actual.objects().get(id);
             if (!dialect.capabilities().supportedKinds().contains(id.kind())) {
+                if (isContentCompared(want) && have != null
+                        && have.definition().equals(want.definition())) {
+                    continue;
+                }
                 out.add(new Difference(id, DifferenceType.UNSUPPORTED,
                         Optional.of(want.definition()), definitionOf(have)));
             } else if (have == null) {
@@ -43,6 +47,10 @@ final class Differ {
                 .forEach(out::add);
         out.sort((a, b) -> ObjectIds.ORDER.compare(a.id(), b.id()));
         return out;
+    }
+
+    private static boolean isContentCompared(SchemaObject object) {
+        return "true".equals(object.attributes().get(Dialect.CONTENT_COMPARED_ATTRIBUTE));
     }
 
     private static boolean isExternalDependent(SchemaObject object) {
