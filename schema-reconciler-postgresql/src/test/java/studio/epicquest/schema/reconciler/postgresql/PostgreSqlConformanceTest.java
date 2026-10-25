@@ -568,4 +568,142 @@ class PostgreSqlConformanceTest extends DialectConformanceTest {
                 .withUnsupportedCategory("matview", Decision.REPORT))
                 .reconcile().outcome());
     }
+
+    @Test
+    @DisplayName("a created table keeps its storage options and replica identity")
+    void createdTableKeepsOptionsAndReplicaIdentity() throws Exception {
+        final var script = "CREATE TABLE t (id bigint NOT NULL, note text)"
+                + " WITH (fillfactor = 70);"
+                + " CREATE UNIQUE INDEX t_id ON t (id);"
+                + " ALTER TABLE t REPLICA IDENTITY USING INDEX t_id";
+        final var report = reconciler(script).reconcile();
+        assertEquals(ReconcileOutcome.RECONCILED, report.outcome());
+        assertEquals(ReconcileOutcome.UP_TO_DATE, reconciler(script).reconcile().outcome());
+    }
+
+    @Test
+    @DisplayName("an exclusion constraint's backing index is not a separate index")
+    void exclusionBackingIndexIsNotSeparate() throws Exception {
+        execute("CREATE TABLE " + qualified("t")
+                + " (id int, CONSTRAINT t_ex EXCLUDE (id WITH =))");
+        try (var c = scratch.getConnection()) {
+            final var snapshot = dialect.readSnapshot(c, namespace());
+            assertTrue(snapshot.objects().keySet().stream()
+                    .noneMatch(id -> id.kind() == ObjectKind.INDEX), snapshot.toString());
+        }
+    }
+
+    @Test
+    @DisplayName("malformed scripts are rejected as desired-state errors")
+    void malformedScriptsAreDesiredStateErrors() {
+        for (final var script : new String[] {"SET", "CREATE", "ALTER", "DROP IF EXISTS"}) {
+            assertThrows(DesiredStateException.class, () -> reconciler(script).plan(), script);
+        }
+    }
+
+    @Test
+    @DisplayName("an escape string cannot hide transaction control from the script check")
+    void escapeStringCannotHideCommit() {
+        assertThrows(DesiredStateException.class, () -> reconciler(
+                "SELECT E'x\\''; COMMIT; SELECT ''").plan());
+    }
+
+    @Test
+    @DisplayName("a role with USAGE but not CREATE on the namespace is rejected up front")
+    void usageWithoutCreateIsRejected() throws Exception {
+        final var role = "rcl_ro_" + Long.toHexString(RUN_ID);
+        PgTestDatabase.execute(scratch, "CREATE ROLE " + role + " NOLOGIN");
+        try {
+            PgTestDatabase.execute(scratch, "GRANT USAGE ON SCHEMA "
+                    + dialect.quoteIdentifier(namespace()) + " TO " + role);
+            try (var c = scratch.getConnection(); var s = c.createStatement()) {
+                s.execute("SET ROLE " + role);
+                assertThrows(ConfigurationException.class,
+                        () -> dialect.checkAccess(c, namespace(), false));
+            }
+        } finally {
+            PgTestDatabase.execute(scratch, "DROP OWNED BY " + role);
+            PgTestDatabase.execute(scratch, "DROP ROLE " + role);
+        }
+    }
+
+    @Test
+    @DisplayName("session-leaking calls inside DO blocks and set_config(false) are rejected")
+    void sessionLeaksAreRejected() {
+        for (final var script : new String[] {
+                "DO $$ BEGIN PERFORM pg_advisory_lock(1); END $$",
+                "DO $$ BEGIN EXECUTE 'SELECT pg_try_advisory_lock(2)'; END $$",
+                "DO $$ BEGIN PERFORM set_config('search_path', 'x', false); END $$",
+                "SELECT set_config('search_path', 'x', false)"}) {
+            assertThrows(DesiredStateException.class, () -> reconciler(script).plan(), script);
+        }
+        reconciler("SELECT set_config('app.x', '1', true)").plan();
+    }
+
+    @Test
+    @DisplayName("a listener failure in plan() is a PlanningException")
+    void listenerFailureInPlanIsPlanningException() {
+        final var r = SchemaReconciler.builder()
+                .dataSource(dataSource()).namespace(namespace())
+                .desiredState(DesiredState.ofScript("CREATE TABLE t (id bigint)"))
+                .dialect(dialect())
+                .listener(new ReconcileListener() {
+                    @Override
+                    public void planned(studio.epicquest.schema.reconciler.model.ReconcilePlan p) {
+                        throw new IllegalStateException("no");
+                    }
+                })
+                .build();
+        assertThrows(PlanningException.class, r::plan);
+        assertThrows(ApplyException.class, r::reconcile);
+    }
+
+    @Test
+    @DisplayName("set_config is accepted only with a literal true third argument")
+    void setConfigRequiresLiteralTrue() {
+        for (final var script : new String[] {
+                "SELECT set_config('a','b', false), true",
+                "SELECT set_config('a','b', false) = 'x' AND true",
+                "SELECT set_config('a','b')",
+                "SELECT set_config('a','b', 1 > 0)",
+                "SELECT set_config('a', 'b,true', false)"}) {
+            assertThrows(DesiredStateException.class, () -> reconciler(script).plan(), script);
+        }
+        reconciler("SELECT set_config('app.a', 'b,false)', TRUE)").plan();
+    }
+
+    @Test
+    @DisplayName("a session lock taken by a function the script calls is released after the script")
+    void indirectSessionLockIsReleased() throws Exception {
+        try (var c = scratch.getConnection(); var s = c.createStatement()) {
+            final var scratchName = dialect.createScratchNamespace(c, namespace());
+            try {
+                dialect.executeScript(c, "SET LOCAL search_path = " + dialect.quoteIdentifier(scratchName)
+                        + "; CREATE FUNCTION leak() RETURNS boolean LANGUAGE sql"
+                        + " AS $$ SELECT pg_try_advisory_lock(424242) $$; SELECT leak()", scratchName);
+            } finally {
+                dialect.dropScratchNamespace(c, scratchName);
+            }
+            try (var rs = s.executeQuery("SELECT count(*) FROM pg_locks WHERE locktype = 'advisory'"
+                    + " AND objid = 424242 AND pid = pg_backend_pid()")) {
+                rs.next();
+                assertEquals(0, rs.getInt(1));
+            }
+            s.execute("ROLLBACK");
+        }
+    }
+
+    @Test
+    @DisplayName("planTimed() reports planning phase timings and no apply time")
+    void planTimedReportsTimings() throws Exception {
+        final var timed = SchemaReconciler.builder()
+                .dataSource(dataSource()).namespace(namespace())
+                .desiredState(DesiredState.ofScript("CREATE TABLE t (id bigint)"))
+                .dialect(dialect()).build().planTimed();
+        assertTrue(timed.timings().readActual().toNanos() > 0, timed.timings().toString());
+        assertTrue(timed.timings().loadDesired().toNanos() > 0, timed.timings().toString());
+        assertEquals(Duration.ZERO, timed.timings().apply());
+        assertEquals(Duration.ZERO, timed.timings().verify());
+        assertEquals(1, timed.plan().changes().size());
+    }
 }

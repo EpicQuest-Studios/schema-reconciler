@@ -142,6 +142,28 @@ public final class PgSql {
         }
     }
 
+    /** The text inside each dollar-quoted body of {@code text} (tags excluded). */
+    public static List<String> dollarBodies(String text) {
+        final var out = new ArrayList<String>();
+        var i = 0;
+        while (i < text.length()) {
+            final var span = nextSpan(text, i);
+            if (span == null) {
+                i++;
+                continue;
+            }
+            if (span[2] == SPAN_DOLLAR) {
+                final var tag = dollarTag(text, i);
+                final var innerEnd = text.startsWith(tag, span[1] - tag.length())
+                        && span[1] - tag.length() >= i + tag.length()
+                        ? span[1] - tag.length() : span[1];
+                out.add(text.substring(i + tag.length(), innerEnd));
+            }
+            i = span[1];
+        }
+        return out;
+    }
+
     private static final int SPAN_STRING = 1;
     private static final int SPAN_IDENT_QUOTED = 2;
     private static final int SPAN_DOLLAR = 3;
@@ -155,8 +177,15 @@ public final class PgSql {
         final var c = text.charAt(pos);
         final var n = text.length();
         if (c == '\'') {
+            // E'...' strings also escape with a backslash: \' does not end them
+            final var escapes = pos > 0 && (text.charAt(pos - 1) == 'E' || text.charAt(pos - 1) == 'e')
+                    && (pos < 2 || !isIdentPart(text.charAt(pos - 2)));
             var i = pos + 1;
             while (i < n) {
+                if (escapes && text.charAt(i) == '\\') {
+                    i += 2;
+                    continue;
+                }
                 if (text.charAt(i) == '\'') {
                     if (i + 1 < n && text.charAt(i + 1) == '\'') {
                         i += 2;
@@ -182,7 +211,8 @@ public final class PgSql {
             }
             return new int[] {pos, n, SPAN_IDENT_QUOTED};
         }
-        if (c == '$') {
+        // a '$' after an identifier character is part of that identifier
+        if (c == '$' && (pos == 0 || !isIdentPart(text.charAt(pos - 1)))) {
             final var tag = dollarTag(text, pos);
             if (tag != null) {
                 var end = text.indexOf(tag, pos + tag.length());

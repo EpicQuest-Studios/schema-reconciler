@@ -5,7 +5,6 @@ import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Statement;
-import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -43,6 +42,10 @@ public final class PgCatalog {
     public static final String DEFAULT = "default";
     public static final String SIG_ARGS = "sigargs";
     public static final String RETURN_TYPE = "returnType";
+    /** Table storage options ({@code fillfactor=70, ...}) for {@code CREATE TABLE ... WITH}. */
+    public static final String TABLE_OPTIONS = "tableOptions";
+    /** The {@code relreplident} letter of a table. */
+    public static final String REPLIDENT = "replident";
 
     public static SchemaSnapshot read(Connection conn, String namespace) throws SQLException {
         try (Statement s = conn.createStatement()) {
@@ -148,11 +151,26 @@ public final class PgCatalog {
 
         void loadExtensionOwned(Connection conn) throws SQLException {
             try (PreparedStatement ps = conn.prepareStatement(
-                    "SELECT objid FROM pg_depend WHERE refclassid = 'pg_extension'::regclass"
-                            + " AND deptype = 'e'");
-                    ResultSet rs = ps.executeQuery()) {
-                while (rs.next()) {
-                    extOwned.add(rs.getLong(1));
+                    // relations, routines and types dominate the member count (a
+                    // PostGIS install owns thousands), so only those in this
+                    // namespace are read; other classes are few and read whole
+                    "SELECT d.objid FROM pg_depend d"
+                            + " WHERE d.refclassid = 'pg_extension'::regclass AND d.deptype = 'e'"
+                            + " AND CASE d.classid"
+                            + " WHEN 'pg_class'::regclass THEN EXISTS (SELECT 1 FROM pg_class o"
+                            + "   WHERE o.oid = d.objid AND o.relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = ?))"
+                            + " WHEN 'pg_proc'::regclass THEN EXISTS (SELECT 1 FROM pg_proc o"
+                            + "   WHERE o.oid = d.objid AND o.pronamespace = (SELECT oid FROM pg_namespace WHERE nspname = ?))"
+                            + " WHEN 'pg_type'::regclass THEN EXISTS (SELECT 1 FROM pg_type o"
+                            + "   WHERE o.oid = d.objid AND o.typnamespace = (SELECT oid FROM pg_namespace WHERE nspname = ?))"
+                            + " ELSE true END")) {
+                ps.setString(1, ns);
+                ps.setString(2, ns);
+                ps.setString(3, ns);
+                try (ResultSet rs = ps.executeQuery()) {
+                    while (rs.next()) {
+                        extOwned.add(rs.getLong(1));
+                    }
                 }
             }
         }
@@ -161,7 +179,9 @@ public final class PgCatalog {
             try (PreparedStatement ps = conn.prepareStatement("""
                     SELECT c.oid, c.relname, c.relkind, c.relpersistence,
                            c.reloptions::text AS options, c.relreplident,
-                           EXISTS (SELECT 1 FROM pg_inherits i WHERE i.inhrelid = c.oid) AS inherited
+                           EXISTS (SELECT 1 FROM pg_inherits i WHERE i.inhrelid = c.oid) AS inherited,
+                           (SELECT ic.relname FROM pg_index ix JOIN pg_class ic ON ic.oid = ix.indexrelid
+                             WHERE ix.indrelid = c.oid AND ix.indisreplident) AS replindex
                     FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
                     WHERE n.nspname = ? AND c.relkind IN ('r','v','m','f','p','c','t','I','S')
                     ORDER BY c.oid
@@ -201,9 +221,14 @@ public final class PgCatalog {
                         };
                         relByOid.put(oid, id);
                         if (id.kind() == ObjectKind.TABLE) {
+                            final var replident = rs.getString("relreplident");
+                            final var replindex = rs.getString("replindex");
                             define(id, "relkind=r;relpersistence=" + persistence
                                     + ";options=" + options
-                                    + ";replident=" + rs.getString("relreplident"), Map.of());
+                                    + ";replident=" + replident
+                                    + (replindex != null ? ";replindex=" + replindex : ""),
+                                    Map.of(TABLE_OPTIONS, String.join(", ", options),
+                                            REPLIDENT, replident));
                         } else if (id.kind() == ObjectKind.OTHER) {
                             define(id, "relkind=" + kind + (inherited ? ";inherited" : ""),
                                     Map.of());
@@ -334,7 +359,10 @@ public final class PgCatalog {
             try (PreparedStatement ps = conn.prepareStatement("""
                     SELECT c.oid, c.conname, c.contype, rel.relname AS parent,
                            pg_get_constraintdef(c.oid) AS def,
-                           ref.oid AS refoid, c.conindid
+                           ref.oid AS refoid, c.conindid,
+                           EXISTS (SELECT 1 FROM pg_index ix
+                                    WHERE ix.indexrelid = c.conindid AND ix.indisreplident
+                                      AND c.contype IN ('p','u')) AS replident
                     FROM pg_constraint c
                     JOIN pg_class rel ON rel.oid = c.conrelid
                     JOIN pg_namespace n ON n.oid = rel.relnamespace
@@ -373,11 +401,16 @@ public final class PgCatalog {
                         }
                         final var qParent = tableRef(parent);
                         final var qName = PgIdentifiers.quote(name);
-                        define(id, def, Map.of(
-                                CREATE_SQL, "ALTER TABLE " + qParent
-                                        + " ADD CONSTRAINT " + qName + " " + def,
-                                DROP_SQL, "ALTER TABLE " + qParent
-                                        + " DROP CONSTRAINT " + qName));
+                        final var attrs = new LinkedHashMap<String, String>();
+                        attrs.put(CREATE_SQL, "ALTER TABLE " + qParent
+                                + " ADD CONSTRAINT " + qName + " " + def);
+                        attrs.put(DROP_SQL, "ALTER TABLE " + qParent
+                                + " DROP CONSTRAINT " + qName);
+                        if (rs.getBoolean("replident")) {
+                            attrs.put(POST_SQL, "ALTER TABLE " + qParent
+                                    + " REPLICA IDENTITY USING INDEX " + qName);
+                        }
+                        define(id, def, attrs);
                         final var refoid = rs.getLong("refoid");
                         if (!rs.wasNull()) {
                             depOid(id, refoid);
@@ -390,7 +423,7 @@ public final class PgCatalog {
         void loadIndexes(Connection conn) throws SQLException {
             try (PreparedStatement ps = conn.prepareStatement("""
                     SELECT i.indexrelid AS oid, ic.relname, tc.relname AS parent,
-                           pg_get_indexdef(i.indexrelid) AS def
+                           pg_get_indexdef(i.indexrelid) AS def, i.indisreplident AS replident
                     FROM pg_index i
                     JOIN pg_class ic ON ic.oid = i.indexrelid
                     JOIN pg_class tc ON tc.oid = i.indrelid
@@ -398,7 +431,7 @@ public final class PgCatalog {
                     WHERE n.nspname = ? AND ic.relkind = 'i'
                       AND NOT EXISTS (SELECT 1 FROM pg_constraint co
                                       WHERE co.conindid = i.indexrelid
-                                        AND co.contype IN ('p','u'))
+                                        AND co.contype IN ('p','u','x'))
                       AND NOT EXISTS (SELECT 1 FROM pg_inherits inh WHERE inh.inhrelid = i.indexrelid)
                     ORDER BY i.indexrelid
                     """)) {
@@ -413,9 +446,14 @@ public final class PgCatalog {
                         final var def = rs.getString("def");
                         final var id = new ObjectId(ObjectKind.INDEX, name, parent);
                         relByOid.put(rs.getLong("oid"), id);
-                        define(id, def, Map.of(
-                                CREATE_SQL, def,
-                                DROP_SQL, "DROP INDEX " + qNs + "." + PgIdentifiers.quote(name)));
+                        final var attrs = new LinkedHashMap<String, String>();
+                        attrs.put(CREATE_SQL, def);
+                        attrs.put(DROP_SQL, "DROP INDEX " + qNs + "." + PgIdentifiers.quote(name));
+                        if (rs.getBoolean("replident")) {
+                            attrs.put(POST_SQL, "ALTER TABLE " + tableRef(parent)
+                                    + " REPLICA IDENTITY USING INDEX " + PgIdentifiers.quote(name));
+                        }
+                        define(id, def, attrs);
                     }
                 }
             }
@@ -1216,12 +1254,15 @@ public final class PgCatalog {
                     SELECT ad.adrelid AS tbl, a.attname AS col, d.refobjid AS dep
                     FROM pg_depend d
                     JOIN pg_attrdef ad ON ad.oid = d.objid
+                    JOIN pg_class tc ON tc.oid = ad.adrelid
+                    JOIN pg_namespace tn ON tn.oid = tc.relnamespace AND tn.nspname = ?
                     JOIN pg_attribute a ON a.attrelid = ad.adrelid AND a.attnum = ad.adnum
                         AND NOT a.attisdropped
                     WHERE d.classid = 'pg_attrdef'::regclass AND d.deptype = 'n'
                       AND d.refclassid IN ('pg_class'::regclass, 'pg_proc'::regclass,
                                            'pg_type'::regclass)
                     """)) {
+                ps.setString(1, ns);
                 try (ResultSet rs = ps.executeQuery()) {
                     while (rs.next()) {
                         final var table = relByOid.get(rs.getLong("tbl"));
@@ -1243,10 +1284,14 @@ public final class PgCatalog {
                     SELECT d.objid AS con, d.refclassid::regclass::text AS refcls,
                            d.refobjid AS dep
                     FROM pg_depend d
+                    JOIN pg_constraint co ON co.oid = d.objid
+                    JOIN pg_class cr ON cr.oid = co.conrelid
+                    JOIN pg_namespace cn ON cn.oid = cr.relnamespace AND cn.nspname = ?
                     WHERE d.classid = 'pg_constraint'::regclass
                       AND d.refclassid IN ('pg_proc'::regclass, 'pg_type'::regclass,
                                            'pg_class'::regclass, 'pg_constraint'::regclass)
                     """)) {
+                ps.setString(1, ns);
                 try (ResultSet rs = ps.executeQuery()) {
                     while (rs.next()) {
                         final var from = conByOid.get(rs.getLong("con"));
@@ -1270,11 +1315,14 @@ public final class PgCatalog {
                     SELECT d.objid AS tbl, d.objsubid AS attnum, a.attname AS col,
                            d.refobjid AS dep
                     FROM pg_depend d
+                    JOIN pg_class tc ON tc.oid = d.objid
+                    JOIN pg_namespace tn ON tn.oid = tc.relnamespace AND tn.nspname = ?
                     LEFT JOIN pg_attribute a ON a.attrelid = d.objid AND a.attnum = d.objsubid
                         AND NOT a.attisdropped
                     WHERE d.classid = 'pg_class'::regclass AND d.deptype = 'n'
                       AND d.refclassid IN ('pg_type'::regclass, 'pg_collation'::regclass)
                     """)) {
+                ps.setString(1, ns);
                 try (ResultSet rs = ps.executeQuery()) {
                     while (rs.next()) {
                         final var table = relByOid.get(rs.getLong("tbl"));
@@ -1298,9 +1346,12 @@ public final class PgCatalog {
             try (PreparedStatement ps = conn.prepareStatement("""
                     SELECT d.objid AS child, d.refobjid AS dep
                     FROM pg_depend d
+                    JOIN pg_class cc ON cc.oid = d.objid
+                    JOIN pg_namespace cn ON cn.oid = cc.relnamespace AND cn.nspname = ?
                     WHERE d.classid = 'pg_class'::regclass AND d.refclassid = 'pg_class'::regclass
                       AND d.deptype IN ('a', 'P')
                     """)) {
+                ps.setString(1, ns);
                 try (ResultSet rs = ps.executeQuery()) {
                     while (rs.next()) {
                         depOid(relByOid.get(rs.getLong("child")), rs.getLong("dep"));

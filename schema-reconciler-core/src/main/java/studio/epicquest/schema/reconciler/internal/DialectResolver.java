@@ -4,7 +4,6 @@ import java.sql.Connection;
 import java.sql.DatabaseMetaData;
 import java.sql.SQLException;
 import java.util.ArrayList;
-import java.util.List;
 import java.util.ServiceLoader;
 import java.util.stream.Collectors;
 import studio.epicquest.schema.reconciler.ConfigurationException;

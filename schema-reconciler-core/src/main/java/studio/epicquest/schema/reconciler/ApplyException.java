@@ -8,7 +8,8 @@ import studio.epicquest.schema.reconciler.model.PlannedChange;
 /**
  * A statement failed, or a listener aborted the run (spec 7). Carries the
  * changes applied so far (possibly none) and, when known, the change being
- * processed.
+ * processed. On a transactional-DDL dialect the whole run is rolled back, so
+ * the applied changes are not persisted.
  */
 public class ApplyException extends SchemaReconcilerException {
 

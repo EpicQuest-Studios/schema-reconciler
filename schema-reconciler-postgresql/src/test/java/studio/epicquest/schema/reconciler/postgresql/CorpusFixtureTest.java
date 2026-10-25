@@ -10,9 +10,7 @@ import java.net.URISyntaxException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.sql.Connection;
-import java.sql.ResultSet;
 import java.sql.SQLException;
-import java.sql.Statement;
 import java.util.TreeSet;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.regex.Matcher;
@@ -31,7 +29,6 @@ import studio.epicquest.schema.reconciler.Decision;
 import studio.epicquest.schema.reconciler.DesiredState;
 import studio.epicquest.schema.reconciler.ReconcileOutcome;
 import studio.epicquest.schema.reconciler.ReconcilePolicy;
-import studio.epicquest.schema.reconciler.ReconcileReport;
 import studio.epicquest.schema.reconciler.SchemaReconciler;
 import studio.epicquest.schema.reconciler.spi.Dialect;
 

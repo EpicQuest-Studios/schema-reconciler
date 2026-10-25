@@ -4,18 +4,18 @@
 
 | | |
 |---|---|
-| **Version** | 0.8, Draft |
+| **Version** | 0.9, Draft |
 | **Date** | 2026-10-25 |
 | **Maven group** | `studio.epicquest.schema` |
 | **Java baseline** | Java SE 25 |
 | **Reference implementation** | PostgreSQL 14+ dialect (`schema-reconciler-postgresql`) |
 | **Conformance suite** | `schema-reconciler-tck` |
 
-This document is the working specification of the schema-reconciler project: the contract the core, the PostgreSQL dialect and every third-party dialect are held to, plus the background appendices that motivated it. It is a draft and may change until version 1.0.
+This document is the working specification of the schema-reconciler project: the contract the core, the PostgreSQL dialect and every third-party dialect are held to, plus background appendices. It is a draft and may change until version 1.0.
 
 ## Document conventions
 
-- Sections 1–11 and Appendix A define required behaviour. The preface, examples and rationale embedded in them, and Appendices B, C, D and E are background and establish no requirements.
+- Sections 1–11 and Appendix A define required behaviour. The preface, examples and rationale embedded in them, and Appendices B, C and D are background and establish no requirements.
 - Requirements are stated in plain words: **must** is binding, **should** is a recommendation an implementation may deviate from for good reason, **may** marks a permitted option.
 - Text in `monospace` is program text. Type and member signatures shown in Java blocks are the API surface; the prose beneath each block defines its contract.
 
@@ -77,8 +77,7 @@ This document is the working specification of the schema-reconciler project: the
   - [A.7 Migration path for an existing deployment script](#a7-migration-path-for-an-existing-deployment-script)
 - [Appendix B. Example](#appendix-b-example)
 - [Appendix C. Related work](#appendix-c-related-work)
-- [Appendix D. Library evaluation](#appendix-d-library-evaluation)
-- [Appendix E. PostgreSQL 14–19 feature coverage and test corpus](#appendix-e-postgresql-1419-feature-coverage-and-test-corpus)
+- [Appendix D. PostgreSQL 14–19 feature coverage and test corpus](#appendix-d-postgresql-1419-feature-coverage-and-test-corpus)
   - [Reconciled constructs (managed kinds)](#reconciled-constructs-managed-kinds)
   - [Detected but unsupported (`OTHER` → `UNSUPPORTED` per 5.4)](#detected-but-unsupported-other--unsupported-per-54)
   - [Out of scope (cluster-level or statement-only, per 1.5/3.2)](#out-of-scope-cluster-level-or-statement-only-per-1532)
@@ -107,7 +106,7 @@ This specification defines a Java library that brings a relational database sche
 
 ### 1.2 Motivation
 
-This design grew out of a long-running service that reconciles its PostgreSQL schema at startup with a hand-written checker. That checker keeps its expected state in hand-written Java maps (`TABLES`, `CONSTRAINTS`, `INDEXES`, `VIEWS`) duplicated from `schema.sql`, and it does not verify function bodies, trigger definitions or view bodies. The library-suitability analysis (Appendix D) found no third-party library that can serve as the core. This specification generalises that approach so that:
+Hand-written schema checkers keep their expected state in code (maps of tables, constraints, indexes and views) duplicated from the schema script, and rarely verify function bodies, trigger definitions or view bodies. Existing declarative tools are surveyed in Appendix C; none can serve as the core. This specification generalises the scratch-and-compare approach so that:
 
 1. the expected state is derived from the script itself, never written twice, and
 2. the same contract can be implemented for other relational databases.
@@ -208,6 +207,8 @@ public final class SchemaReconciler {
 
     /** Computes a plan without changing the target namespace. */
     public ReconcilePlan plan() { ... }
+    /** Like plan(), also returning the phase timings of the planning run (3.5). */
+    public TimedPlan planTimed() { ... }
 
     /** Plans and applies under the configured policy, holding one namespace lock. */
     public ReconcileReport reconcile() { ... }
@@ -232,6 +233,8 @@ public final class SchemaReconciler {
 
 `build()` must fail with `ConfigurationException` if a required property is missing, if an explicitly configured dialect is invalid, or — when no dialect is set — if no `Dialect` provider is discoverable via `ServiceLoader` at all. `build()` must not open a connection: the `supports(DatabaseMetaData)` check of 3.4 needs one, so final dialect selection is deferred to the first use of the reconciler.
 
+`plan()` and `planTimed()` perform the planning steps of 5.1 without changing the target; `planTimed()` additionally returns the run's `RunTimings` (3.5). A `ReconcileListener` exception during planning aborts as `PlanningException` (3.6).
+
 ### 3.2 `DesiredState`
 
 ```java
@@ -247,7 +250,7 @@ Namespace references inside the script must be written as the placeholder `${nam
 The desired script is a trusted build artefact. It is executed with the privileges of the configured `DataSource`. Its content is constrained:
 
 1. The script should create objects only inside `${namespace}` (or unqualified). A statement that creates an object in another namespace escapes the scratch namespace — it can neither be detected nor cleaned up — so its behaviour is undefined. A dialect may instead reject a statement it can determine would create an object with no namespace anchor at all — a role or a server, for example — since such an object could never appear in a snapshot (5.4).
-2. The script must not create, alter or drop namespaces, must not acquire session-level locks (for example `pg_advisory_lock`), and must not change session state (for example `SET` without `LOCAL`, `RESET`, `LOAD`): session-level effects are not undone by the scratch rollback and can leak onto a pooled connection (C-21). A dialect may also reject a statement whose created, altered or dropped object name is qualified by a namespace other than the scratch namespace — the statement would escape the scratch namespace even though its text parses.
+2. The script must not create, alter or drop namespaces, must not acquire session-level locks (for example `pg_advisory_lock`), and must not change session state (for example `SET` without `LOCAL`, `RESET`, `LOAD`, or `set_config` with `is_local` other than the literal `true`): session-level effects can leak onto a pooled connection (C-21). A dialect should detect these statically, including inside anonymous code blocks, and must release any session-level lock a script took indirectly (for example inside a function it invoked) before the scratch connection is reused (A.2). A dialect may also reject a statement whose created, altered or dropped object name is qualified by a namespace other than the scratch namespace — the statement would escape the scratch namespace even though its text parses.
 3. On transactional dialects, the script must not contain transaction control (`BEGIN`, `COMMIT`, `ROLLBACK`, `SAVEPOINT`), nor statements that cannot run inside a transaction block, for example `CREATE INDEX CONCURRENTLY` or `VACUUM` (OI-3). After executing the script, the dialect must check that the run's transaction and scratch savepoint are still intact. If they are not, it must remove the scratch namespace and fail with `DesiredStateException`.
 4. Other non-DDL statements may appear; their effects are confined to the scratch connection.
 5. The script must not refer to the target namespace by its literal name; it uses `${namespace}` or unqualified names instead. Before substitution, the core must search the script for the target namespace identifier — bare or enclosed in the dialect's identifier quotes, compared case-insensitively — immediately followed by `.` and not preceded by an identifier character (letter, digit, `_`, `$`) or by `.`. On a match, `plan()` must fail with `DesiredStateException` giving the position of the first match.
@@ -329,7 +332,7 @@ public record RunTimings(
         Duration verify) { }    // post-apply snapshot re-read and comparison
 ```
 
-`timings` measures the run so adopters can size its locking impact on a realistic database (OI-7). DDL locks release only at commit, so the lock-holding window is `apply` + `verify`. All phases are monotonic elapsed times measured with `System.nanoTime`, never wall-clock differences. On failure the run still surfaces its timings: the exception's `timings()` returns the completed phases plus the partial duration of the phase that failed (section 7). `statementTimeout` bounds each *statement*, not the run — a run of many short statements can exceed it.
+`timings` measures the run so adopters can size its locking impact on a realistic database (OI-6). `SchemaReconciler.planTimed()` (3.1) returns the same measurements for a planning run as a `TimedPlan(plan, timings)`; its `apply` and `verify` phases are zero. DDL locks release only at commit, so the lock-holding window is `apply` + `verify`. All phases are monotonic elapsed times measured with `System.nanoTime`, never wall-clock differences. On failure the run still surfaces its timings: the exception's `timings()` returns the completed phases plus the partial duration of the phase that failed (section 7). `statementTimeout` bounds each *statement*, not the run — a run of many short statements can exceed it.
 
 - `UP_TO_DATE`: the plan had no changes. Unexpected objects and `UNSUPPORTED` differences reported under `REPORT` do not prevent `UP_TO_DATE`. They are listed in `unexpected` and `unsupported` respectively and never produce changes (5.4, 5.5).
 - `RECONCILED`: at least one change was applied and verified.
@@ -346,7 +349,7 @@ public interface ReconcileListener {
 }
 ```
 
-Listeners are called on the reconciling thread. An exception thrown by a listener must abort the run as `ApplyException`, carrying the changes applied so far (possibly none) and, when thrown from `applying` or `applied`, the change being processed. This holds even when the exception comes from `planned`, before anything is applied. In transactional dialects the abort rolls everything back.
+Listeners are called on the reconciling thread. An exception thrown by a listener must abort the run as `ApplyException`, carrying the changes applied so far (possibly none) and, when thrown from `applying` or `applied`, the change being processed. This holds even when the exception comes from `planned`, before anything is applied. `plan()` applies nothing, so there a listener exception aborts as `PlanningException`. In transactional dialects the abort rolls everything back.
 
 ## 4. Model
 
@@ -739,7 +742,7 @@ A release of this project ships three deliverables: this document, the reference
 ## 10. Versioning and compatibility
 
 1. Releases follow Semantic Versioning 2.0.0.
-2. Within a major version, the API and model must stay source- and binary-compatible. New SPI methods must be `default` methods. Before 1.0 the SPI may still change signatures: in this version `executeScript` gained the `scratchNamespace` parameter, and `statementTimeout` and `checkAccess` were added as defaults — dialect implementations built against earlier versions must be recompiled.
+2. Within a major version, the API and model must stay source- and binary-compatible. New SPI methods must be `default` methods. Before 1.0 the SPI may still change signatures, so dialect implementations must be recompiled against each release.
 3. A dialect declares the core major version it was built against via `Dialect.coreMajorVersion()` (6.1). The core must refuse, with `ConfigurationException`, a dialect reporting a different major version than its own.
 4. Changing a dialect's normalisation rules is a breaking change for that dialect, because it can turn equal objects into drifted ones.
 5. Implementations of this specification must run on Java SE 25 or later and must not rely on preview, incubator or deprecated-for-removal APIs.
@@ -751,10 +754,9 @@ A release of this project ships three deliverables: this document, the reference
 | OI-1 | One script per dialect, or one portable script? | One script per dialect. Translation is a non-goal (1.5). |
 | OI-2 | Should version 1 ever drop unexpected objects? | No. Revisit with an explicit `prune` policy in a later version. |
 | OI-3 | Online index builds (`CREATE INDEX CONCURRENTLY` cannot run in a transaction) | Out of scope for version 1; document as a known limitation of the PostgreSQL profile. |
-| OI-4 | Namespace-token replacement (5.3 rule 1) could also match text inside string literals or routine bodies | Partly resolved in 0.5: matches now require an identifier boundary, and scripts may not name the target literally (3.2). Matches inside literals remain possible and are symmetric between desired and actual, so they do not cause drift. Prototype on the bundled deployment fixture before freezing. |
+| OI-4 | Namespace-token replacement (5.3 rule 1) could also match text inside string literals or routine bodies | Matches require an identifier boundary and scripts may not name the target literally (3.2). Matches inside literals remain possible and are symmetric between desired and actual, so they do not cause drift. Prototype on the bundled deployment fixture before freezing. |
 | OI-5 | Sequence current values differ between scratch and target | Compare sequence options only, never the current value. |
-| OI-6 | Rule 5.6(1) classified every change to an existing column as `DESTRUCTIVE`, including ones that cannot lose data (changing a default, dropping `NOT NULL`) | Resolved: rule 5.6(1) now permits `REBUILD` for column alterations that cannot lose or rewrite data; the PostgreSQL profile renders them as in-place `ALTER COLUMN` statements (A.6). |
-| OI-7 | DDL applied in one transaction holds its locks (for example `ACCESS EXCLUSIVE` for recreated constraints and indexes) until commit | Document in the PostgreSQL profile. Applications should reconcile at startup, before taking traffic. |
+| OI-6 | DDL applied in one transaction holds its locks (for example `ACCESS EXCLUSIVE` for recreated constraints and indexes) until commit | Document in the PostgreSQL profile. Applications should reconcile at startup, before taking traffic. |
 
 ## Appendix A. PostgreSQL profile — reference implementation
 
@@ -770,9 +772,9 @@ A release of this project ships three deliverables: this document, the reference
 
 ### A.2 Locking
 
-**Access preflight (`checkAccess`).** Before the lock, the dialect resolves the target namespace with `to_regnamespace` — a null result fails the run with `ConfigurationException`, because PostgreSQL silently ignores a `search_path` entry that names a missing schema and applied DDL would land in the wrong namespace — and checks `has_schema_privilege(current_user, <namespace>, 'USAGE,CREATE')`, failing with `ConfigurationException` when the connecting role lacks either. When no `scratchDataSource` is configured it also checks `has_database_privilege(current_user, 'CREATE')`, the privilege scratch-schema creation needs, and fails with `ConfigurationException` naming the missing privilege (5.1 step 1).
+**Access preflight (`checkAccess`).** Before the lock, the dialect resolves the target namespace with `to_regnamespace` — a null result fails the run with `ConfigurationException`, because PostgreSQL silently ignores a `search_path` entry that names a missing schema and applied DDL would land in the wrong namespace — and checks `has_schema_privilege(current_user, <namespace>, 'USAGE')` and, separately, `'CREATE'` (a comma-separated list means *any of*, so the two privileges must not share one call), failing with `ConfigurationException` when the connecting role lacks either. The namespace is passed to `to_regnamespace` as a quoted identifier so mixed-case names resolve exactly. When no `scratchDataSource` is configured it also checks `has_database_privilege(current_user, 'CREATE')`, the privilege scratch-schema creation needs, and fails with `ConfigurationException` naming the missing privilege (5.1 step 1).
 
-`SELECT pg_advisory_xact_lock(hashtextextended(:key, 0))` with `:key = 'studio.epicquest.schema.reconciler:' || <database> || ':' || <namespace>`, under `SET LOCAL lock_timeout` set to the reconciler's `lockTimeout`. Once the lock is held, the dialect must run `SET LOCAL lock_timeout = DEFAULT`, so that the reconciler's timeout does not also govern lock waits of the applied DDL; those follow the session's own setting. The lock is released by commit or rollback. The dialect must also call `pg_advisory_unlock_all()` before returning the connection, in case the script took session-level locks.
+`SELECT pg_advisory_xact_lock(hashtextextended(:key, 0))` with `:key = 'studio.epicquest.schema.reconciler:' || <database> || ':' || <namespace>`, under `SET LOCAL lock_timeout` set to the reconciler's `lockTimeout`. Once the lock is held, the dialect must run `SET LOCAL lock_timeout = DEFAULT`, so that the reconciler's timeout does not also govern lock waits of the applied DDL; those follow the session's own setting. The lock is released by commit or rollback. Session-level advisory locks are not undone by a rollback, so a lock taken by the script — directly, or inside a function it invoked — would outlive the scratch run. The dialect must call `pg_advisory_unlock_all()` immediately after the scratch rollback and again before returning the connection. Transaction-scoped locks, including the namespace lock, are unaffected by it.
 
 When `statementTimeout` is configured, the dialect applies it immediately after the lock as `SET LOCAL statement_timeout = <millis>`; being transaction-scoped it needs no explicit restore and never bounds the lock wait itself. With a separate `scratchDataSource` the engine applies the same bound on the scratch connection too — one `SET LOCAL` cannot cross connections, so without this the desired script and scratch snapshot read would run unbounded. It bounds *every* statement of the run — catalog reads included — not the total run duration. Note that inspection itself can stall: catalog getters such as `pg_get_expr` open the relation they deparse with `AccessShareLock`, so reading a schema that holds an `ACCESS EXCLUSIVE`-locked table can block until `statement_timeout` cancels the query.
 
@@ -786,13 +788,13 @@ With `scratchDataSource` (6.3.2), the scratch connection uses a separate transac
 
 ### A.4 Script execution
 
-The whole script is sent in one `Statement.execute` call. The server parses it, so dollar-quoted bodies need no client-side splitting. This matches the current reconciler and the jOOQ probe result in Appendix D.
+The whole script is sent in one `Statement.execute` call. The server parses it, so dollar-quoted bodies need no client-side splitting.
 
 ### A.5 Catalog sources
 
 | Kind | Source | Canonical definition |
 |---|---|---|
-| `TABLE` | `pg_class` (`relkind` `r`, excluding inheritance children) | `relkind`, `relpersistence`, `reloptions`, `relreplident`; columns are separate objects |
+| `TABLE` | `pg_class` (`relkind` `r`, excluding inheritance children) | `relkind`, `relpersistence`, `reloptions`, `relreplident`, and for replica identity `USING INDEX` the index name; columns are separate objects |
 | `COLUMN` | `pg_attribute`, `pg_attrdef`, `pg_collation` | `format_type(atttypid, atttypmod)`, nullability, `pg_get_expr(adbin, adrelid)` as the default or, when `attgenerated` is set, as the generation expression; collation when it is not the type's default; identity kind and identity sequence options |
 | `PRIMARY_KEY`, `UNIQUE`, `FOREIGN_KEY`, `CHECK` | `pg_constraint` (`contype` `p`, `u`, `f`, `c`) | `pg_get_constraintdef(oid)` |
 | `INDEX` | `pg_index` (`relkind` `i`), excluding constraint-backing indexes (`pg_constraint.conindid` on `p`, `u`, `x` constraints) and partition-child indexes | `pg_get_indexdef(indexrelid)` |
@@ -800,7 +802,7 @@ The whole script is sent in one `Statement.execute` call. The server parses it, 
 | `SEQUENCE` | `pg_sequence` | type, start, increment, min, max, cycle; never the current value |
 | `ROUTINE` | `pg_proc` (`prokind` `f`, `p`) | `pg_get_functiondef(oid)`; the identity signature (4.1) is `proname` plus `format_type` over each element of `proargtypes` |
 | `TRIGGER` | `pg_trigger` (`NOT tgisinternal`) | `pg_get_triggerdef(oid, true)` plus the enabled state (`tgenabled`) |
-| dependencies | `pg_depend`, `pg_rewrite`, `pg_inherits`, `pg_trigger` | populate `dependsOn` |
+| dependencies | `pg_depend`, `pg_rewrite`, `pg_inherits`, `pg_trigger`, restricted to objects of the namespace being read | populate `dependsOn` |
 | `OTHER` | see below | detected so that unsupported constructs are reported (5.4) |
 
 `OTHER` detection covers every namespace-scoped catalog object the managed
@@ -859,10 +861,14 @@ scratch namespace itself. References to foreign schemas elsewhere in a
 statement remain legal: a cross-schema `REFERENCES` clause is a declared
 external dependency, not an escaping creation. Finally it rejects
 session-state changes — `SET` without `LOCAL` or `TRANSACTION`,
-`RESET` and `LOAD` — which the scratch rollback would not undo (3.2
-rule 2). Casts and transforms anchored only to
+`RESET`, `LOAD`, and any `set_config` call whose third argument is not the
+literal `true` (its arguments are parsed, string literals included) — and
+scans the bodies of `DO` blocks for `set_config` and session advisory
+locks (3.2 rule 2). Lexically it follows PostgreSQL: backslash escapes
+inside `E'...'` strings, and a `$` that continues an identifier does not
+open a dollar-quoted body. Casts and transforms anchored only to
 foreign objects — a `CAST (text AS int)` with a `pg_catalog` function —
-remain outside the model. Appendix E tabulates coverage against the
+remain outside the model. Appendix D tabulates coverage against the
 PostgreSQL 14–19 SQL command sets.
 
 The snapshot must be read with `search_path` set to the namespace being read, using `SET LOCAL` so that the setting ends with the transaction, or with the savepoint for the scratch snapshot. `pg_get_*def` then omits the qualifier for that namespace. Normalisation rule 5.3(1) then handles explicit qualifiers that remain.
@@ -885,25 +891,25 @@ Name scopes (`nameScopes`, 5.8.7). Tables, views, sequences and indexes share on
 
 | Difference | Statements | Safety |
 |---|---|---|
-| `MISSING` table | `CREATE TABLE` assembled from all desired columns, including `NOT NULL` columns without defaults (no separate column changes, 5.8.4); constraints and indexes follow as separate changes | `ADDITIVE` |
+| `MISSING` table | `CREATE TABLE` assembled from all desired columns, including `NOT NULL` columns without defaults (no separate column changes, 5.8.4), with `UNLOGGED` and `WITH (<reloptions>)` as desired, followed by `ALTER TABLE ... REPLICA IDENTITY FULL|NOTHING` when set; constraints and indexes follow as separate changes | `ADDITIVE` |
 | `MISSING` nullable column on an existing table | `ALTER TABLE ... ADD COLUMN` | `ADDITIVE` |
 | `MISSING` `NOT NULL` column with a constant default (see below) | `ALTER TABLE ... ADD COLUMN ... NOT NULL DEFAULT` | `ADDITIVE` (metadata-only since PostgreSQL 11) |
 | `MISSING` `NOT NULL` column on an existing table whose default is not constant | manual change (no statements) | `DESTRUCTIVE` |
-| `MISSING` constraint | `ALTER TABLE ... ADD CONSTRAINT <name> <pg_get_constraintdef>` | `ADDITIVE` |
+| `MISSING` constraint | `ALTER TABLE ... ADD CONSTRAINT <name> <pg_get_constraintdef>`, followed by `ALTER TABLE ... REPLICA IDENTITY USING INDEX <name>` when its index is the table's replica identity | `ADDITIVE` |
 | `DRIFTED` constraint | a `DROP` change `ALTER TABLE ... DROP CONSTRAINT`, then a `CREATE` change `ADD CONSTRAINT` | `REBUILD` |
-| `MISSING` / `DRIFTED` index | `CREATE`: the desired `pg_get_indexdef`; when drifted, preceded by a `DROP` change `DROP INDEX` | `ADDITIVE` / `REBUILD` |
+| `MISSING` / `DRIFTED` index | `CREATE`: the desired `pg_get_indexdef`, followed by `ALTER TABLE ... REPLICA IDENTITY USING INDEX` when it is the table's replica identity; when drifted, preceded by a `DROP` change `DROP INDEX` | `ADDITIVE` / `REBUILD` |
 | `MISSING` / `DRIFTED` view | `CREATE`: `CREATE VIEW ... AS <pg_get_viewdef>`; when drifted, preceded by a `DROP` change `DROP VIEW` | `ADDITIVE` / `REBUILD` |
 | `MISSING` sequence not covered by a table create | `CREATE`: `CREATE SEQUENCE` with the desired options, followed by `ALTER SEQUENCE ... OWNED BY` when it is owned | `ADDITIVE` |
 | `DRIFTED` sequence | `ALTER`: `ALTER SEQUENCE` setting the desired options; the current value is never changed (OI-5) | `DESTRUCTIVE` |
 | `MISSING` routine | `CREATE`: `pg_get_functiondef` | `ADDITIVE` |
 | `DRIFTED` routine | `ALTER`: `CREATE OR REPLACE` from `pg_get_functiondef`; if the return type changed, a `DROP` change `DROP FUNCTION`/`DROP PROCEDURE` plus a `CREATE` change instead | `REBUILD` |
-| `MISSING` / `DRIFTED` trigger | `CREATE`: `pg_get_triggerdef`; when drifted, preceded by a `DROP` change `DROP TRIGGER` | `ADDITIVE` / `REBUILD` |
+| `MISSING` / `DRIFTED` trigger | `CREATE`: `pg_get_triggerdef`, followed by `ALTER TABLE ... ENABLE|DISABLE TRIGGER` for a non-default enabled state; when drifted, preceded by a `DROP` change `DROP TRIGGER` | `ADDITIVE` / `REBUILD` |
 | `DRIFTED` column | in-place `ALTER TABLE ... ALTER COLUMN` statements decomposed from the canonical difference — `SET`/`DROP DEFAULT`, `DROP NOT NULL`, and `TYPE` only for a widening (below); one `ALTER` change | `REBUILD` |
 | `DRIFTED` column that also needs `SET NOT NULL` | the `REBUILD` change above carries only the safe statements; the `SET NOT NULL` renders as a second `ALTER` change on the same column | `DESTRUCTIVE` |
 | `DRIFTED` column with a generated, identity or collation change, or a type change outside the widening list | manual change (no statements) | `DESTRUCTIVE` |
-| any `DRIFTED` table, `MISSING` `NOT NULL` column without default on an existing table, table-shape conflict | manual change (no statements) in version 1 | `DESTRUCTIVE` |
+| any `DRIFTED` table, `MISSING` `NOT NULL` column without default on an existing table, table-shape conflict | manual change (no statements) | `DESTRUCTIVE` |
 
-**Column type widenings.** A `DRIFTED` column's `TYPE` alteration is rendered only for conversions on this allowlist — conversions that preserve every stored value and cannot fail: the integer chain (`smallint` → `integer` → `bigint`), `character varying(n)` growing or becoming `text`, `character(n)` growing, and `numeric(p,s)` to `numeric(p′,s′)` with `p′ ≥ p` and `s′ ≥ s`, or to unbounded `numeric`. Everything else — `text` to `varchar(n)`, `bigint` to `integer`, `varchar` to `integer`, `char` to `varchar`/`text` (trailing spaces are stripped), type-family changes — stays a manual change (5.6 rule 1). The allowlist defines safety, not the planner: several entries (`integer` chain, `character`/`numeric` growth) still rewrite the table physically under the `ALTER` lock — safe for data, not free at runtime.
+**Column type widenings.** A `DRIFTED` column's `TYPE` alteration is rendered only for conversions on this allowlist — conversions that preserve every stored value and cannot fail: the integer chain (`smallint` → `integer` → `bigint`), `character varying(n)` growing or becoming `text`, `character(n)` growing, and `numeric(p,s)` to `numeric(p′,s′)` with `s′ ≥ s` and `p′ − s′ ≥ p − s` (the integer digits never shrink), or to unbounded `numeric`. Everything else — `text` to `varchar(n)`, `bigint` to `integer`, `varchar` to `integer`, `char` to `varchar`/`text` (trailing spaces are stripped), type-family changes — stays a manual change (5.6 rule 1). The allowlist defines safety, not the planner: several entries (`integer` chain, `character`/`numeric` growth) still rewrite the table physically under the `ALTER` lock — safe for data, not free at runtime.
 
 **Constant defaults.** Deciding whether an arbitrary default expression is volatile would require parsing SQL (P1), so the profile uses a conservative lexical rule, which 5.6 rule 3 permits. A default counts as *constant* only if its canonical text is a numeric literal, a boolean literal, `NULL`, or a quoted string literal, in each case optionally followed by one `::type` cast. Anything else, for example `now()`, `gen_random_uuid()`, an arithmetic expression or any function call, is treated as not constant. A dialect must classify by this rule and must not loosen it.
 
@@ -912,7 +918,7 @@ Name scopes (`nameScopes`, 5.8.7). Tables, views, sequences and indexes share on
 ### A.7 Migration path for an existing deployment script
 
 1. Replace the literal namespace qualifier (for example `svc.`) in the deployment script `db/schema.sql` with `${namespace}.`.
-2. Remove the deployment-only statements that violate the script constraints of 3.2 — `CREATE SCHEMA IF NOT EXISTS svc;` and `SELECT pg_advisory_lock(...)` — because the library now owns namespace binding and locking. (`pg_advisory_lock` would otherwise leak a session-level lock onto the pooled connection: it is not released by rollback.)
+2. Remove the deployment-only statements that violate the script constraints of 3.2 — `CREATE SCHEMA IF NOT EXISTS svc;` and `SELECT pg_advisory_lock(...)` — because the library owns namespace binding and locking. (`pg_advisory_lock` would otherwise leak a session-level lock onto the pooled connection: it is not released by rollback.)
 3. Replace the hand-written reconcile routine with a `SchemaReconciler.builder()` call configured for the target namespace, and delete the duplicated `TABLES`, `CONSTRAINTS`, `INDEXES` and `VIEWS` maps.
 4. Keep the application's existing reconcile tests as a regression suite until the TCK covers the same scenarios.
 
@@ -951,29 +957,15 @@ Declarative, desired-state schema management is an established pattern; what is 
 | migra / `results dbdiff` (Python) | Diffs two live PostgreSQL databases into a migration script; drops require `--unsafe`. Deprecated upstream; needs a live desired-state database. |
 | apgdiff (Java) | Diffs two `pg_dump` outputs into upgrade DDL. Client-side parser, unmaintained, offline dumps only. |
 | Apache DdlUtils (Java) | Historic alter-database-to-model library; unmaintained since the late 2000s, pre-dating modern DDL features. |
-| Liquibase `diff`/`diffChangeLog`, jOOQ `Meta.diff` | Java diff/changelog generators; probed and rejected for this schema in Appendix D (fidelity and destructive output). |
+| Liquibase `diff`/`diffChangeLog`, jOOQ `Meta.diff` | Java diff/changelog generators; rejected: their parsers fail on functions, triggers and expression indexes, and generated diffs emit destructive `drop view` statements. |
 | Hibernate `hbm2ddl`, Prisma `db push`, Drizzle push | ORM-scoped declarative updates; model-derived, not script-derived. |
 | pgroll, Reshape | Zero-downtime *versioned* migration engines (expand/contract); a different problem than state reconciliation. |
 
 Distinguishing properties of this design: the target engine is the only parser (P1), comparison is engine-canonical (P2), unexpected objects are never dropped (P3), the scratch namespace lives inside the run's transaction on the target database by default (savepoint rollback — no second server needed, unlike Skeema's temp schema or Atlas's dev database), applied changes are verified by re-reading the catalog (P6), and third-party dialects are checked by a conformance suite.
 
-## Appendix D. Library evaluation
+## Appendix D. PostgreSQL 14–19 feature coverage and test corpus
 
-Before the engine was built, PostgreSQL-aware tooling was evaluated as a candidate reconciler core for a Java service. Requirements came from an existing hand-written reconciler that (a) sends the whole `schema.sql` to the server in one call — PostgreSQL itself is the parser, so dollar-quoted bodies need no client-side splitting — and (b) duplicates its expected state in hand-written maps (`TABLES`, `CONSTRAINTS`, `INDEXES`, `VIEWS`) that verify the live catalog but never check function bodies, triggers or view bodies.
-
-| Candidate | Role | Verdict | Reason |
-|---|---|---|---|
-| Liquibase | introspection, changelog | Do not adopt | Migration-oriented; changelog fidelity for functions, triggers, view bodies and expression/partial indexes unproven; the design deliberately has no ordered changelog. |
-| jOOQ | DSL, DDL parser, `Meta` diff | Reject | Probed with OSS 3.21.9 on PostgreSQL 18.6: parser rejects functions and triggers ("pro edition"), DDL interpretation fails on expression indexes, generated diff emits destructive `drop view` statements. |
-| hand-written verifier | status quo | Baseline | Works, but duplicates expected state and under-verifies. |
-
-**Conclusion.** No library was worth adopting. The closest fix needs none: apply `schema.sql` into a scratch schema, compare its catalog (`pg_get_indexdef`, `pg_get_constraintdef`, `pg_get_viewdef`, `pg_get_functiondef`, `pg_get_triggerdef`) with the live one, and the duplicated maps disappear — the working approach that became P1.
-
-**jOOQ probe detail** (OSS 3.21.9, PostgreSQL 18.6, 23-table real-world fixture): whole-file parse fails at the first `CREATE FUNCTION`; per-statement parsing needs a dollar-quote-aware splitter (95/115 pass; functions, triggers and multi-clause `ALTER`s fail); `Meta` interpretation yields 12/23 tables and 8/46 indexes; live-catalog `Meta` works well but duplicates what `pg_get_*def` returns more exactly; `migrateTo` produced 149 queries starting with `drop view` — neither faithful nor non-destructive.
-
-## Appendix E. PostgreSQL 14–19 feature coverage and test corpus
-
-Coverage of the PostgreSQL SQL command set by the reference dialect, measured against what a desired script can express — PostgreSQL 18.6 documentation, part VI reference. The PostgreSQL 15, 16 and 17 command sets are identical; 14 lacks only MERGE (a data statement the script check passes through like other DML — on 14 it fails at execution, as any version-specific user syntax does). The catalog queries use no 14-plus-only columns, and the suite runs green on PostgreSQL 14.24, 15.19, 16.15 and 17.11 (the corpus exercises two v15 constructs — NULLS NOT DISTINCT indexes and security_invoker views — downgraded by a test-only transform on pre-15 servers, alongside the uuidv7() stand-in on pre-18). The PostgreSQL 19 (rc1) delta: the command set gains `REPACK` and `WAIT FOR LSN`, both rejected as session/utility statements below, and `pg_publication_sequences` exposes sequence publication bindings. The suite also runs green on `postgres:19rc1`.
+Coverage of the PostgreSQL SQL command set by the reference dialect, measured against what a desired script can express (PostgreSQL documentation, part VI reference). The command sets of PostgreSQL 15, 16 and 17 are identical; 14 lacks only `MERGE`, a data statement the script check passes through like other DML (on 14 it fails at execution, as any version-specific user syntax does). The catalog queries use no columns that are missing on 14. PostgreSQL 19 adds `REPACK` and `WAIT FOR LSN`, both rejected as session/utility statements below, and `pg_publication_sequences`, which exposes sequence publication bindings.
 
 ### Reconciled constructs (managed kinds)
 
@@ -995,7 +987,7 @@ Coverage of the PostgreSQL SQL command set by the reference dialect, measured ag
 
 ### Out of scope (cluster-level or statement-only, per 1.5/3.2)
 
-Objects with no namespace anchor — `CREATE DATABASE`*, `CREATE TABLESPACE`*, `CREATE SUBSCRIPTION`*, `CREATE PUBLICATION`*, `CREATE EVENT TRIGGER`, `CREATE SERVER`, `CREATE FOREIGN DATA WRAPPER`, `CREATE USER MAPPING`, `CREATE ACCESS METHOD`, `CREATE LANGUAGE`, `CREATE ROLE|GROUP|USER`, `CREATE LARGE OBJECT`, default privileges, `REASSIGN OWNED`, `DROP OWNED`, `ALTER SYSTEM`, `ALTER ... SET SCHEMA`, role-membership `GRANT`/`REVOKE` — and session/utility statements — transaction control*, `VACUUM`*, `CHECKPOINT`*, `CLUSTER`*, `DISCARD`*, `LISTEN`/`NOTIFY`/`UNLISTEN`, session-level advisory locks, `LOAD`*, `REPACK`*, `WAIT FOR LSN`. Items marked `*` are rejected by the script check because they cannot run inside a transaction; the rest are rejected because their catalog rows have no namespace anchor and could never be detected (5.4), or — `WAIT FOR LSN` — because the statement manipulates session or replication state only. Casts and transforms anchored only to foreign objects have no anchor either and stay invisible; `DO`-block bodies are string literals to the lexical check, so dynamic DDL issued from them is not scanned.
+Objects with no namespace anchor — `CREATE DATABASE`*, `CREATE TABLESPACE`*, `CREATE SUBSCRIPTION`*, `CREATE PUBLICATION`*, `CREATE EVENT TRIGGER`, `CREATE SERVER`, `CREATE FOREIGN DATA WRAPPER`, `CREATE USER MAPPING`, `CREATE ACCESS METHOD`, `CREATE LANGUAGE`, `CREATE ROLE|GROUP|USER`, `CREATE LARGE OBJECT`, default privileges, `REASSIGN OWNED`, `DROP OWNED`, `ALTER SYSTEM`, `ALTER ... SET SCHEMA`, role-membership `GRANT`/`REVOKE` — and session/utility statements — transaction control*, `VACUUM`*, `CHECKPOINT`*, `CLUSTER`*, `DISCARD`*, `LISTEN`/`NOTIFY`/`UNLISTEN`, session-level advisory locks, `LOAD`*, `REPACK`*, `WAIT FOR LSN`. Items marked `*` are rejected by the script check because they cannot run inside a transaction; the rest are rejected because their catalog rows have no namespace anchor and could never be detected (5.4), or — `WAIT FOR LSN` — because the statement manipulates session or replication state only. Casts and transforms anchored only to foreign objects have no anchor either and stay invisible; `DO`-block bodies are scanned only for `set_config` and session advisory locks (3.2 rule 2), so dynamic DDL issued from them is not scanned.
 
 ### Test corpus
 

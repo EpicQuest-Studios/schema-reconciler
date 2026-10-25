@@ -23,7 +23,6 @@ import studio.epicquest.schema.reconciler.model.ObjectIds;
 import studio.epicquest.schema.reconciler.model.ObjectKind;
 import studio.epicquest.schema.reconciler.model.PlannedChange;
 import studio.epicquest.schema.reconciler.model.ReconcilePlan;
-import studio.epicquest.schema.reconciler.model.SchemaObject;
 import studio.epicquest.schema.reconciler.model.SchemaSnapshot;
 import studio.epicquest.schema.reconciler.spi.Dialect;
 
@@ -232,6 +231,12 @@ final class PlanBuilder {
                 .map(PlannedChange::target)
                 .collect(Collectors.toSet());
 
+        final var actualByScope = new HashMap<String, List<ObjectId>>();
+        for (final var have : actual.objects().values()) {
+            for (final var scope : dialect.nameScopes(have.id())) {
+                actualByScope.computeIfAbsent(scope, k -> new ArrayList<>()).add(have.id());
+            }
+        }
         final var createScopes = new HashMap<String, ObjectId>();
         for (final var change : changes) {
             if (change.action() != ChangeAction.CREATE) {
@@ -246,14 +251,11 @@ final class PlanBuilder {
                             + " in name scope '" + scope + "'");
                 }
             }
-            for (final var have : actual.objects().values()) {
-                if (have.id().equals(change.target()) || dropped.contains(have.id())) {
-                    continue;
-                }
-                for (final var scope : scopes) {
-                    if (dialect.nameScopes(have.id()).contains(scope)) {
+            for (final var scope : scopes) {
+                for (final var have : actualByScope.getOrDefault(scope, List.of())) {
+                    if (!have.equals(change.target()) && !dropped.contains(have)) {
                         throw new PlanningException("namespace '" + targetNamespace + "': "
-                                + change.target() + " collides with " + have.id()
+                                + change.target() + " collides with " + have
                                 + " in name scope '" + scope + "'");
                     }
                 }

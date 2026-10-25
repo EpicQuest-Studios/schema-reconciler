@@ -1,7 +1,10 @@
 package studio.epicquest.schema.reconciler.postgresql.internal;
 
+import java.util.ArrayList;
 import java.util.List;
+import java.util.Locale;
 import java.util.Set;
+import java.util.regex.Pattern;
 import studio.epicquest.schema.reconciler.DesiredStateException;
 
 /**
@@ -43,6 +46,10 @@ public final class PgScriptCheck {
     private static final Set<String> SESSION_LOCKS = Set.of(
             "PG_ADVISORY_LOCK", "PG_ADVISORY_LOCK_SHARED",
             "PG_TRY_ADVISORY_LOCK", "PG_TRY_ADVISORY_LOCK_SHARED");
+
+    private static final Pattern SET_CONFIG_CALL = Pattern.compile("\\bSET_CONFIG\\b");
+    private static final Pattern SESSION_LOCK_CALL = Pattern.compile(
+            "\\bPG_(TRY_)?ADVISORY_LOCK(_SHARED)?\\b");
 
     /** CREATE/DROP/ALTER head modifiers skipped before the object-kind word. */
     private static final Set<String> HEAD_MODIFIERS = Set.of(
@@ -90,6 +97,9 @@ public final class PgScriptCheck {
                         first + " cannot run inside a transaction block");
             }
             if (first.equals("CREATE") || first.equals("DROP") || first.equals("ALTER")) {
+                if (kindIndex(t) >= t.size()) {
+                    throw rejected(statement, first + " names no object kind");
+                }
                 final var object = objectWord(t);
                 if (object.equals("SCHEMA")) {
                     throw rejected(statement,
@@ -161,6 +171,9 @@ public final class PgScriptCheck {
                             "REINDEX " + reindexObject + " cannot run inside a transaction block");
                 }
             }
+            if (first.equals("SET") && t.size() < 2) {
+                throw rejected(statement, "SET names no setting");
+            }
             if (first.equals("SET")
                     && !(t.get(1).equals("LOCAL") || t.get(1).equals("TRANSACTION")
                             || t.get(1).equals("CONSTRAINTS"))) {
@@ -170,6 +183,14 @@ public final class PgScriptCheck {
             if (first.equals("RESET") || first.equals("LOAD")) {
                 throw rejected(statement,
                         first + " changes session state and must not appear in the script");
+            }
+            if (t.contains("SET_CONFIG")) {
+                checkSetConfig(statement, statement.text());
+            }
+            if (first.equals("DO")) {
+                for (final var body : PgSql.dollarBodies(statement.text())) {
+                    checkDoBody(statement, body);
+                }
             }
             if (t.stream().anyMatch(SESSION_LOCKS::contains)) {
                 throw rejected(statement,
@@ -188,6 +209,74 @@ public final class PgScriptCheck {
                         "WAIT FOR LSN is a session-level replication operation and must not appear in the script");
             }
         }
+    }
+
+    /**
+     * A {@code DO} block runs immediately but its body is opaque to the
+     * statement scan, so the session-leaking calls are matched on its text,
+     * string literals included ({@code EXECUTE '...'}).
+     */
+    private static void checkDoBody(PgSql.StatementTokens statement, String body) {
+        final var upper = body.toUpperCase(Locale.ROOT);
+        if (SESSION_LOCK_CALL.matcher(upper).find()) {
+            throw rejected(statement,
+                    "session-level advisory locks leak onto the pooled connection and are not allowed");
+        }
+        checkSetConfig(statement, body);
+    }
+
+    /**
+     * Every {@code set_config(name, value, is_local)} call in {@code text}
+     * (string literals included, so {@code EXECUTE '...'} is covered) must
+     * pass the literal {@code true} as its third argument; any other form —
+     * {@code false}, an expression, fewer arguments — is rejected.
+     */
+    private static void checkSetConfig(PgSql.StatementTokens statement, String text) {
+        final var matcher = SET_CONFIG_CALL.matcher(text.toUpperCase(Locale.ROOT));
+        while (matcher.find()) {
+            final var args = callArguments(text, matcher.end());
+            if (args == null || args.size() != 3 || !args.get(2).strip().equalsIgnoreCase("true")) {
+                throw rejected(statement,
+                        "set_config must pass the literal true as is_local: a session-level"
+                                + " setting leaks onto the pooled connection");
+            }
+        }
+    }
+
+    /** The top-level comma-separated arguments of the call whose name ends at {@code from}, or null. */
+    private static List<String> callArguments(String text, int from) {
+        var i = from;
+        while (i < text.length() && Character.isWhitespace(text.charAt(i))) {
+            i++;
+        }
+        if (i >= text.length() || text.charAt(i) != '(') {
+            return null;
+        }
+        final var args = new ArrayList<String>();
+        var depth = 0;
+        var start = i + 1;
+        for (; i < text.length(); i++) {
+            final var c = text.charAt(i);
+            if (c == '\'') {
+                i++;
+                while (i < text.length()
+                        && !(text.charAt(i) == '\'' && (i + 1 >= text.length() || text.charAt(i + 1) != '\''))) {
+                    i += text.charAt(i) == '\'' ? 2 : 1;
+                }
+            } else if (c == '(') {
+                depth++;
+            } else if (c == ')') {
+                depth--;
+                if (depth == 0) {
+                    args.add(text.substring(start, i));
+                    return args;
+                }
+            } else if (c == ',' && depth == 1) {
+                args.add(text.substring(start, i));
+                start = i + 1;
+            }
+        }
+        return null;
     }
 
     /**
@@ -332,21 +421,10 @@ public final class PgScriptCheck {
         return false;
     }
 
-    /** The first token after CREATE/DROP/ALTER, skipping modifiers like UNIQUE, OR, REPLACE, IF, NOT, EXISTS, CONCURRENTLY. */
+    /** The object-kind word after CREATE/DROP/ALTER and its modifiers, or empty. */
     private static String objectWord(List<String> tokens) {
-        for (var i = 1; i < tokens.size(); i++) {
-            final var w = tokens.get(i);
-            if (w.equals("UNIQUE") || w.equals("OR") || w.equals("REPLACE") || w.equals("IF")
-                    || w.equals("NOT") || w.equals("EXISTS") || w.equals("TEMP")
-                    || w.equals("TEMPORARY") || w.equals("UNLOGGED") || w.equals("GLOBAL")
-                    || w.equals("LOCAL") || w.equals("MATERIALIZED") || w.equals("RECURSIVE")
-                    || w.equals("FOREIGN") || w.equals("TRUSTED") || w.equals("UNTRUSTED")
-                    || w.equals("PROCEDURAL")) {
-                continue;
-            }
-            return w;
-        }
-        return "";
+        final var i = kindIndex(tokens);
+        return i < tokens.size() ? tokens.get(i) : "";
     }
 
     /**

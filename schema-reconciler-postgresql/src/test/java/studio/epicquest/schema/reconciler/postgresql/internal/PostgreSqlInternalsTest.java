@@ -625,6 +625,7 @@ class PostgreSqlInternalsTest {
                 {"bigint", "integer"},
                 {"integer", "smallint"},
                 {"numeric(12,3)", "numeric(10,2)"},
+                {"numeric(12,4)", "numeric(10,2)"},
                 {"numeric", "numeric(10,2)"}}) {
             final var want = "type=" + pair[0] + ";notnull=false";
             final var have = "type=" + pair[1] + ";notnull=false";
@@ -646,6 +647,8 @@ class PostgreSqlInternalsTest {
                 {"text", "character(5)"},                             // bpchar strips padding
                 {"character varying(10)", "character(5)"},            // bpchar strips padding
                 {"character(5)", "character varying(10)"},            // adds padding semantics
+                {"numeric(10,4)", "numeric(10,2)"},                   // fewer integer digits
+                {"numeric(10,2)", "numeric(10,4)"},                   // scale shrinks
                 {"text", "integer"},
                 {"timestamp with time zone", "timestamp without time zone"}}) {
             final var want = "type=" + pair[0] + ";notnull=false";

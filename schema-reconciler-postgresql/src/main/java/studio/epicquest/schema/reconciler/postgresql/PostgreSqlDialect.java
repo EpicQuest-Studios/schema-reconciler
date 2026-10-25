@@ -122,10 +122,15 @@ public final class PostgreSqlDialect implements Dialect {
         try (Statement s = connection.createStatement()) {
             try {
                 s.execute("ROLLBACK TO SAVEPOINT " + SAVEPOINT);
+                // the rollback undoes settings but not session advisory locks, which a
+                // function the script invoked may have taken (the static check cannot
+                // see through a call): release them before the connection is reused
+                s.execute("SELECT pg_advisory_unlock_all()");
             } catch (SQLException e) {
                 // the savepoint is gone: the script committed (or aborted) the
                 // transaction — remove the committed schema explicitly (A.3)
                 rollbackQuietly(connection);
+                s.execute("SELECT pg_advisory_unlock_all()");
                 s.execute("DROP SCHEMA " + PgIdentifiers.quote(scratchNamespace) + " CASCADE");
                 connection.commit();
                 throw new DesiredStateException("the desired script left the transaction: "
@@ -141,11 +146,16 @@ public final class PostgreSqlDialect implements Dialect {
                             boolean createNamespace) throws SQLException {
         if (namespace != null) {
             try (PreparedStatement ps = connection.prepareStatement(
+                    // a comma list means "any of", so each privilege is checked alone
                     "SELECT to_regnamespace(?),"
-                            + " has_schema_privilege(current_user, to_regnamespace(?),"
-                            + " 'USAGE,CREATE')")) {
-                ps.setString(1, namespace);
-                ps.setString(2, namespace);
+                            + " has_schema_privilege(current_user, to_regnamespace(?), 'USAGE')"
+                            + " AND has_schema_privilege(current_user, to_regnamespace(?), 'CREATE')")) {
+                // to_regnamespace parses its argument as an identifier, so
+                // quote it to keep mixed-case namespaces exact
+                final var quoted = PgIdentifiers.quote(namespace);
+                ps.setString(1, quoted);
+                ps.setString(2, quoted);
+                ps.setString(3, quoted);
                 try (ResultSet rs = ps.executeQuery()) {
                     rs.next();
                     if (rs.getObject(1) == null) {

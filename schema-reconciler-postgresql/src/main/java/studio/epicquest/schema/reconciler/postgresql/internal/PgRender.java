@@ -56,10 +56,8 @@ public final class PgRender {
                     ChangeSafety.ADDITIVE, createTableStatements(id, desired, ns),
                     Optional.of(want.definition()), "missing " + id));
             case COLUMN -> missingColumn(id, want, desired, ns);
-            case PRIMARY_KEY, UNIQUE, FOREIGN_KEY, CHECK ->
+            case PRIMARY_KEY, UNIQUE, FOREIGN_KEY, CHECK, INDEX, VIEW, TRIGGER ->
                     List.of(additive(id, want, ns, "missing " + id));
-            case INDEX -> List.of(additive(id, want, ns, "missing " + id));
-            case VIEW -> List.of(additive(id, want, ns, "missing " + id));
             case SEQUENCE -> {
                 final var statements = new ArrayList<String>();
                 statements.add(bind(want, PgCatalog.CREATE_SQL, ns));
@@ -72,17 +70,6 @@ public final class PgRender {
                         "missing " + id));
             }
             case ROUTINE -> List.of(additive(id, want, ns, "missing " + id));
-            case TRIGGER -> {
-                final var statements = new ArrayList<String>();
-                statements.add(bind(want, PgCatalog.CREATE_SQL, ns));
-                final var post = want.attributes().get(PgCatalog.POST_SQL);
-                if (post != null) {
-                    statements.add(bind(post, ns));
-                }
-                yield List.of(new PlannedChange(0, id, ChangeAction.CREATE,
-                        ChangeSafety.ADDITIVE, statements, Optional.of(want.definition()),
-                        "missing " + id));
-            }
             default -> List.of();
         };
     }
@@ -114,7 +101,22 @@ public final class PgRender {
                         .map(c -> "    " + c.attributes().get(PgCatalog.COLUMN_SQL))
                         .collect(Collectors.joining(",\n")))
                 .append("\n)");
+        final var tableAttrs = desired.objects().get(table).attributes();
+        final var options = tableAttrs.getOrDefault(PgCatalog.TABLE_OPTIONS, "");
+        if (!options.isEmpty()) {
+            create.append(" WITH (").append(options).append(')');
+        }
         statements.add(bind(create.toString(), ns));
+        // 'i' (USING INDEX) is applied after the index exists, see PgCatalog POST_SQL
+        final var replident = switch (tableAttrs.getOrDefault(PgCatalog.REPLIDENT, "d")) {
+            case "f" -> "FULL";
+            case "n" -> "NOTHING";
+            default -> null;
+        };
+        if (replident != null) {
+            statements.add(bind("ALTER TABLE " + TOKEN + "." + PgIdentifiers.quote(table.name())
+                    + " REPLICA IDENTITY " + replident, ns));
+        }
         sequences.stream()
                 .map(s -> s.attributes().get(PgCatalog.OWNED_SQL))
                 .filter(Objects::nonNull)
@@ -164,7 +166,7 @@ public final class PgRender {
                                                Difference difference, String ns) {
         return switch (id.kind()) {
             case COLUMN -> driftedColumn(id, want, difference, ns);
-            case PRIMARY_KEY, UNIQUE, FOREIGN_KEY, CHECK, INDEX, VIEW ->
+            case PRIMARY_KEY, UNIQUE, FOREIGN_KEY, CHECK, INDEX, VIEW, TRIGGER ->
                     recreate(id, want, ns, "drifted " + id);
             case SEQUENCE -> {
                 final var statements = new ArrayList<String>();
@@ -188,19 +190,6 @@ public final class PgRender {
                             Optional.of(want.definition()), "drifted " + id));
                 }
                 yield recreate(id, want, ns, "drifted " + id + " (return type changed)");
-            }
-            case TRIGGER -> {
-                final var w = want;
-                final var pair = new ArrayList<PlannedChange>(recreate(id, w, ns, "drifted " + id));
-                final var post = w.attributes().get(PgCatalog.POST_SQL);
-                if (post != null) {
-                    final var create = pair.get(1);
-                    final var statements = new ArrayList<String>(create.statements());
-                    statements.add(bind(post, ns));
-                    pair.set(1, new PlannedChange(0, create.target(), create.action(),
-                            create.safety(), statements, create.expected(), create.reason()));
-                }
-                yield pair;
             }
             default -> List.of(new PlannedChange(0, id, ChangeAction.ALTER,
                     ChangeSafety.DESTRUCTIVE, List.of(), Optional.empty(),
@@ -319,9 +308,10 @@ public final class PgRender {
      * change — every stored value converts without error, truncation or
      * semantic change. The allowlist is the integer chain, {@code character
      * varying} growth or conversion to {@code text}, {@code character(n)}
-     * growth, and {@code numeric} precision/scale growth. Several of these
+     * growth, and {@code numeric} growth that keeps the integer digits and
+     * does not shrink the scale. Several of these
      * rewrite the table (the integer chain, {@code character} growth,
-     * scale-increasing {@code numeric}); that is a locking concern (OI-7),
+     * scale-increasing {@code numeric}); that is a locking concern (OI-6),
      * not a data-safety one. Notably excluded: {@code character → character
      * varying/text} strips trailing spaces, and {@code → character} changes
      * padding semantics.
@@ -348,8 +338,10 @@ public final class PgRender {
         if (hb.equals("numeric") && wb.equals("numeric")) {
             final var hm = typmod(have);
             final var wm = typmod(want);
+            // integer digits (p - s) must not shrink, or existing values overflow
             return wm.length == 0
-                    || (hm.length == 2 && wm.length == 2 && wm[0] >= hm[0] && wm[1] >= hm[1]);
+                    || (hm.length == 2 && wm.length == 2
+                            && wm[1] >= hm[1] && wm[0] - wm[1] >= hm[0] - hm[1]);
         }
         return false;
     }
@@ -371,8 +363,18 @@ public final class PgRender {
 
     private static PlannedChange additive(ObjectId id, SchemaObject want, String ns, String reason) {
         return new PlannedChange(0, id, ChangeAction.CREATE, ChangeSafety.ADDITIVE,
-                List.of(bind(want, PgCatalog.CREATE_SQL, ns)),
-                Optional.of(want.definition()), reason);
+                createStatements(want, ns), Optional.of(want.definition()), reason);
+    }
+
+    /** The CREATE statement plus its post-create fragment (trigger enablement, replica identity). */
+    private static List<String> createStatements(SchemaObject want, String ns) {
+        final var statements = new ArrayList<String>();
+        statements.add(bind(want, PgCatalog.CREATE_SQL, ns));
+        final var post = want.attributes().get(PgCatalog.POST_SQL);
+        if (post != null) {
+            statements.add(bind(post, ns));
+        }
+        return statements;
     }
 
     /** A DROP change plus a CREATE change — the two halves of a recreate (4.4). */
@@ -382,8 +384,7 @@ public final class PgRender {
                 new PlannedChange(0, id, ChangeAction.DROP, ChangeSafety.REBUILD,
                         List.of(bind(want, PgCatalog.DROP_SQL, ns)), Optional.empty(), reason),
                 new PlannedChange(0, id, ChangeAction.CREATE, ChangeSafety.REBUILD,
-                        List.of(bind(want, PgCatalog.CREATE_SQL, ns)),
-                        Optional.of(want.definition()), reason));
+                        createStatements(want, ns), Optional.of(want.definition()), reason));
     }
 
     private static String seqRef(ObjectId id) {

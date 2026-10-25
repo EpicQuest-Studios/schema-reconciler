@@ -1,17 +1,17 @@
 package studio.epicquest.schema.reconciler.internal;
 
 import java.sql.Connection;
-import java.sql.DatabaseMetaData;
 import java.sql.SQLException;
 import java.sql.Statement;
 import java.time.Duration;
+import java.lang.ref.ReferenceQueue;
+import java.lang.ref.WeakReference;
 import java.util.ArrayList;
-import java.util.Collections;
+import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
-import java.util.WeakHashMap;
 import javax.sql.DataSource;
 import studio.epicquest.schema.reconciler.ApplyException;
 import studio.epicquest.schema.reconciler.ConfigurationException;
@@ -27,6 +27,7 @@ import studio.epicquest.schema.reconciler.ReconcileReport;
 import studio.epicquest.schema.reconciler.RunTimings;
 import studio.epicquest.schema.reconciler.SchemaReconcilerException;
 import studio.epicquest.schema.reconciler.StalePlanException;
+import studio.epicquest.schema.reconciler.TimedPlan;
 import studio.epicquest.schema.reconciler.VerificationException;
 import studio.epicquest.schema.reconciler.model.Definition;
 import studio.epicquest.schema.reconciler.model.Difference;
@@ -46,6 +47,51 @@ public final class Engine {
     private static final System.Logger LOG =
             System.getLogger("studio.epicquest.schema.reconciler");
 
+    /**
+     * Weak, identity-compared key: a plan is hashed and compared by reference
+     * (never by its record contents) and its metadata is dropped once the
+     * plan is garbage collected.
+     */
+    private static final class IdentityKey extends WeakReference<ReconcilePlan> {
+        private final int hash;
+
+        IdentityKey(ReconcilePlan plan, ReferenceQueue<ReconcilePlan> queue) {
+            super(plan, queue);
+            this.hash = System.identityHashCode(plan);
+        }
+
+        @Override
+        public int hashCode() {
+            return hash;
+        }
+
+        @Override
+        public boolean equals(Object other) {
+            return this == other || (other instanceof IdentityKey key
+                    && get() != null && get() == key.get());
+        }
+    }
+
+    private void putMeta(ReconcilePlan plan, PlanMeta meta) {
+        synchronized (planMeta) {
+            purgeCollected();
+            planMeta.put(new IdentityKey(plan, collectedPlans), meta);
+        }
+    }
+
+    private PlanMeta metaOf(ReconcilePlan plan) {
+        synchronized (planMeta) {
+            purgeCollected();
+            return planMeta.get(new IdentityKey(plan, null));
+        }
+    }
+
+    private void purgeCollected() {
+        for (var ref = collectedPlans.poll(); ref != null; ref = collectedPlans.poll()) {
+            planMeta.remove(ref);
+        }
+    }
+
     /** Metadata retained per issued plan for {@code apply()}. */
     private record PlanMeta(SchemaSnapshot desired,
                             Map<ObjectId, Map<ObjectId, Definition>> coveredByParent) { }
@@ -59,8 +105,8 @@ public final class Engine {
     private final Duration statementTimeout;
     private final ReconcileListener listener;
     private final DialectResolver resolver;
-    private final Map<ReconcilePlan, PlanMeta> planMeta =
-            Collections.synchronizedMap(new WeakHashMap<>());
+    private final Map<IdentityKey, PlanMeta> planMeta = new HashMap<>();
+    private final ReferenceQueue<ReconcilePlan> collectedPlans = new ReferenceQueue<>();
 
     public Engine(DataSource dataSource, DataSource scratchDataSource, String namespace,
                   DesiredState desiredState, Dialect dialect, ReconcilePolicy policy,
@@ -79,14 +125,51 @@ public final class Engine {
 
     /** Spec 5.1 plan(): steps 1–5, returning the plan without evaluating policy or applying. */
     public ReconcilePlan plan() {
+        return planTimed().plan();
+    }
+
+    /** {@link #plan()} with the phase timings of the planning run. */
+    public TimedPlan planTimed() {
+        final var clock = new PhaseClock();
         try (Session session = open()) {
-            session.lock();
-            final var actual = session.readActual();
-            final var desired = loadDesired(session);
-            final var built = buildPlan(session, actual, desired);
-            notifyPlanned(built.plan(), List.of());
-            planMeta.put(built.plan(), new PlanMeta(desired, built.coveredByParent()));
-            return built.plan();
+            var t = clock.now();
+            try {
+                session.lock();
+            } finally {
+                clock.lockWait = clock.since(t);
+            }
+            t = clock.now();
+            final SchemaSnapshot actual;
+            try {
+                actual = session.readActual();
+            } finally {
+                clock.readActual = clock.since(t);
+            }
+            t = clock.now();
+            final SchemaSnapshot desired;
+            try {
+                desired = loadDesired(session);
+            } finally {
+                clock.loadDesired = clock.since(t);
+            }
+            t = clock.now();
+            final PlanBuilder.Built built;
+            try {
+                built = buildPlan(session, actual, desired);
+            } finally {
+                clock.plan = clock.since(t);
+            }
+            // nothing is applied by plan(), so a listener failure is a planning failure
+            try {
+                listener.planned(built.plan());
+            } catch (RuntimeException e) {
+                throw new PlanningException(
+                        "namespace '" + namespace + "': listener aborted planning", e);
+            }
+            putMeta(built.plan(), new PlanMeta(desired, built.coveredByParent()));
+            return new TimedPlan(built.plan(), clock.snapshot());
+        } catch (SchemaReconcilerException e) {
+            throw e.withTimings(clock.snapshot());
         }
     }
 
@@ -179,7 +262,7 @@ public final class Engine {
             PolicyEvaluator.Evaluation evaluation =
                     new PolicyEvaluator(policy).evaluate(plan, actual, desired);
             Map<ObjectId, Map<ObjectId, Definition>> covered =
-                    Optional.ofNullable(planMeta.get(plan))
+                    Optional.ofNullable(metaOf(plan))
                             .map(PlanMeta::coveredByParent)
                             .orElseGet(() -> PlanBuilder.coverageOf(
                                     session.dialect, namespace, plan.differences(), desired));
@@ -322,7 +405,7 @@ public final class Engine {
     }
 
     private SchemaSnapshot desiredFor(ReconcilePlan plan, Session session) {
-        final var meta = planMeta.get(plan);
+        final var meta = metaOf(plan);
         if (meta != null) {
             return meta.desired();
         }
@@ -471,6 +554,10 @@ public final class Engine {
         return new Session();
     }
 
+    /**
+     * Spec 3.6: a listener failure during {@code reconcile()} or {@code apply()},
+     * from {@code planned} too, aborts the run as {@link ApplyException}.
+     */
     private void notifyPlanned(ReconcilePlan plan, List<PlannedChange> applied) {
         try {
             listener.planned(plan);
@@ -614,15 +701,17 @@ public final class Engine {
                         conn.setAutoCommit(true);
                     }
                 } catch (SQLException e) {
-                    throw new SchemaReconcilerException(
-                            "namespace '" + namespace + "': could not restore auto-commit", e);
+                    // close() runs while an exception may be propagating: a throw
+                    // here would replace it, so the failure is only logged
+                    LOG.log(System.Logger.Level.WARNING,
+                            "namespace ''" + namespace + "'': could not restore auto-commit", e);
                 }
             } finally {
                 try {
                     conn.close();
                 } catch (SQLException e) {
-                    throw new SchemaReconcilerException(
-                            "namespace '" + namespace + "': could not close the connection", e);
+                    LOG.log(System.Logger.Level.WARNING,
+                            "namespace ''" + namespace + "'': could not close the connection", e);
                 }
             }
         }

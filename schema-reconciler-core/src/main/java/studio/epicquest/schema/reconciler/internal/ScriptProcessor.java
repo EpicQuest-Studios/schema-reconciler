@@ -1,6 +1,5 @@
 package studio.epicquest.schema.reconciler.internal;
 
-import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import studio.epicquest.schema.reconciler.DesiredStateException;
 import studio.epicquest.schema.reconciler.spi.Dialect;

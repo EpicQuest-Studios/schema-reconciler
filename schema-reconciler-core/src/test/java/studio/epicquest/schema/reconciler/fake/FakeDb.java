@@ -25,7 +25,6 @@ import studio.epicquest.schema.reconciler.model.ObjectId;
 import studio.epicquest.schema.reconciler.model.ObjectIds;
 import studio.epicquest.schema.reconciler.model.ObjectKind;
 import studio.epicquest.schema.reconciler.model.SchemaObject;
-import studio.epicquest.schema.reconciler.model.SchemaSnapshot;
 
 /**
  * An in-memory database exposing JDBC proxies, so the whole engine can run in

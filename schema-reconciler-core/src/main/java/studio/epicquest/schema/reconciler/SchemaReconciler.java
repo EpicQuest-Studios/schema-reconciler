@@ -30,6 +30,11 @@ public final class SchemaReconciler {
         return engine.plan();
     }
 
+    /** Like {@link #plan()}, also returning the phase timings of the planning run. */
+    public TimedPlan planTimed() {
+        return engine.planTimed();
+    }
+
     /** Plans and applies under the configured policy, holding one namespace lock. */
     public ReconcileReport reconcile() {
         return engine.reconcile();
