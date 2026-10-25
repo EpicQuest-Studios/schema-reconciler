@@ -50,12 +50,46 @@ public interface Dialect {
      */
     default void bindSessionNamespace(Connection connection, String namespace) throws SQLException { }
 
+    /**
+     * Bounds how long any single statement may run during this run (for
+     * example {@code SET LOCAL statement_timeout} on PostgreSQL). Called once
+     * on the target connection after the namespace lock is acquired, so it
+     * never bounds the lock wait itself, and again on the scratch connection
+     * when a separate {@code scratchDataSource} is configured, so the desired
+     * script and scratch snapshot read stay bounded there too. Adopters use
+     * it to cap the time applied DDL — and the catalog reads around it — can
+     * hold locks. A dialect that cannot express the bound leaves it a no-op.
+     */
+    default void statementTimeout(Connection connection, Duration timeout) throws SQLException { }
+
+    /**
+     * Verifies that this connection's user holds the privileges a reconcile run
+     * needs (for example {@code USAGE, CREATE} on the target schema plus
+     * {@code CREATE} on the database for the scratch namespace, on
+     * PostgreSQL). Called once per run, before the lock, on the target
+     * connection — with {@code createNamespace} telling it whether this
+     * connection must also create the scratch namespace — and again on the
+     * scratch connection when a separate {@code scratchDataSource} is
+     * configured, then with {@code namespace} {@code null} and
+     * {@code createNamespace} {@code true}. A dialect that cannot express the
+     * check leaves it a no-op. Throw {@code SQLException} or
+     * {@code ConfigurationException} when access is insufficient.
+     */
+    default void checkAccess(Connection connection, String namespace,
+                             boolean createNamespace) throws SQLException { }
+
     String createScratchNamespace(Connection connection, String targetNamespace) throws SQLException;
 
     void dropScratchNamespace(Connection connection, String scratchNamespace) throws SQLException;
 
-    /** Executes a complete script; the dialect decides whether to batch or split it. */
-    void executeScript(Connection connection, String script) throws SQLException;
+    /**
+     * Executes a complete script in the scratch namespace; the dialect decides
+     * whether to batch or split it. {@code scratchNamespace} is the name
+     * {@link #createScratchNamespace} returned — the script's qualified
+     * references must resolve to it (3.2 rule 1).
+     */
+    void executeScript(Connection connection, String script, String scratchNamespace)
+            throws SQLException;
 
     /** Reads every object in the namespace, normalised per 5.3. */
     SchemaSnapshot readSnapshot(Connection connection, String namespace) throws SQLException;

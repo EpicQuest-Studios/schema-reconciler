@@ -8,6 +8,7 @@ import java.sql.Statement;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -50,6 +51,7 @@ public final class PgCatalog {
 
         final var data = new Data(namespace);
         data.serverMajor = conn.getMetaData().getDatabaseMajorVersion();
+        data.loadExtensionOwned(conn);
         data.loadRelations(conn);
         data.loadColumns(conn);
         data.loadConstraints(conn);
@@ -80,6 +82,10 @@ public final class PgCatalog {
         private final Map<Long, ObjectId> collByOid = new HashMap<>();
         private final Map<Long, ObjectId> langByOid = new HashMap<>();
         private final Map<ObjectId, Set<ObjectId>> deps = new HashMap<>();
+        /** Catalog oids owned by an extension (pg_depend deptype 'e'). Member
+         *  objects cannot be created or dropped standalone, so they never
+         *  enter the model; the extension itself is reported as OTHER. */
+        private final Set<Long> extOwned = new HashSet<>();
 
         Data(String ns) {
             this.ns = ns;
@@ -136,6 +142,21 @@ public final class PgCatalog {
 
         // ---- loads ------------------------------------------------------
 
+        private boolean extMember(long oid) {
+            return extOwned.contains(oid);
+        }
+
+        void loadExtensionOwned(Connection conn) throws SQLException {
+            try (PreparedStatement ps = conn.prepareStatement(
+                    "SELECT objid FROM pg_depend WHERE refclassid = 'pg_extension'::regclass"
+                            + " AND deptype = 'e'");
+                    ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    extOwned.add(rs.getLong(1));
+                }
+            }
+        }
+
         void loadRelations(Connection conn) throws SQLException {
             try (PreparedStatement ps = conn.prepareStatement("""
                     SELECT c.oid, c.relname, c.relkind, c.relpersistence,
@@ -149,6 +170,9 @@ public final class PgCatalog {
                 try (ResultSet rs = ps.executeQuery()) {
                     while (rs.next()) {
                         final var oid = rs.getLong("oid");
+                        if (extMember(oid)) {
+                            continue;
+                        }
                         final var name = rs.getString("relname");
                         final var kind = rs.getString("relkind");
                         final var persistence = rs.getString("relpersistence");
@@ -160,11 +184,20 @@ public final class PgCatalog {
                         // creatable as a standalone TABLE, so both are OTHER.
                         final var id = switch (kind) {
                             case "r" -> inherited
-                                    ? new ObjectId(ObjectKind.OTHER, name)
+                                    ? new ObjectId(ObjectKind.OTHER, "inherited:" + name)
                                     : new ObjectId(ObjectKind.TABLE, name);
                             case "v" -> new ObjectId(ObjectKind.VIEW, name);
                             case "S" -> new ObjectId(ObjectKind.SEQUENCE, name);
-                            default -> new ObjectId(ObjectKind.OTHER, name);
+                            // a documented category prefix per relkind (3.3):
+                            // tolerating one non-managed relation kind must
+                            // not exempt the others — matviews in particular
+                            case "m" -> new ObjectId(ObjectKind.OTHER, "matview:" + name);
+                            case "f" -> new ObjectId(ObjectKind.OTHER, "foreign:" + name);
+                            case "p" -> new ObjectId(ObjectKind.OTHER, "partition:" + name);
+                            case "I" -> new ObjectId(ObjectKind.OTHER, "partindex:" + name);
+                            case "c" -> new ObjectId(ObjectKind.OTHER, "composite:" + name);
+                            case "t" -> new ObjectId(ObjectKind.OTHER, "toast:" + name);
+                            default -> new ObjectId(ObjectKind.OTHER, "relation:" + name);
                         };
                         relByOid.put(oid, id);
                         if (id.kind() == ObjectKind.TABLE) {
@@ -182,7 +215,7 @@ public final class PgCatalog {
 
         void loadColumns(Connection conn) throws SQLException {
             try (PreparedStatement ps = conn.prepareStatement("""
-                    SELECT c.relname AS parent, a.attnum,
+                    SELECT c.relname AS parent, c.oid AS reloid, a.attnum,
                            a.attname, format_type(a.atttypid, a.atttypmod) AS typ,
                            a.attgenerated, a.attcollation, t.typcollation, a.attidentity,
                            co.collname,
@@ -216,6 +249,9 @@ public final class PgCatalog {
                 ps.setString(1, ns);
                 try (ResultSet rs = ps.executeQuery()) {
                     while (rs.next()) {
+                        if (extMember(rs.getLong("reloid"))) {
+                            continue;
+                        }
                         final var parent = rs.getString("parent");
                         final var name = rs.getString("attname");
                         final var type = rs.getString("typ");
@@ -309,6 +345,9 @@ public final class PgCatalog {
                 ps.setString(1, ns);
                 try (ResultSet rs = ps.executeQuery()) {
                     while (rs.next()) {
+                        if (extMember(rs.getLong("oid"))) {
+                            continue;
+                        }
                         final var contype = rs.getString("contype");
                         final var kind = switch (contype) {
                             case "p" -> ObjectKind.PRIMARY_KEY;
@@ -366,6 +405,9 @@ public final class PgCatalog {
                 ps.setString(1, ns);
                 try (ResultSet rs = ps.executeQuery()) {
                     while (rs.next()) {
+                        if (extMember(rs.getLong("oid"))) {
+                            continue;
+                        }
                         final var name = rs.getString("relname");
                         final var parent = rs.getString("parent");
                         final var def = rs.getString("def");
@@ -394,6 +436,9 @@ public final class PgCatalog {
                 ps.setString(1, ns);
                 try (ResultSet rs = ps.executeQuery()) {
                     while (rs.next()) {
+                        if (extMember(rs.getLong("oid"))) {
+                            continue;
+                        }
                         final var name = rs.getString("relname");
                         final var def = rs.getString("def");
                         final var cols = nullToEmpty(rs.getString("cols"));
@@ -429,6 +474,9 @@ public final class PgCatalog {
                 ps.setString(1, ns);
                 try (ResultSet rs = ps.executeQuery()) {
                     while (rs.next()) {
+                        if (extMember(rs.getLong("oid"))) {
+                            continue;
+                        }
                         final var name = rs.getString("relname");
                         final var id = new ObjectId(ObjectKind.SEQUENCE, name);
                         final var stype = rs.getString("stype");
@@ -525,6 +573,9 @@ public final class PgCatalog {
                 ps.setString(1, ns);
                 try (ResultSet rs = ps.executeQuery()) {
                     while (rs.next()) {
+                        if (extMember(rs.getLong("oid"))) {
+                            continue;
+                        }
                         final var proname = rs.getString("proname");
                         final var prokind = rs.getString("prokind");
                         final var sigargs = rs.getString("sigargs");
@@ -558,6 +609,9 @@ public final class PgCatalog {
                 ps.setString(1, ns);
                 try (ResultSet rs = ps.executeQuery()) {
                     while (rs.next()) {
+                        if (extMember(rs.getLong("oid"))) {
+                            continue;
+                        }
                         final var name = rs.getString("tgname");
                         final var parent = rs.getString("parent");
                         final var enabled = rs.getString("tgenabled");
@@ -655,6 +709,9 @@ public final class PgCatalog {
                 ps.setString(1, ns);
                 try (ResultSet rs = ps.executeQuery()) {
                     while (rs.next()) {
+                        if (extMember(rs.getLong("oid"))) {
+                            continue;
+                        }
                         final var name = rs.getString("typname");
                         final var id = new ObjectId(ObjectKind.OTHER, "type:" + name);
                         typeByOid.put(rs.getLong("oid"), id);
@@ -686,6 +743,9 @@ public final class PgCatalog {
                 ps.setString(1, ns);
                 try (ResultSet rs = ps.executeQuery()) {
                     while (rs.next()) {
+                        if (extMember(rs.getLong("oid"))) {
+                            continue;
+                        }
                         define(new ObjectId(ObjectKind.OTHER,
                                         "policy:" + rs.getString("relname") + "."
                                                 + rs.getString("polname")),
@@ -708,6 +768,9 @@ public final class PgCatalog {
                 ps.setString(1, ns);
                 try (ResultSet rs = ps.executeQuery()) {
                     while (rs.next()) {
+                        if (extMember(rs.getLong("oid"))) {
+                            continue;
+                        }
                         final var id = new ObjectId(ObjectKind.OTHER,
                                 "routine:" + rs.getString("name"));
                         procByOid.put(rs.getLong("oid"), id);
@@ -725,6 +788,9 @@ public final class PgCatalog {
                 ps.setString(1, ns);
                 try (ResultSet rs = ps.executeQuery()) {
                     while (rs.next()) {
+                        if (extMember(rs.getLong("oid"))) {
+                            continue;
+                        }
                         define(new ObjectId(ObjectKind.OTHER,
                                         "conversion:" + rs.getString("conname")),
                                 "conversion", Map.of());
@@ -733,16 +799,19 @@ public final class PgCatalog {
             }
             // non-view rewrite rules (_RETURN is part of the view itself)
             try (PreparedStatement ps = conn.prepareStatement("""
-                    SELECT c.relname || '.' || r.rulename AS name
+                    SELECT r.oid, c.relname || '.' || r.rulename AS name
                     FROM pg_rewrite r
                     JOIN pg_class c ON c.oid = r.ev_class
                     JOIN pg_namespace n ON n.oid = c.relnamespace AND n.nspname = ?
                     WHERE r.rulename <> '_RETURN'
-                    ORDER BY 1
+                    ORDER BY 2
                     """)) {
                 ps.setString(1, ns);
                 try (ResultSet rs = ps.executeQuery()) {
                     while (rs.next()) {
+                        if (extMember(rs.getLong("oid"))) {
+                            continue;
+                        }
                         define(new ObjectId(ObjectKind.OTHER, "rule:" + rs.getString("name")),
                                 "rule", Map.of());
                     }
@@ -750,15 +819,18 @@ public final class PgCatalog {
             }
             // extended statistics objects
             try (PreparedStatement ps = conn.prepareStatement("""
-                    SELECT c.relname || '.' || s.stxname AS name
+                    SELECT s.oid, c.relname || '.' || s.stxname AS name
                     FROM pg_statistic_ext s
                     JOIN pg_class c ON c.oid = s.stxrelid
                     JOIN pg_namespace n ON n.oid = s.stxnamespace AND n.nspname = ?
-                    ORDER BY 1
+                    ORDER BY 2
                     """)) {
                 ps.setString(1, ns);
                 try (ResultSet rs = ps.executeQuery()) {
                     while (rs.next()) {
+                        if (extMember(rs.getLong("oid"))) {
+                            continue;
+                        }
                         define(new ObjectId(ObjectKind.OTHER,
                                         "statistics:" + rs.getString("name")),
                                 "statistics", Map.of());
@@ -775,6 +847,9 @@ public final class PgCatalog {
                 ps.setString(1, ns);
                 try (ResultSet rs = ps.executeQuery()) {
                     while (rs.next()) {
+                        if (extMember(rs.getLong("oid"))) {
+                            continue;
+                        }
                         final var id = new ObjectId(ObjectKind.OTHER,
                                 "collation:" + rs.getString("collname"));
                         collByOid.put(rs.getLong("oid"), id);
@@ -784,22 +859,25 @@ public final class PgCatalog {
             }
             // full-text-search objects
             try (PreparedStatement ps = conn.prepareStatement("""
-                    SELECT 'fts-config:' || g.cfgname AS name
+                    SELECT 'fts-config:' || g.cfgname AS name, g.oid
                     FROM pg_ts_config g JOIN pg_namespace n ON n.oid = g.cfgnamespace AND n.nspname = ?
                     UNION ALL
-                    SELECT 'fts-dict:' || g.dictname
+                    SELECT 'fts-dict:' || g.dictname, g.oid
                     FROM pg_ts_dict g JOIN pg_namespace n ON n.oid = g.dictnamespace AND n.nspname = ?
                     UNION ALL
-                    SELECT 'fts-parser:' || g.prsname
+                    SELECT 'fts-parser:' || g.prsname, g.oid
                     FROM pg_ts_parser g JOIN pg_namespace n ON n.oid = g.prsnamespace AND n.nspname = ?
                     UNION ALL
-                    SELECT 'fts-template:' || g.tmplname
+                    SELECT 'fts-template:' || g.tmplname, g.oid
                     FROM pg_ts_template g JOIN pg_namespace n ON n.oid = g.tmplnamespace AND n.nspname = ?
                     ORDER BY 1
                     """)) {
                 bindNamespace(ps, 4);
                 try (ResultSet rs = ps.executeQuery()) {
                     while (rs.next()) {
+                        if (extMember(rs.getLong("oid"))) {
+                            continue;
+                        }
                         define(new ObjectId(ObjectKind.OTHER, rs.getString("name")),
                                 "text-search", Map.of());
                     }
@@ -809,19 +887,22 @@ public final class PgCatalog {
             try (PreparedStatement ps = conn.prepareStatement("""
                     SELECT 'operator:' || g.oprname || '('
                             || COALESCE(g.oprleft::regtype::text, '-') || ','
-                            || COALESCE(g.oprright::regtype::text, '-') || ')' AS name
+                            || COALESCE(g.oprright::regtype::text, '-') || ')' AS name, g.oid
                     FROM pg_operator g JOIN pg_namespace n ON n.oid = g.oprnamespace AND n.nspname = ?
                     UNION ALL
-                    SELECT 'opclass:' || g.opcname
+                    SELECT 'opclass:' || g.opcname, g.oid
                     FROM pg_opclass g JOIN pg_namespace n ON n.oid = g.opcnamespace AND n.nspname = ?
                     UNION ALL
-                    SELECT 'opfamily:' || g.opfname
+                    SELECT 'opfamily:' || g.opfname, g.oid
                     FROM pg_opfamily g JOIN pg_namespace n ON n.oid = g.opfnamespace AND n.nspname = ?
                     ORDER BY 1
                     """)) {
                 bindNamespace(ps, 3);
                 try (ResultSet rs = ps.executeQuery()) {
                     while (rs.next()) {
+                        if (extMember(rs.getLong("oid"))) {
+                            continue;
+                        }
                         define(new ObjectId(ObjectKind.OTHER, rs.getString("name")),
                                 "operator", Map.of());
                     }
@@ -830,7 +911,8 @@ public final class PgCatalog {
             // comments on namespace objects (pg_description)
             try (PreparedStatement ps = conn.prepareStatement("""
                     SELECT 'comment:' || o.name
-                            || CASE WHEN a.attname IS NULL THEN '' ELSE '.' || a.attname END AS name
+                            || CASE WHEN a.attname IS NULL THEN '' ELSE '.' || a.attname END AS name,
+                            d.objoid
                     FROM pg_description d
                     JOIN (""" + NS_OBJECTS + """
                     ) o ON o.cls = d.classoid AND o.obj = d.objoid
@@ -841,6 +923,9 @@ public final class PgCatalog {
                 bindNamespace(ps, 18);
                 try (ResultSet rs = ps.executeQuery()) {
                     while (rs.next()) {
+                        if (extMember(rs.getLong("objoid"))) {
+                            continue;
+                        }
                         define(new ObjectId(ObjectKind.OTHER, rs.getString("name")),
                                 "comment", Map.of());
                     }
@@ -849,7 +934,8 @@ public final class PgCatalog {
             // security labels on namespace objects (pg_seclabel)
             try (PreparedStatement ps = conn.prepareStatement("""
                     SELECT 'seclabel:' || o.name
-                            || CASE WHEN a.attname IS NULL THEN '' ELSE '.' || a.attname END AS name
+                            || CASE WHEN a.attname IS NULL THEN '' ELSE '.' || a.attname END AS name,
+                            d.objoid
                     FROM pg_seclabel d
                     JOIN (""" + NS_OBJECTS + """
                     ) o ON o.cls = d.classoid AND o.obj = d.objoid
@@ -860,6 +946,9 @@ public final class PgCatalog {
                 bindNamespace(ps, 18);
                 try (ResultSet rs = ps.executeQuery()) {
                     while (rs.next()) {
+                        if (extMember(rs.getLong("objoid"))) {
+                            continue;
+                        }
                         define(new ObjectId(ObjectKind.OTHER, rs.getString("name")),
                                 "security-label", Map.of());
                     }
@@ -867,16 +956,16 @@ public final class PgCatalog {
             }
             // granted privileges: object acl columns are NULL until a GRANT
             try (PreparedStatement ps = conn.prepareStatement("""
-                    SELECT 'privileges:' || c.relname AS name
+                    SELECT 'privileges:' || c.relname AS name, c.oid
                     FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
                     WHERE n.nspname = ? AND c.relacl IS NOT NULL
                     UNION ALL
                     SELECT 'privileges:' || p.proname || '('
-                            || pg_get_function_identity_arguments(p.oid) || ')'
+                            || pg_get_function_identity_arguments(p.oid) || ')', p.oid
                     FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
                     WHERE n.nspname = ? AND p.proacl IS NOT NULL
                     UNION ALL
-                    SELECT 'privileges:' || t.typname
+                    SELECT 'privileges:' || t.typname, t.oid
                     FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace
                     WHERE n.nspname = ? AND t.typacl IS NOT NULL
                     ORDER BY 1
@@ -884,6 +973,9 @@ public final class PgCatalog {
                 bindNamespace(ps, 3);
                 try (ResultSet rs = ps.executeQuery()) {
                     while (rs.next()) {
+                        if (extMember(rs.getLong("oid"))) {
+                            continue;
+                        }
                         define(new ObjectId(ObjectKind.OTHER, rs.getString("name")),
                                 "privileges", Map.of());
                     }
@@ -891,16 +983,16 @@ public final class PgCatalog {
             }
             // ownership changed away from the executing role
             try (PreparedStatement ps = conn.prepareStatement("""
-                    SELECT 'ownership:' || c.relname AS name
+                    SELECT 'ownership:' || c.relname AS name, c.oid
                     FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
                     WHERE n.nspname = ? AND c.relowner::regrole::text <> current_user
                     UNION ALL
                     SELECT 'ownership:' || p.proname || '('
-                            || pg_get_function_identity_arguments(p.oid) || ')'
+                            || pg_get_function_identity_arguments(p.oid) || ')', p.oid
                     FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
                     WHERE n.nspname = ? AND p.proowner::regrole::text <> current_user
                     UNION ALL
-                    SELECT 'ownership:' || t.typname
+                    SELECT 'ownership:' || t.typname, t.oid
                     FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace
                     WHERE n.nspname = ? AND t.typowner::regrole::text <> current_user
                     ORDER BY 1
@@ -908,6 +1000,9 @@ public final class PgCatalog {
                 bindNamespace(ps, 3);
                 try (ResultSet rs = ps.executeQuery()) {
                     while (rs.next()) {
+                        if (extMember(rs.getLong("oid"))) {
+                            continue;
+                        }
                         define(new ObjectId(ObjectKind.OTHER, rs.getString("name")),
                                 "ownership", Map.of());
                     }
@@ -916,7 +1011,7 @@ public final class PgCatalog {
             // publication bindings on namespace tables (the publication itself
             // is database-level; the FOR TABLE edge is the namespace-visible part)
             try (PreparedStatement ps = conn.prepareStatement("""
-                    SELECT 'publication:' || p.pubname || ':' || c.relname AS name
+                    SELECT 'publication:' || p.pubname || ':' || c.relname AS name, c.oid
                     FROM pg_publication_rel pr
                     JOIN pg_class c ON c.oid = pr.prrelid
                     JOIN pg_namespace n ON n.oid = c.relnamespace AND n.nspname = ?
@@ -926,6 +1021,9 @@ public final class PgCatalog {
                 ps.setString(1, ns);
                 try (ResultSet rs = ps.executeQuery()) {
                     while (rs.next()) {
+                        if (extMember(rs.getLong("oid"))) {
+                            continue;
+                        }
                         define(new ObjectId(ObjectKind.OTHER, rs.getString("name")),
                                 "publication", Map.of());
                     }
@@ -950,6 +1048,9 @@ public final class PgCatalog {
                 bindNamespace(ps, 2);
                 try (ResultSet rs = ps.executeQuery()) {
                     while (rs.next()) {
+                        if (extMember(rs.getLong("oid"))) {
+                            continue;
+                        }
                         define(new ObjectId(ObjectKind.OTHER, rs.getString("name")),
                                 "cast", Map.of());
                     }
@@ -973,6 +1074,9 @@ public final class PgCatalog {
                 bindNamespace(ps, 2);
                 try (ResultSet rs = ps.executeQuery()) {
                     while (rs.next()) {
+                        if (extMember(rs.getLong("oid"))) {
+                            continue;
+                        }
                         define(new ObjectId(ObjectKind.OTHER, rs.getString("name")),
                                 "transform", Map.of());
                     }
@@ -993,6 +1097,9 @@ public final class PgCatalog {
                 ps.setString(1, ns);
                 try (ResultSet rs = ps.executeQuery()) {
                     while (rs.next()) {
+                        if (extMember(rs.getLong("oid"))) {
+                            continue;
+                        }
                         final var id = new ObjectId(ObjectKind.OTHER,
                                 rs.getString("name"));
                         langByOid.put(rs.getLong("oid"), id);

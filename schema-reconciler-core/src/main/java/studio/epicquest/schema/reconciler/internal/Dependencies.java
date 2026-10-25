@@ -67,7 +67,21 @@ final class Dependencies {
         objects.values().stream()
                 .sorted((a, b) -> ObjectIds.ORDER.compare(a.id(), b.id()))
                 .filter(o -> PARENTABLE.contains(o.id().kind()))
-                .forEach(o -> map.putIfAbsent(o.id().name(), o.id()));
+                .forEach(o -> map.putIfAbsent(resolvableName(o.id()), o.id()));
         return map;
+    }
+
+    /** An OTHER id's name carries a documented category prefix (3.3); the
+     *  parent linkage keys on the object name behind the prefix, so a
+     *  {@code matview:mv} still blocks children parented on {@code mv}. */
+    private static String resolvableName(ObjectId id) {
+        final var name = id.name();
+        if (id.kind() == ObjectKind.OTHER) {
+            final var colon = name.indexOf(':');
+            if (colon > 0) {
+                return name.substring(colon + 1);
+            }
+        }
+        return name;
     }
 }

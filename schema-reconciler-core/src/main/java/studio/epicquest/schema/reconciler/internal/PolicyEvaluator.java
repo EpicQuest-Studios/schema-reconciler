@@ -51,8 +51,9 @@ final class PolicyEvaluator {
             }
         }
         final var unsupported = plan.differences().stream()
-                .anyMatch(d -> d.type() == DifferenceType.UNSUPPORTED);
-        if (fail || (unsupported && policy.unsupported() == Decision.FAIL)) {
+                .anyMatch(d -> d.type() == DifferenceType.UNSUPPORTED
+                        && policy.unsupportedDecision(d) == Decision.FAIL);
+        if (fail || unsupported) {
             throw new PolicyViolationException(
                     "namespace '" + plan.targetNamespace()
                             + "': plan contains changes or unsupported differences mapped to FAIL",

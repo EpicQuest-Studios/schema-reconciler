@@ -223,6 +223,7 @@ public final class SchemaReconciler {
         public Builder scratchDataSource(DataSource dataSource) { ... }   // optional, see 6.3
         public Builder policy(ReconcilePolicy policy) { ... }             // default ReconcilePolicy.defaults()
         public Builder lockTimeout(Duration timeout) { ... }              // default 60 s
+        public Builder statementTimeout(Duration timeout) { ... }         // optional, unbounded by default
         public Builder listener(ReconcileListener listener) { ... }       // optional
         public SchemaReconciler build() { ... }
     }
@@ -246,7 +247,7 @@ Namespace references inside the script must be written as the placeholder `${nam
 The desired script is a trusted build artefact. It is executed with the privileges of the configured `DataSource`. Its content is constrained:
 
 1. The script should create objects only inside `${namespace}` (or unqualified). A statement that creates an object in another namespace escapes the scratch namespace — it can neither be detected nor cleaned up — so its behaviour is undefined. A dialect may instead reject a statement it can determine would create an object with no namespace anchor at all — a role or a server, for example — since such an object could never appear in a snapshot (5.4).
-2. The script must not create, alter or drop namespaces, and must not acquire session-level locks (for example `pg_advisory_lock`): session-level effects are not undone by the scratch rollback and can leak onto a pooled connection (C-21).
+2. The script must not create, alter or drop namespaces, must not acquire session-level locks (for example `pg_advisory_lock`), and must not change session state (for example `SET` without `LOCAL`, `RESET`, `LOAD`): session-level effects are not undone by the scratch rollback and can leak onto a pooled connection (C-21). A dialect may also reject a statement whose created, altered or dropped object name is qualified by a namespace other than the scratch namespace — the statement would escape the scratch namespace even though its text parses.
 3. On transactional dialects, the script must not contain transaction control (`BEGIN`, `COMMIT`, `ROLLBACK`, `SAVEPOINT`), nor statements that cannot run inside a transaction block, for example `CREATE INDEX CONCURRENTLY` or `VACUUM` (OI-3). After executing the script, the dialect must check that the run's transaction and scratch savepoint are still intact. If they are not, it must remove the scratch namespace and fail with `DesiredStateException`.
 4. Other non-DDL statements may appear; their effects are confined to the scratch connection.
 5. The script must not refer to the target namespace by its literal name; it uses `${namespace}` or unqualified names instead. Before substitution, the core must search the script for the target namespace identifier — bare or enclosed in the dialect's identifier quotes, compared case-insensitively — immediately followed by `.` and not preceded by an identifier character (letter, digit, `_`, `$`) or by `.`. On a match, `plan()` must fail with `DesiredStateException` giving the position of the first match.
@@ -259,20 +260,24 @@ The desired script is a trusted build artefact. It is executed with the privileg
 public enum Decision { APPLY, REPORT, FAIL }
 
 public record ReconcilePolicy(
-        Decision additive,      // default APPLY
-        Decision rebuild,       // default APPLY
-        Decision destructive,   // default FAIL
-        Decision unsupported) { // default FAIL; APPLY is not permitted
+        Decision additive,                          // default APPLY
+        Decision rebuild,                           // default APPLY
+        Decision destructive,                       // default FAIL
+        Decision unsupported,                       // default FAIL; APPLY is not permitted
+        Map<String, Decision> unsupportedCategories) { // per-category overrides; APPLY is not permitted
 
     public static ReconcilePolicy defaults() { ... }
     public static ReconcilePolicy reportOnly() { ... }  // REPORT for every class
 
     public ReconcilePolicy withDestructive(Decision decision) { ... }
+    public ReconcilePolicy withUnsupportedCategory(String category, Decision decision) { ... }
     // with... for each component
 }
 ```
 
-The compact constructor must reject `unsupported == APPLY` with `IllegalArgumentException`. The safety classes are defined in section 5.6.
+The compact constructor must reject `unsupported == APPLY` and any `unsupportedCategories` value of `APPLY` with `IllegalArgumentException`. The safety classes are defined in section 5.6.
+
+`unsupportedCategories` overrides `unsupported` per *difference category*. The category of an `UNSUPPORTED` difference is, for an `ObjectKind.OTHER` object, the dialect's documented name prefix before `:` (for example `extension`, `policy`, `comment`, `privileges`, `matview`; an `OTHER` name without a prefix is `relation`), and for any other kind the lowercased `ObjectKind` name (for example `table`, `routine`). A policy can therefore tolerate objects it deliberately leaves to other tooling — extensions or grants, for example — while still failing on unsupported constructs that carry reconciliation risk, such as materialized views. Categories are stable identifiers, never free-text matching: a category not present in the map falls back to `unsupported`, which defaults to `FAIL` — unknown or unclassified objects fail closed. The decision for a difference is `unsupportedCategories.getOrDefault(category, unsupported)`. The PostgreSQL prefix list is in A.5.
 
 `additive`, `rebuild` and `destructive` govern *changes* by their `ChangeSafety`. `unsupported` governs *differences*: an `UNSUPPORTED` difference (5.4) never produces a `PlannedChange`, so it is evaluated against `plan.differences()`, not `plan.changes()`. Semantics of each decision:
 
@@ -286,7 +291,7 @@ A change whose `statements` list is empty is a *manual change*: the dialect can 
 
 **Evaluation** (step 7 of 5.1) proceeds in this order:
 
-1. *Fail check.* Map every change to its class's decision, treating a manual change mapped to `APPLY` as `FAIL`. If any change maps to `FAIL`, or `unsupported` is `FAIL` and an `UNSUPPORTED` difference exists, throw `PolicyViolationException` carrying the plan.
+1. *Fail check.* Map every change to its class's decision, treating a manual change mapped to `APPLY` as `FAIL`. If any change maps to `FAIL`, or any `UNSUPPORTED` difference resolves to `FAIL` under `unsupported` and `unsupportedCategories`, throw `PolicyViolationException` carrying the plan.
 2. *Recreate pairing.* The `DROP` and `CREATE` halves of one recreate (4.4) always receive the same decision.
 3. *Prerequisite closure.* A change mapped to `APPLY` must be demoted to `REPORT` when its target depends — through `dependsOn` in the desired snapshot, transitively, or through `ObjectId.parent` — on a *blocked* object. An object is blocked when either:
    - it has a change in the plan that is not applied (mapped to `REPORT`, or demoted), or
@@ -312,8 +317,19 @@ public record ReconcileReport(
         List<PlannedChange> reported,
         List<Difference> unexpected,
         List<Difference> unsupported,   // UNSUPPORTED differences reported under policy REPORT (3.3)
-        Duration elapsed) { }
+        Duration elapsed,
+        RunTimings timings) { }
+
+public record RunTimings(
+        Duration lockWait,      // time spent acquiring the namespace lock — contention shows here
+        Duration readActual,    // catalog read of the target namespace
+        Duration loadDesired,   // scratch namespace + script + snapshot + cleanup
+        Duration plan,          // diff, render and plan assembly
+        Duration apply,         // the window in which applied DDL holds its locks
+        Duration verify) { }    // post-apply snapshot re-read and comparison
 ```
+
+`timings` measures the run so adopters can size its locking impact on a realistic database (OI-7). DDL locks release only at commit, so the lock-holding window is `apply` + `verify`. All phases are monotonic elapsed times measured with `System.nanoTime`, never wall-clock differences. On failure the run still surfaces its timings: the exception's `timings()` returns the completed phases plus the partial duration of the phase that failed (section 7). `statementTimeout` bounds each *statement*, not the run — a run of many short statements can exceed it.
 
 - `UP_TO_DATE`: the plan had no changes. Unexpected objects and `UNSUPPORTED` differences reported under `REPORT` do not prevent `UP_TO_DATE`. They are listed in `unexpected` and `unsupported` respectively and never produce changes (5.4, 5.5).
 - `RECONCILED`: at least one change was applied and verified.
@@ -430,10 +446,10 @@ A plan must be serialisable as plain text for review via `toSql()`. The output m
 
 `reconcile()` must behave as the following steps. `plan()` performs steps 1 to 6 and then releases the lock without changing the target; before releasing it must roll back (transactional dialects) or clean up (non-transactional dialects) so the returned connection carries no session state (C-21). `apply(plan)` performs steps 1 to 3, checks the fingerprint (5.7), then performs steps 7 to 10 with the given plan. `reconcile()` holds one lock throughout and may skip the fingerprint recheck.
 
-1. **Connect.** Obtain one connection from the `DataSource`. If `capabilities().transactionalDdl()` is true, disable auto-commit. The core must restore the connection's original auto-commit setting on every exit path, before closing the connection and returning it to its pool (C-21).
-2. **Lock.** Acquire the namespace lock (6.2) within `lockTimeout`, or fail with `LockTimeoutException`.
+1. **Connect.** Obtain one connection from the `DataSource`. Call `Dialect.checkAccess` to verify the connection's privileges on the target namespace — a missing namespace or insufficient privileges must fail the run before any lock is taken. If `capabilities().transactionalDdl()` is true, disable auto-commit. The core must restore the connection's original auto-commit setting on every exit path, before closing the connection and returning it to its pool (C-21).
+2. **Lock.** Acquire the namespace lock (6.2) within `lockTimeout`, or fail with `LockTimeoutException`. If `statementTimeout` is configured, the dialect applies it now (for example `SET LOCAL statement_timeout`), so it bounds applied statements and catalog reads but never the lock wait itself.
 3. **Read actual.** Read the snapshot of the target namespace.
-4. **Load desired.** Create a scratch namespace (6.3), bind the session namespace to it (`bindSessionNamespace`, 6.1), execute the desired script in it, read its snapshot, then remove the scratch namespace. Removal must happen even if loading fails.
+4. **Load desired.** Create a scratch namespace (6.3), bind the session namespace to it (`bindSessionNamespace`, 6.1), execute the desired script in it, read its snapshot, then remove the scratch namespace. Removal must happen even if loading fails. When `scratchDataSource` supplies a separate connection and `statementTimeout` is configured, the dialect applies the bound on that connection as well before the script runs.
 5. **Diff.** Compute differences (5.4, 5.5).
 6. **Plan.** Ask the dialect to render changes for each difference, add dependent rebuilds (5.8), assign execution order and safety classes, and build the `ReconcilePlan`.
 7. **Evaluate policy.** Evaluate the plan as defined in 3.3: fail check, recreate pairing, then prerequisite closure. On a `FAIL`, throw `PolicyViolationException` carrying the plan. Nothing is executed.
@@ -485,7 +501,7 @@ Rules:
 
 Rules 1 and 2 govern tables present in the actual snapshot. A `MISSING` table and the children its create covers (5.8.4) are created as one `ADDITIVE` change, whatever the nullability of its columns, because no stored data exists yet. So C-01 reconciles under the default policy.
 
-1. Any change to an existing `TABLE`, and any change to an existing `COLUMN`, must be classified `DESTRUCTIVE`. Adding a missing column to an existing table is a `CREATE` of that column, not a change to an existing one: it is `ADDITIVE` when the column is nullable, and is classified by rule 2 otherwise.
+1. Any change to an existing `TABLE` must be classified `DESTRUCTIVE`. A change to an existing `COLUMN` must be classified `DESTRUCTIVE` unless the dialect renders it as in-place alterations that cannot lose data and cannot fail on any existing value — a default change, `DROP NOT NULL`, or a widening from the dialect's explicit allowlist (A.6) — which it may classify `REBUILD`. `SET NOT NULL` always checks existing rows and can fail on them, so it is `DESTRUCTIVE`; the dialect must not bundle it with `REBUILD` operations on the same column. Widening safety is defined by the allowlist, never inferred from PostgreSQL accepting the cast; note that a lossless widening may still physically rewrite the table under the DDL lock (A.6). Adding a missing column to an existing table is a `CREATE` of that column, not a change to an existing one: it is `ADDITIVE` when the column is nullable, and is classified by rule 2 otherwise.
 2. Adding a `NOT NULL` column without a default to an existing table must be classified `DESTRUCTIVE`, because it fails on a non-empty table. Adding a `NOT NULL` column with a default may be `ADDITIVE` where the engine fills it without rewriting existing rows (constant defaults on PostgreSQL 11+); the dialect must classify it by its engine's behaviour.
 3. A dialect may raise a change to a stricter class, never to a looser one.
 4. Adding a constraint that existing rows violate fails at apply time. This is an `ApplyException`, not a misclassification.
@@ -541,12 +557,38 @@ public interface Dialect {
      */
     default void bindSessionNamespace(Connection connection, String namespace) throws SQLException { }
 
+    /**
+     * Bounds how long any single statement may run during this run (for
+     * example SET LOCAL statement_timeout). Called once after the namespace
+     * lock is acquired, so it never bounds the lock wait itself. A no-op for
+     * dialects that cannot express the bound.
+     */
+    default void statementTimeout(Connection connection, Duration timeout) throws SQLException { }
+
+    /**
+     * Verifies that this connection's user holds the privileges a reconcile run
+     * needs. Called once per run, before the lock, on the target connection —
+     * with {@code createNamespace} telling it whether that connection must
+     * also create the scratch namespace — and again on the scratch connection
+     * when a separate {@code scratchDataSource} is configured, then with
+     * {@code namespace} {@code null} and {@code createNamespace} {@code true}.
+     * A missing namespace or insufficient privilege fails the run. A no-op
+     * for dialects that cannot express the check.
+     */
+    default void checkAccess(Connection connection, String namespace,
+                             boolean createNamespace) throws SQLException { }
+
     String createScratchNamespace(Connection connection, String targetNamespace) throws SQLException;
 
     void dropScratchNamespace(Connection connection, String scratchNamespace) throws SQLException;
 
-    /** Executes a complete script; the dialect decides whether to batch or split it. */
-    void executeScript(Connection connection, String script) throws SQLException;
+    /**
+     * Executes a complete script in the scratch namespace; the dialect decides
+     * whether to batch or split it. scratchNamespace is the name
+     * createScratchNamespace returned — qualified object references in the
+     * script must resolve to it (3.2).
+     */
+    void executeScript(Connection connection, String script, String scratchNamespace) throws SQLException;
 
     /** Reads every object in the namespace, normalised per 5.3. */
     SchemaSnapshot readSnapshot(Connection connection, String namespace) throws SQLException;
@@ -622,14 +664,15 @@ SchemaReconcilerException (extends RuntimeException)
 └── VerificationException       applied objects did not converge; carries remaining differences
 ```
 
-Every message must name the target namespace and, where applicable, the object id. `DesiredStateException` must include the engine's error message and position when the driver provides them.
+Every message must name the target namespace and, where applicable, the object id. `DesiredStateException` must include the engine's error message and position when the driver provides them. `SchemaReconcilerException` itself carries `timings()` — the `RunTimings` snapshot taken when the run failed, with the phases that completed and the partial duration of the phase that failed (`Duration.ZERO` where nothing ran yet, `RunTimings.unmeasured()` for exceptions raised outside a run).
 
 ## 8. Security
 
 1. Object names read from the catalog must be quoted with `Dialect.quoteIdentifier` whenever they are placed into SQL.
 2. The library must not build SQL from data supplied at run time other than the configured namespace and the trusted desired script.
 3. The configured namespace must be validated as a legal identifier for the dialect before use: the core passes it to `Dialect.quoteIdentifier` and reports an `IllegalArgumentException` from it as `ConfigurationException`. Because a dialect is selected on first use (3.4), this validation happens then, before any SQL is sent.
-4. Documentation should recommend running reconciliation with a role limited to the target namespace. When no `scratchDataSource` is configured, that role additionally needs namespace-creation privilege on the target database (for example `CREATE ON DATABASE` in PostgreSQL); `scratchDataSource` exists for environments that cannot grant it.
+4. Documentation should recommend running reconciliation with a role limited to the target namespace. The run verifies that role's privileges before locking (`Dialect.checkAccess`), so a misconfigured role fails fast rather than mid-apply. When no `scratchDataSource` is configured, that role additionally needs namespace-creation privilege on the target database (for example `CREATE ON DATABASE` in PostgreSQL); `scratchDataSource` exists for environments that cannot grant it.
+5. The script checks of 3.2 and A.4 are guardrails, not a security sandbox. They scan top-level statements only: `DO` bodies, function and procedure bodies, and other string literals are opaque to them, and dynamic SQL issued from inside (`EXECUTE`, `format()`) runs with the connection's privileges. Desired scripts must be treated as trusted artifacts — ship them with the service's own build, review them like migrations, and combine them with the least-privilege role of rule 4 rather than relying on lexical checks alone.
 
 ## 9. Conformance
 
@@ -673,6 +716,10 @@ Every message must name the target namespace and, where applicable, the object i
 | C-30 | Drifted view `v` with dependent view `w` | plan order is `DROP w`, `DROP v`, `CREATE v`, `CREATE w`; both verified |
 | C-31 | Missing index `i` on table `a`, while the target holds an unexpected index `i` on table `b` (where the dialect declares relation-scoped names) | `PlanningException` naming both; nothing executed |
 | C-32 | Missing table with a serial-style or identity column | `RECONCILED`; no dependency cycle; the second run is `UP_TO_DATE` |
+| C-33 | Drifted column on a table holding a `NULL` row: default change and `DROP NOT NULL`, then `SET NOT NULL` | default and `DROP NOT NULL` apply in place as `REBUILD` `ALTER COLUMN` changes; `SET NOT NULL` renders `DESTRUCTIVE` and fails with `PolicyViolationException` under the default policy |
+| C-34 | Drifted column: unsafe type change | manual `DESTRUCTIVE` change; default policy throws `PolicyViolationException`; data untouched |
+| C-35 | `unsupportedCategories` reports one category while `unsupported` stays `FAIL` | the tolerated `UNSUPPORTED` difference lands in `report.unsupported()`; a `FAIL`-category one still fails the plan |
+| C-36 | `ReconcileReport.timings()` | every `RunTimings` phase is non-negative; `elapsed` covers their sum |
 
 C-03, C-04, C-07, C-08, C-09 and C-12 mirror regression scenarios exercised by the hand-written reconciler this specification generalises.
 
@@ -692,7 +739,7 @@ A release of this project ships three deliverables: this document, the reference
 ## 10. Versioning and compatibility
 
 1. Releases follow Semantic Versioning 2.0.0.
-2. Within a major version, the API and model must stay source- and binary-compatible. New SPI methods must be `default` methods.
+2. Within a major version, the API and model must stay source- and binary-compatible. New SPI methods must be `default` methods. Before 1.0 the SPI may still change signatures: in this version `executeScript` gained the `scratchNamespace` parameter, and `statementTimeout` and `checkAccess` were added as defaults — dialect implementations built against earlier versions must be recompiled.
 3. A dialect declares the core major version it was built against via `Dialect.coreMajorVersion()` (6.1). The core must refuse, with `ConfigurationException`, a dialect reporting a different major version than its own.
 4. Changing a dialect's normalisation rules is a breaking change for that dialect, because it can turn equal objects into drifted ones.
 5. Implementations of this specification must run on Java SE 25 or later and must not rely on preview, incubator or deprecated-for-removal APIs.
@@ -706,7 +753,7 @@ A release of this project ships three deliverables: this document, the reference
 | OI-3 | Online index builds (`CREATE INDEX CONCURRENTLY` cannot run in a transaction) | Out of scope for version 1; document as a known limitation of the PostgreSQL profile. |
 | OI-4 | Namespace-token replacement (5.3 rule 1) could also match text inside string literals or routine bodies | Partly resolved in 0.5: matches now require an identifier boundary, and scripts may not name the target literally (3.2). Matches inside literals remain possible and are symmetric between desired and actual, so they do not cause drift. Prototype on the bundled deployment fixture before freezing. |
 | OI-5 | Sequence current values differ between scratch and target | Compare sequence options only, never the current value. |
-| OI-6 | Rule 5.6(1) classifies every change to an existing column as `DESTRUCTIVE`, including ones that cannot lose data (changing a default, dropping `NOT NULL`) | Keep for version 1, and render those as manual changes. Consider allowing a dialect to classify specific column alterations as `REBUILD` in a later minor version. |
+| OI-6 | Rule 5.6(1) classified every change to an existing column as `DESTRUCTIVE`, including ones that cannot lose data (changing a default, dropping `NOT NULL`) | Resolved: rule 5.6(1) now permits `REBUILD` for column alterations that cannot lose or rewrite data; the PostgreSQL profile renders them as in-place `ALTER COLUMN` statements (A.6). |
 | OI-7 | DDL applied in one transaction holds its locks (for example `ACCESS EXCLUSIVE` for recreated constraints and indexes) until commit | Document in the PostgreSQL profile. Applications should reconcile at startup, before taking traffic. |
 
 ## Appendix A. PostgreSQL profile — reference implementation
@@ -723,7 +770,11 @@ A release of this project ships three deliverables: this document, the reference
 
 ### A.2 Locking
 
+**Access preflight (`checkAccess`).** Before the lock, the dialect resolves the target namespace with `to_regnamespace` — a null result fails the run with `ConfigurationException`, because PostgreSQL silently ignores a `search_path` entry that names a missing schema and applied DDL would land in the wrong namespace — and checks `has_schema_privilege(current_user, <namespace>, 'USAGE,CREATE')`, failing with `ConfigurationException` when the connecting role lacks either. When no `scratchDataSource` is configured it also checks `has_database_privilege(current_user, 'CREATE')`, the privilege scratch-schema creation needs, and fails with `ConfigurationException` naming the missing privilege (5.1 step 1).
+
 `SELECT pg_advisory_xact_lock(hashtextextended(:key, 0))` with `:key = 'studio.epicquest.schema.reconciler:' || <database> || ':' || <namespace>`, under `SET LOCAL lock_timeout` set to the reconciler's `lockTimeout`. Once the lock is held, the dialect must run `SET LOCAL lock_timeout = DEFAULT`, so that the reconciler's timeout does not also govern lock waits of the applied DDL; those follow the session's own setting. The lock is released by commit or rollback. The dialect must also call `pg_advisory_unlock_all()` before returning the connection, in case the script took session-level locks.
+
+When `statementTimeout` is configured, the dialect applies it immediately after the lock as `SET LOCAL statement_timeout = <millis>`; being transaction-scoped it needs no explicit restore and never bounds the lock wait itself. With a separate `scratchDataSource` the engine applies the same bound on the scratch connection too — one `SET LOCAL` cannot cross connections, so without this the desired script and scratch snapshot read would run unbounded. It bounds *every* statement of the run — catalog reads included — not the total run duration. Note that inspection itself can stall: catalog getters such as `pg_get_expr` open the relation they deparse with `AccessShareLock`, so reading a schema that holds an `ACCESS EXCLUSIVE`-locked table can block until `statement_timeout` cancels the query.
 
 ### A.3 Scratch namespace
 
@@ -772,6 +823,21 @@ whose source type, target type or cast function is in the namespace,
 `pg_transform` rows anchored by their type or SQL functions, and
 `pg_language` rows whose handler functions are in the namespace.
 
+`OTHER` object ids carry a documented category prefix — the substring
+before the first `:` of the `ObjectId` name, used by
+`unsupportedCategories` (3.3): `matview`, `foreign`, `partition`,
+`partindex`, `composite`, `toast`, `inherited` and `relation` (any other
+non-managed `relkind`), `constraint` (exclusion), `type`, `extension`,
+`policy`, `rule`, `statistics`, `collation`, `conversion`, `fts-config`,
+`fts-dict`, `fts-parser`, `fts-template`, `operator`, `opclass`,
+`opfamily`, `comment`, `seclabel`, `privileges`, `ownership`,
+`publication`, `cast`, `transform`, `language` and `routine` (aggregate
+or window). Extension *member* objects (`pg_depend` `deptype = 'e'`) are
+excluded from the model entirely: they cannot be created or dropped
+standalone, so a member function or type must never surface as a managed
+object or an `UNEXPECTED` one — only the `pg_extension` row itself is
+reported, as `extension:<name>`.
+
 Objects that have no namespace anchor at all — databases, tablespaces,
 roles, event triggers, servers, foreign data wrappers, user mappings,
 publications, subscriptions, access methods, default privileges and large
@@ -782,7 +848,19 @@ represent (`SERVER`, `FOREIGN DATA WRAPPER`, `USER MAPPING`,
 `EVENT TRIGGER`, `ACCESS METHOD`, `LANGUAGE`, `ROLE`/`GROUP`/`USER`,
 `DEFAULT PRIVILEGES`, `OWNED`, `REASSIGN OWNED`, role-membership
 `GRANT`/`REVOKE`, and `ALTER ... SET SCHEMA`), so a script cannot silently
-create an undetectable object. Casts and transforms anchored only to
+create an undetectable object. It also rejects any object name in
+`CREATE`/`DROP`/`ALTER` position — including the `ON`-anchored names of
+`CREATE INDEX`, `CREATE TRIGGER` and `CREATE POLICY`, and the object
+targets of `GRANT`/`REVOKE`, `COMMENT` and `SECURITY LABEL` — that is
+qualified by a schema other than the scratch namespace (`pg_temp`
+excepted), because such a statement creates or changes an object outside
+the sandbox (3.2 rule 1); a `GRANT ... ON SCHEMA` is legal only on the
+scratch namespace itself. References to foreign schemas elsewhere in a
+statement remain legal: a cross-schema `REFERENCES` clause is a declared
+external dependency, not an escaping creation. Finally it rejects
+session-state changes — `SET` without `LOCAL` or `TRANSACTION`,
+`RESET` and `LOAD` — which the scratch rollback would not undo (3.2
+rule 2). Casts and transforms anchored only to
 foreign objects — a `CAST (text AS int)` with a `pg_catalog` function —
 remain outside the model. Appendix E tabulates coverage against the
 PostgreSQL 14–19 SQL command sets.
@@ -820,7 +898,12 @@ Name scopes (`nameScopes`, 5.8.7). Tables, views, sequences and indexes share on
 | `MISSING` routine | `CREATE`: `pg_get_functiondef` | `ADDITIVE` |
 | `DRIFTED` routine | `ALTER`: `CREATE OR REPLACE` from `pg_get_functiondef`; if the return type changed, a `DROP` change `DROP FUNCTION`/`DROP PROCEDURE` plus a `CREATE` change instead | `REBUILD` |
 | `MISSING` / `DRIFTED` trigger | `CREATE`: `pg_get_triggerdef`; when drifted, preceded by a `DROP` change `DROP TRIGGER` | `ADDITIVE` / `REBUILD` |
-| any `DRIFTED` table or column, `MISSING` `NOT NULL` column without default on an existing table, table-shape conflict | manual change (no statements) in version 1 | `DESTRUCTIVE` |
+| `DRIFTED` column | in-place `ALTER TABLE ... ALTER COLUMN` statements decomposed from the canonical difference — `SET`/`DROP DEFAULT`, `DROP NOT NULL`, and `TYPE` only for a widening (below); one `ALTER` change | `REBUILD` |
+| `DRIFTED` column that also needs `SET NOT NULL` | the `REBUILD` change above carries only the safe statements; the `SET NOT NULL` renders as a second `ALTER` change on the same column | `DESTRUCTIVE` |
+| `DRIFTED` column with a generated, identity or collation change, or a type change outside the widening list | manual change (no statements) | `DESTRUCTIVE` |
+| any `DRIFTED` table, `MISSING` `NOT NULL` column without default on an existing table, table-shape conflict | manual change (no statements) in version 1 | `DESTRUCTIVE` |
+
+**Column type widenings.** A `DRIFTED` column's `TYPE` alteration is rendered only for conversions on this allowlist — conversions that preserve every stored value and cannot fail: the integer chain (`smallint` → `integer` → `bigint`), `character varying(n)` growing or becoming `text`, `character(n)` growing, and `numeric(p,s)` to `numeric(p′,s′)` with `p′ ≥ p` and `s′ ≥ s`, or to unbounded `numeric`. Everything else — `text` to `varchar(n)`, `bigint` to `integer`, `varchar` to `integer`, `char` to `varchar`/`text` (trailing spaces are stripped), type-family changes — stays a manual change (5.6 rule 1). The allowlist defines safety, not the planner: several entries (`integer` chain, `character`/`numeric` growth) still rewrite the table physically under the `ALTER` lock — safe for data, not free at runtime.
 
 **Constant defaults.** Deciding whether an arbitrary default expression is volatile would require parsing SQL (P1), so the profile uses a conservative lexical rule, which 5.6 rule 3 permits. A default counts as *constant* only if its canonical text is a numeric literal, a boolean literal, `NULL`, or a quoted string literal, in each case optionally followed by one `::type` cast. Anything else, for example `now()`, `gen_random_uuid()`, an arithmetic expression or any function call, is treated as not constant. A dialect must classify by this rule and must not loosen it.
 

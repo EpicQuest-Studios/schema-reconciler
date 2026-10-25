@@ -286,6 +286,65 @@ class PostgreSqlInternalsTest {
                 () -> PgScriptCheck.check("CREATE SCHEMA \"some_scratch_ns\""));
     }
 
+    @Test
+    void crossNamespaceCreationRejected() {
+        final var scratch = "app__rcl_deadbeef";
+        for (final var sql : new String[] {
+                "CREATE TABLE other.t (a int)",
+                "CREATE TABLE \"Other\".t (a int)",
+                "DROP TABLE other.t",
+                "ALTER TABLE other.t ADD COLUMN a int",
+                "CREATE INDEX i ON other.t (a)",
+                "CREATE TRIGGER g BEFORE INSERT ON other.t FOR EACH ROW EXECUTE FUNCTION f()",
+                "CREATE POLICY p ON other.t",
+                "GRANT SELECT ON TABLE other.t TO r",
+                "GRANT USAGE ON SCHEMA other TO r",
+                "GRANT SELECT ON ALL TABLES IN SCHEMA other TO r",
+                "COMMENT ON TABLE other.t IS 'x'",
+                "COMMENT ON COLUMN other.t.c IS 'x'",
+                "GRANT SELECT ON DATABASE d TO r"}) {
+            assertThrows(DesiredStateException.class,
+                    () -> PgScriptCheck.check(sql, scratch), sql);
+        }
+    }
+
+    @Test
+    void scratchQualifiedAndReferenceNamesAllowed() {
+        final var scratch = "app__rcl_deadbeef";
+        // qualified to the scratch namespace — the post-substitution ${namespace} form
+        PgScriptCheck.check("CREATE TABLE " + scratch + ".t (a int)", scratch);
+        PgScriptCheck.check("CREATE OR REPLACE FUNCTION " + scratch
+                + ".f() RETURNS int LANGUAGE sql AS $$ SELECT 1 $$", scratch);
+        PgScriptCheck.check("GRANT USAGE ON SCHEMA " + scratch + " TO r", scratch);
+        PgScriptCheck.check("GRANT SELECT ON TABLE " + scratch + ".t TO r", scratch);
+        PgScriptCheck.check("COMMENT ON TABLE " + scratch + ".t IS 'x'", scratch);
+        PgScriptCheck.check("COMMENT ON COLUMN t.c IS 'x'", scratch);
+        // unqualified names resolve inside the scratch search_path
+        PgScriptCheck.check("CREATE TABLE t (a int)", scratch);
+        // references to other namespaces are not creation positions:
+        // a cross-schema foreign key is a legitimate external dependency (5.8.3)
+        PgScriptCheck.check("ALTER TABLE " + scratch
+                + ".t ADD CONSTRAINT fk FOREIGN KEY (a) REFERENCES ext.pt (id)", scratch);
+        // temporary objects are session-confined like the scratch namespace
+        PgScriptCheck.check("CREATE TABLE pg_temp.t (a int)", scratch);
+    }
+
+    @Test
+    void sessionSetRejected() {
+        assertThrows(DesiredStateException.class,
+                () -> PgScriptCheck.check("SET search_path = x"));
+        assertThrows(DesiredStateException.class,
+                () -> PgScriptCheck.check("SET SESSION statement_timeout = 0"));
+        assertThrows(DesiredStateException.class,
+                () -> PgScriptCheck.check("RESET search_path"));
+        assertThrows(DesiredStateException.class,
+                () -> PgScriptCheck.check("LOAD 'mod'"));
+        // transaction-scoped settings are confined to the run
+        PgScriptCheck.check("SET LOCAL search_path = x");
+        PgScriptCheck.check("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE");
+        PgScriptCheck.check("SET CONSTRAINTS ALL DEFERRED");
+    }
+
     // ---- PgRender ------------------------------------------------------------
 
     private static Difference missing(ObjectId id) {
@@ -489,5 +548,128 @@ class PostgreSqlInternalsTest {
         assertEquals(ChangeAction.ALTER, change.action());
         assertEquals(ChangeSafety.DESTRUCTIVE, change.safety());
         assertTrue(change.isManual());
+    }
+
+    private static Difference driftedColumn(String want, String have) {
+        return new Difference(new ObjectId(ObjectKind.COLUMN, "c", "t"),
+                DifferenceType.DRIFTED,
+                Optional.of(new Definition(want)), Optional.of(new Definition(have)));
+    }
+
+    private static SchemaSnapshot columnSnap(String canonical) {
+        return snap(obj(new ObjectId(ObjectKind.COLUMN, "c", "t"), canonical, Map.of()));
+    }
+
+    @Test
+    void driftedColumnDefaultAltersInPlace() {
+        final var d = driftedColumn("type=text;notnull=false;default='b'::text",
+                "type=text;notnull=false;default='a'::text");
+        final var change = PgRender.render(d, columnSnap(
+                "type=text;notnull=false;default='b'::text"), "core").get(0);
+        assertEquals(ChangeAction.ALTER, change.action());
+        assertEquals(ChangeSafety.REBUILD, change.safety());
+        assertEquals(List.of("ALTER TABLE \"core\".\"t\" ALTER COLUMN \"c\""
+                + " SET DEFAULT 'b'::text"), change.statements());
+    }
+
+    @Test
+    void driftedColumnNotNullSplitsByDataRisk() {
+        // DROP NOT NULL is a metadata change (REBUILD); SET NOT NULL validates
+        // existing rows and can fail on them (rendered DESTRUCTIVE, 5.6 rule 1)
+        var d = driftedColumn("type=text;notnull=true",
+                "type=text;notnull=false");
+        var changes = PgRender.render(d, columnSnap("type=text;notnull=true"), "core");
+        assertEquals(1, changes.size());
+        assertEquals(ChangeSafety.DESTRUCTIVE, changes.get(0).safety());
+        assertEquals(List.of("ALTER TABLE \"core\".\"t\" ALTER COLUMN \"c\" SET NOT NULL"),
+                changes.get(0).statements());
+        d = driftedColumn("type=text;notnull=false;default='a'::text",
+                "type=text;notnull=true");
+        var change = PgRender.render(d, columnSnap(
+                "type=text;notnull=false;default='a'::text"), "core").get(0);
+        assertEquals(List.of(
+                "ALTER TABLE \"core\".\"t\" ALTER COLUMN \"c\" SET DEFAULT 'a'::text",
+                "ALTER TABLE \"core\".\"t\" ALTER COLUMN \"c\" DROP NOT NULL"),
+                change.statements());
+        assertEquals(ChangeSafety.REBUILD, change.safety());
+    }
+
+    @Test
+    void driftedColumnSetNotNullDefersToDestructiveChange() {
+        // safe parts converge under the default policy; SET NOT NULL stays
+        // gated — and the REBUILD half's expected omits the deferred notnull
+        final var d = driftedColumn("type=text;notnull=true;default='a'::text",
+                "type=text;notnull=false");
+        final var changes = PgRender.render(d, columnSnap(
+                "type=text;notnull=true;default='a'::text"), "core");
+        assertEquals(2, changes.size());
+        assertEquals(ChangeSafety.REBUILD, changes.get(0).safety());
+        assertEquals(List.of("ALTER TABLE \"core\".\"t\" ALTER COLUMN \"c\""
+                + " SET DEFAULT 'a'::text"), changes.get(0).statements());
+        assertEquals("type=text;notnull=false;default='a'::text",
+                changes.get(0).expected().orElseThrow().canonical());
+        assertEquals(ChangeSafety.DESTRUCTIVE, changes.get(1).safety());
+        assertEquals(List.of("ALTER TABLE \"core\".\"t\" ALTER COLUMN \"c\" SET NOT NULL"),
+                changes.get(1).statements());
+        assertEquals("type=text;notnull=true;default='a'::text",
+                changes.get(1).expected().orElseThrow().canonical());
+    }
+
+    @Test
+    void driftedColumnWideningTypeAltersInPlace() {
+        for (final var pair : new String[][] {
+                {"character varying(20)", "character varying(10)"},
+                {"text", "character varying(10)"},
+                {"character varying", "character varying(10)"},
+                {"character(8)", "character(5)"},
+                {"bigint", "integer"},
+                {"integer", "smallint"},
+                {"numeric(12,3)", "numeric(10,2)"},
+                {"numeric", "numeric(10,2)"}}) {
+            final var want = "type=" + pair[0] + ";notnull=false";
+            final var have = "type=" + pair[1] + ";notnull=false";
+            final var change = PgRender.render(driftedColumn(want, have),
+                    columnSnap(want), "core").get(0);
+            assertEquals(ChangeSafety.REBUILD, change.safety(), pair[0] + " <- " + pair[1]);
+            assertEquals(List.of("ALTER TABLE \"core\".\"t\" ALTER COLUMN \"c\" TYPE "
+                    + pair[0]), change.statements());
+        }
+    }
+
+    @Test
+    void driftedColumnUnsafeTypeStaysManual() {
+        for (final var pair : new String[][] {
+                {"character varying(10)", "character varying(20)"},   // narrowing
+                {"character varying(10)", "text"},                    // bounded
+                {"integer", "bigint"},                                // narrowing
+                {"boolean", "text"},                                  // unrelated
+                {"text", "character(5)"},                             // bpchar strips padding
+                {"character varying(10)", "character(5)"},            // bpchar strips padding
+                {"character(5)", "character varying(10)"},            // adds padding semantics
+                {"text", "integer"},
+                {"timestamp with time zone", "timestamp without time zone"}}) {
+            final var want = "type=" + pair[0] + ";notnull=false";
+            final var have = "type=" + pair[1] + ";notnull=false";
+            final var change = PgRender.render(driftedColumn(want, have),
+                    columnSnap(want), "core").get(0);
+            assertEquals(ChangeSafety.DESTRUCTIVE, change.safety(), pair[0] + " <- " + pair[1]);
+            assertTrue(change.isManual());
+        }
+    }
+
+    @Test
+    void driftedColumnGeneratedOrIdentityStaysManual() {
+        var change = PgRender.render(driftedColumn(
+                "type=int;notnull=false;generated=s:(a + 1)",
+                "type=int;notnull=false"),
+                columnSnap("type=int;notnull=false;generated=s:(a + 1)"), "core").get(0);
+        assertEquals(ChangeSafety.DESTRUCTIVE, change.safety());
+        assertTrue(change.isManual());
+        change = PgRender.render(driftedColumn(
+                "type=bigint;notnull=false;identity=a;identityOptions=x",
+                "type=bigint;notnull=false"),
+                columnSnap("type=bigint;notnull=false;identity=a;identityOptions=x"),
+                "core").get(0);
+        assertEquals(ChangeSafety.DESTRUCTIVE, change.safety());
     }
 }

@@ -61,6 +61,12 @@ final class PgTestDatabase {
         return new Simple(url, user, password);
     }
 
+    /** A DataSource that authenticates as another role (preflight tests). */
+    static DataSource dataSource(String user, String password) {
+        start();
+        return new Simple(url, user, password);
+    }
+
     /** Minimal DriverManager-backed DataSource — keeps the JDBC driver test-only. */
     private record Simple(String url, String user, String password) implements DataSource {
         @Override

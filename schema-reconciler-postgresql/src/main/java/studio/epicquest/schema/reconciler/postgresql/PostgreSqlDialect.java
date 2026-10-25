@@ -2,6 +2,8 @@ package studio.epicquest.schema.reconciler.postgresql;
 
 import java.sql.Connection;
 import java.sql.DatabaseMetaData;
+import java.sql.PreparedStatement;
+import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Statement;
 import java.time.Duration;
@@ -9,6 +11,7 @@ import java.util.EnumSet;
 import java.util.List;
 import java.util.Set;
 import java.util.concurrent.ThreadLocalRandom;
+import studio.epicquest.schema.reconciler.ConfigurationException;
 import studio.epicquest.schema.reconciler.DesiredStateException;
 import studio.epicquest.schema.reconciler.LockTimeoutException;
 import studio.epicquest.schema.reconciler.model.Difference;
@@ -87,6 +90,14 @@ public final class PostgreSqlDialect implements Dialect {
         }
     }
 
+    @Override
+    public void statementTimeout(Connection connection, Duration timeout) throws SQLException {
+        try (Statement s = connection.createStatement()) {
+            s.execute("SET LOCAL statement_timeout = '"
+                    + Math.max(1L, timeout.toMillis()) + "ms'");
+        }
+    }
+
     // ---- A.3 scratch namespace ----------------------------------------------
 
     @Override
@@ -126,8 +137,52 @@ public final class PostgreSqlDialect implements Dialect {
     // ---- A.4 script execution -----------------------------------------------
 
     @Override
-    public void executeScript(Connection connection, String script) throws SQLException {
-        PgScriptCheck.check(script);
+    public void checkAccess(Connection connection, String namespace,
+                            boolean createNamespace) throws SQLException {
+        if (namespace != null) {
+            try (PreparedStatement ps = connection.prepareStatement(
+                    "SELECT to_regnamespace(?),"
+                            + " has_schema_privilege(current_user, to_regnamespace(?),"
+                            + " 'USAGE,CREATE')")) {
+                ps.setString(1, namespace);
+                ps.setString(2, namespace);
+                try (ResultSet rs = ps.executeQuery()) {
+                    rs.next();
+                    if (rs.getObject(1) == null) {
+                        throw new ConfigurationException("namespace '" + namespace
+                                + "' does not exist on the target database");
+                    }
+                    if (!rs.getBoolean(2)) {
+                        throw new ConfigurationException("namespace '" + namespace
+                                + "': the connecting user lacks USAGE or CREATE"
+                                + " on the target namespace");
+                    }
+                }
+            }
+        }
+        if (createNamespace) {
+            try (PreparedStatement ps = connection.prepareStatement(
+                    "SELECT has_database_privilege(current_user, current_database(),"
+                            + " 'CREATE')")) {
+                try (ResultSet rs = ps.executeQuery()) {
+                    rs.next();
+                    if (!rs.getBoolean(1)) {
+                        throw new ConfigurationException("the connecting user lacks"
+                                + " CREATE on the database, needed for the scratch"
+                                + " namespace; configure scratchDataSource to"
+                                + " offload scratch creation");
+                    }
+                }
+            }
+        }
+    }
+
+    // ---- A.4 script execution -----------------------------------------------
+
+    @Override
+    public void executeScript(Connection connection, String script, String scratchNamespace)
+            throws SQLException {
+        PgScriptCheck.check(script, scratchNamespace);
         try (Statement s = connection.createStatement()) {
             s.execute(script);
         }

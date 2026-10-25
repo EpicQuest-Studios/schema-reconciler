@@ -353,6 +353,37 @@ class ReconcileEngineTest {
     }
 
     @Test
+    void failuresCarryRunTimings() {
+        // an apply-time failure reports the phases it completed plus the
+        // partial duration of the failed phase
+        final var r = SchemaReconciler.builder()
+                .dataSource(db.dataSource()).namespace(NS)
+                .desiredState(DesiredState.ofScript("CREATE TABLE t DEF t_v1"))
+                .dialect(dialect)
+                .listener(new ReconcileListener() {
+                    @Override
+                    public void applying(PlannedChange change) {
+                        throw new IllegalStateException("stop");
+                    }
+                })
+                .build();
+        final var e = assertThrows(ApplyException.class, r::reconcile);
+        assertTrue(e.timings().readActual().toNanos() > 0, e.timings().toString());
+        assertTrue(e.timings().apply().toNanos() > 0,
+                "partial apply phase must be measured: " + e.timings());
+        assertEquals(Duration.ZERO, e.timings().verify(),
+                "verify never started: " + e.timings());
+
+        // a policy rejection still reports every completed phase
+        db.executeDirect(NS, "CREATE TABLE t DEF t_old");
+        final var policyFail = assertThrows(PolicyViolationException.class,
+                () -> reconciler("CREATE TABLE t DEF t_new").reconcile());
+        assertTrue(policyFail.timings().plan().toNanos() > 0,
+                policyFail.timings().toString());
+        assertEquals(Duration.ZERO, policyFail.timings().apply());
+    }
+
+    @Test
     void concurrentRunsSerialiseOnLock() throws Exception {
         final var entered = new CountDownLatch(1);
         final var release = new CountDownLatch(1);

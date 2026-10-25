@@ -109,6 +109,24 @@ public abstract class DialectConformanceTest {
     /** A statement creating an unsupported object and one supported object depending on it. */
     public record UnsupportedScript(String script, String dependentName) { }
 
+    /**
+     * The policy category of the object {@link #unsupportedScript()} creates —
+     * for OTHER ids the name prefix before {@code ':'}, or {@code "relation"}
+     * when the name carries none (C-35). {@code null} skips the scenario.
+     */
+    protected String unsupportedCategory() {
+        return null;
+    }
+
+    /**
+     * Whether the dialect renders safe in-place column alterations (default,
+     * {@code NOT NULL}, widening type changes) instead of manual changes
+     * (C-33). {@code false} skips the scenario.
+     */
+    protected boolean columnAlterSupported() {
+        return false;
+    }
+
     /** DDL for an identity-style column (C-32), or {@code null} to skip. */
     protected String identityColumnDdl() {
         return null;
@@ -238,6 +256,10 @@ public abstract class DialectConformanceTest {
 
     private static ObjectId index(String parent, String name) {
         return new ObjectId(ObjectKind.INDEX, name, parent);
+    }
+
+    private static ObjectId column(String parent, String name) {
+        return new ObjectId(ObjectKind.COLUMN, name, parent);
     }
 
     private static ObjectId routine(String name, String args) {
@@ -808,5 +830,81 @@ public abstract class DialectConformanceTest {
         final var report = reconciler(script).reconcile();
         assertEquals(ReconcileOutcome.RECONCILED, report.outcome());
         assertEquals(ReconcileOutcome.UP_TO_DATE, reconciler(script).reconcile().outcome());
+    }
+
+    @Test
+    @DisplayName("C-33 column default and DROP NOT NULL alter; SET NOT NULL fails closed")
+    void c33ColumnDefaultAlter() throws Exception {
+        assumeKind(ObjectKind.COLUMN);
+        assumeTrue(columnAlterSupported(),
+                "skipped: dialect renders column drift as manual changes");
+        reconciler("CREATE TABLE t (id bigint, note text DEFAULT 'a', req text NOT NULL)")
+                .reconcile();
+        execute("INSERT INTO " + qualified("t") + " VALUES (1, NULL, 'x'), (2, 'y', 'z')");
+        // both safe directions apply in place: default change and DROP NOT NULL
+        final var report = reconciler(
+                "CREATE TABLE t (id bigint, note text DEFAULT 'b', req text)").reconcile();
+        assertEquals(ReconcileOutcome.RECONCILED, report.outcome());
+        for (final var col : List.of(column("t", "note"), column("t", "req"))) {
+            assertTrue(report.applied().stream()
+                    .anyMatch(c -> c.target().equals(col)
+                            && c.action() == ChangeAction.ALTER),
+                    "expected an applied ALTER for " + col + ": " + report.applied());
+        }
+        assertEquals(ReconcileOutcome.UP_TO_DATE, reconciler(
+                "CREATE TABLE t (id bigint, note text DEFAULT 'b', req text)")
+                .reconcile().outcome());
+        // the reverse direction — SET NOT NULL — can fail on the NULL row held
+        // by 'note': it renders DESTRUCTIVE and stays manual under the default
+        // policy instead of being silently applied
+        assertThrows(PolicyViolationException.class, () -> reconciler(
+                "CREATE TABLE t (id bigint, note text NOT NULL, req text)").reconcile());
+    }
+
+    @Test
+    @DisplayName("C-34 unsafe column type change stays destructive")
+    void c34UnsafeColumnType() throws Exception {
+        assumeKind(ObjectKind.COLUMN);
+        reconciler("CREATE TABLE t (id bigint, payload text)").reconcile();
+        assertThrows(PolicyViolationException.class, () -> reconciler(
+                "CREATE TABLE t (id bigint, payload boolean)").reconcile());
+        assertTrue(snapshot().objects().get(column("t", "payload"))
+                        .definition().canonical().contains("type=text"),
+                "the column type must be unchanged after the rejected plan");
+    }
+
+    @Test
+    @DisplayName("C-35 unsupported category override reports while the rest fails")
+    void c35UnsupportedCategory() throws Exception {
+        final var unsupported = unsupportedScript();
+        final var category = unsupportedCategory();
+        assumeTrue(unsupported != null && category != null,
+                "skipped: dialect declares every kind it can detect");
+        final var script = unsupported.script()
+                + "; CREATE TABLE independent_t (id bigint)";
+        final var report = reconciler(script, ReconcilePolicy.defaults()
+                .withUnsupportedCategory(category, Decision.REPORT)).reconcile();
+        assertTrue(report.unsupported().stream()
+                .anyMatch(d -> d.type() == DifferenceType.UNSUPPORTED));
+        assertTrue(present(table("independent_t")),
+                "independent changes are still applied");
+        // a category that does not match still falls back to the global FAIL
+        assertThrows(PolicyViolationException.class, () -> reconciler(script,
+                ReconcilePolicy.defaults()
+                        .withUnsupportedCategory("no-match", Decision.REPORT)).reconcile());
+    }
+
+    @Test
+    @DisplayName("C-36 the report carries phase timings")
+    void c36RunTimings() throws Exception {
+        final var report = reconciler("CREATE TABLE t (id bigint)").reconcile();
+        final var timings = report.timings();
+        assertNotNull(timings);
+        for (final var d : List.of(timings.lockWait(), timings.readActual(),
+                timings.loadDesired(), timings.plan(), timings.apply(), timings.verify())) {
+            assertNotNull(d);
+            assertFalse(d.isNegative());
+        }
+        assertFalse(report.elapsed().isNegative());
     }
 }

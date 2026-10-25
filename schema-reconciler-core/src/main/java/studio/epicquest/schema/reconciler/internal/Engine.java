@@ -5,7 +5,6 @@ import java.sql.DatabaseMetaData;
 import java.sql.SQLException;
 import java.sql.Statement;
 import java.time.Duration;
-import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.LinkedHashMap;
@@ -25,6 +24,7 @@ import studio.epicquest.schema.reconciler.ReconcileListener;
 import studio.epicquest.schema.reconciler.ReconcileOutcome;
 import studio.epicquest.schema.reconciler.ReconcilePolicy;
 import studio.epicquest.schema.reconciler.ReconcileReport;
+import studio.epicquest.schema.reconciler.RunTimings;
 import studio.epicquest.schema.reconciler.SchemaReconcilerException;
 import studio.epicquest.schema.reconciler.StalePlanException;
 import studio.epicquest.schema.reconciler.VerificationException;
@@ -56,6 +56,7 @@ public final class Engine {
     private final DesiredState desiredState;
     private final ReconcilePolicy policy;
     private final Duration lockTimeout;
+    private final Duration statementTimeout;
     private final ReconcileListener listener;
     private final DialectResolver resolver;
     private final Map<ReconcilePlan, PlanMeta> planMeta =
@@ -63,13 +64,15 @@ public final class Engine {
 
     public Engine(DataSource dataSource, DataSource scratchDataSource, String namespace,
                   DesiredState desiredState, Dialect dialect, ReconcilePolicy policy,
-                  Duration lockTimeout, ReconcileListener listener) {
+                  Duration lockTimeout, Duration statementTimeout,
+                  ReconcileListener listener) {
         this.dataSource = dataSource;
         this.scratchDataSource = scratchDataSource;
         this.namespace = namespace;
         this.desiredState = desiredState;
         this.policy = policy;
         this.lockTimeout = lockTimeout;
+        this.statementTimeout = statementTimeout;
         this.listener = listener;
         this.resolver = new DialectResolver(dialect);
     }
@@ -89,35 +92,89 @@ public final class Engine {
 
     /** Spec 5.1 reconcile(): the full sequence. */
     public ReconcileReport reconcile() {
-        final var start = Instant.now();
+        final var start = System.nanoTime();
+        final var clock = new PhaseClock();
         try (Session session = open()) {
-            session.lock();
-            final var actual = session.readActual();
-            final var desired = loadDesired(session);
-            final var built = buildPlan(session, actual, desired);
+            var t = clock.now();
+            try {
+                session.lock();
+            } finally {
+                clock.lockWait = clock.since(t);
+            }
+            t = clock.now();
+            final SchemaSnapshot actual;
+            try {
+                actual = session.readActual();
+            } finally {
+                clock.readActual = clock.since(t);
+            }
+            t = clock.now();
+            final SchemaSnapshot desired;
+            try {
+                desired = loadDesired(session);
+            } finally {
+                clock.loadDesired = clock.since(t);
+            }
+            t = clock.now();
+            final PlanBuilder.Built built;
+            try {
+                built = buildPlan(session, actual, desired);
+            } finally {
+                clock.plan = clock.since(t);
+            }
             notifyPlanned(built.plan(), List.of());
             PolicyEvaluator.Evaluation evaluation =
                     new PolicyEvaluator(policy).evaluate(built.plan(), actual, desired);
             final var outcome = applyAndVerify(session, built.plan(), evaluation, desired,
-                    built.coveredByParent());
+                    built.coveredByParent(), clock);
             session.commit();
             final var unexpected = unexpected(built.plan());
             final var unsupported = unsupported(built.plan());
             logUnexpectedAndUnsupported(unexpected, unsupported);
             return new ReconcileReport(outcome.outcome(), built.plan(), outcome.applied(),
                     outcome.reported(), unexpected, unsupported,
-                    Duration.between(start, Instant.now()));
+                    Duration.ofNanos(System.nanoTime() - start), clock.snapshot());
+        } catch (SchemaReconcilerException e) {
+            throw e.withTimings(clock.snapshot());
         }
     }
 
     /** Spec 5.1 apply(): the same sequence, driven by a previously issued plan. */
     public ReconcileReport apply(ReconcilePlan plan) {
-        final var start = Instant.now();
+        final var start = System.nanoTime();
+        final var clock = new PhaseClock();
+        // reject a foreign plan before touching the database: a namespace or
+        // dialect mismatch needs no connection to diagnose (5.7)
+        final var fixed = resolver.peek();
+        if (!namespace.equals(plan.targetNamespace())
+                || (fixed != null && !fixed.id().equals(plan.dialectId()))) {
+            throw new IllegalArgumentException("plan targets namespace '"
+                    + plan.targetNamespace() + "' on dialect '" + plan.dialectId()
+                    + "', this reconciler is bound to '" + namespace
+                    + (fixed != null ? "' on '" + fixed.id() + "'" : "'"));
+        }
         try (Session session = open()) {
-            session.lock();
-            final var actual = session.readActual();
+            var t = clock.now();
+            try {
+                session.lock();
+            } finally {
+                clock.lockWait = clock.since(t);
+            }
+            t = clock.now();
+            final SchemaSnapshot actual;
+            try {
+                actual = session.readActual();
+            } finally {
+                clock.readActual = clock.since(t);
+            }
             verifyPlan(plan, session.dialect, actual);
-            final var desired = desiredFor(plan, session);
+            t = clock.now();
+            final SchemaSnapshot desired;
+            try {
+                desired = desiredFor(plan, session);
+            } finally {
+                clock.loadDesired = clock.since(t);
+            }
             notifyPlanned(plan, List.of());
             PolicyEvaluator.Evaluation evaluation =
                     new PolicyEvaluator(policy).evaluate(plan, actual, desired);
@@ -126,14 +183,38 @@ public final class Engine {
                             .map(PlanMeta::coveredByParent)
                             .orElseGet(() -> PlanBuilder.coverageOf(
                                     session.dialect, namespace, plan.differences(), desired));
-            final var outcome = applyAndVerify(session, plan, evaluation, desired, covered);
+            final var outcome = applyAndVerify(session, plan, evaluation, desired, covered, clock);
             session.commit();
             final var unexpected = unexpected(plan);
             final var unsupported = unsupported(plan);
             logUnexpectedAndUnsupported(unexpected, unsupported);
             return new ReconcileReport(outcome.outcome(), plan, outcome.applied(),
                     outcome.reported(), unexpected, unsupported,
-                    Duration.between(start, Instant.now()));
+                    Duration.ofNanos(System.nanoTime() - start), clock.snapshot());
+        } catch (SchemaReconcilerException e) {
+            throw e.withTimings(clock.snapshot());
+        }
+    }
+
+    /** Accumulates per-phase durations for {@link RunTimings}; monotonic (nanoTime). */
+    private static final class PhaseClock {
+        Duration lockWait = Duration.ZERO;
+        Duration readActual = Duration.ZERO;
+        Duration loadDesired = Duration.ZERO;
+        Duration plan = Duration.ZERO;
+        Duration apply = Duration.ZERO;
+        Duration verify = Duration.ZERO;
+
+        long now() {
+            return System.nanoTime();
+        }
+
+        Duration since(long startNanos) {
+            return Duration.ofNanos(System.nanoTime() - startNanos);
+        }
+
+        RunTimings snapshot() {
+            return new RunTimings(lockWait, readActual, loadDesired, plan, apply, verify);
         }
     }
 
@@ -143,41 +224,52 @@ public final class Engine {
     private RunOutcome applyAndVerify(Session session, ReconcilePlan plan,
                                       PolicyEvaluator.Evaluation evaluation,
                                       SchemaSnapshot desired,
-                                      Map<ObjectId, Map<ObjectId, Definition>> coveredByParent) {
+                                      Map<ObjectId, Map<ObjectId, Definition>> coveredByParent,
+                                      PhaseClock clock) {
         final var applied = new ArrayList<PlannedChange>();
         final var reported = new ArrayList<PlannedChange>();
         session.bindNamespace();
-        for (var change : plan.changes()) {
-            if (evaluation.decisions().get(change) == Decision.APPLY) {
-                notifyApplying(change, applied);
-                final var t0 = Instant.now();
-                for (final var sql : change.statements()) {
-                    try {
-                        session.execute(sql);
-                    } catch (SQLException e) {
-                        throw new ApplyException("namespace '" + namespace + "': change "
-                                + change.order() + " failed: " + e.getMessage(), e,
-                                List.copyOf(applied), change);
+        final var applyStart = clock.now();
+        try {
+            for (var change : plan.changes()) {
+                if (evaluation.decisions().get(change) == Decision.APPLY) {
+                    notifyApplying(change, applied);
+                    final var t0 = System.nanoTime();
+                    for (final var sql : change.statements()) {
+                        try {
+                            session.execute(sql);
+                        } catch (SQLException e) {
+                            throw new ApplyException("namespace '" + namespace + "': change "
+                                    + change.order() + " failed: " + e.getMessage(), e,
+                                    List.copyOf(applied), change);
+                        }
                     }
+                    applied.add(change);
+                    notifyApplied(change, Duration.ofNanos(System.nanoTime() - t0), applied);
+                } else {
+                    final var blocker = evaluation.demotedBy().get(change);
+                    if (blocker != null) {
+                        change = new PlannedChange(change.order(), change.target(), change.action(),
+                                change.safety(), change.statements(), change.expected(),
+                                change.reason() + " (blocked by " + blocker + ")");
+                    }
+                    reported.add(change);
+                    LOG.log(System.Logger.Level.WARNING,
+                            "namespace ''{0}'': change {1} ({2} {3}) not applied: {4}",
+                            namespace, change.order(), change.action(), change.target(),
+                            change.reason());
+                    notifyReported(change, applied);
                 }
-                applied.add(change);
-                notifyApplied(change, Duration.between(t0, Instant.now()), applied);
-            } else {
-                final var blocker = evaluation.demotedBy().get(change);
-                if (blocker != null) {
-                    change = new PlannedChange(change.order(), change.target(), change.action(),
-                            change.safety(), change.statements(), change.expected(),
-                            change.reason() + " (blocked by " + blocker + ")");
-                }
-                reported.add(change);
-                LOG.log(System.Logger.Level.WARNING,
-                        "namespace ''{0}'': change {1} ({2} {3}) not applied: {4}",
-                        namespace, change.order(), change.action(), change.target(),
-                        change.reason());
-                notifyReported(change, applied);
             }
+        } finally {
+            clock.apply = clock.since(applyStart);
         }
-        verify(session, applied, coveredByParent);
+        final var verifyStart = clock.now();
+        try {
+            verify(session, applied, coveredByParent);
+        } finally {
+            clock.verify = clock.since(verifyStart);
+        }
         final var outcome = applied.isEmpty()
                 ? (plan.changes().isEmpty() ? ReconcileOutcome.UP_TO_DATE
                         : ReconcileOutcome.REPORTED_ONLY)
@@ -243,11 +335,10 @@ public final class Engine {
     }
 
     private List<Difference> unsupported(ReconcilePlan plan) {
-        if (policy.unsupported() != Decision.REPORT) {
-            return List.of();
-        }
         return plan.differences().stream()
-                .filter(d -> d.type() == DifferenceType.UNSUPPORTED).toList();
+                .filter(d -> d.type() == DifferenceType.UNSUPPORTED
+                        && policy.unsupportedDecision(d) == Decision.REPORT)
+                .toList();
     }
 
     /**
@@ -287,9 +378,16 @@ public final class Engine {
         try {
             if (separate) {
                 checkSameEngine(session.conn, scratch, session.dialect);
+                session.dialect.checkAccess(scratch, null, true);
                 if (session.dialect.capabilities().transactionalDdl()) {
                     scratch.setAutoCommit(false);
                     restoreAutoCommit = true;
+                }
+                if (statementTimeout != null) {
+                    // the separate connection never sees the target session's
+                    // SET LOCAL — the bound must be applied here too or the
+                    // desired script and scratch snapshot read run unbounded
+                    session.dialect.statementTimeout(scratch, statementTimeout);
                 }
             }
             String scratchNamespace;
@@ -312,7 +410,7 @@ public final class Engine {
                     session.dialect.bindSessionNamespace(scratch, scratchNamespace);
                 }
                 try {
-                    session.dialect.executeScript(scratch, processor.substituted());
+                    session.dialect.executeScript(scratch, processor.substituted(), scratchNamespace);
                 } catch (DesiredStateException e) {
                     throw e;
                 } catch (SQLException e) {
@@ -427,6 +525,7 @@ public final class Engine {
             try {
                 this.dialect = resolver.resolve(conn);
                 DialectResolver.quoteOf(dialect, namespace);
+                dialect.checkAccess(conn, namespace, scratchDataSource == null);
                 if (dialect.capabilities().transactionalDdl() && conn.getAutoCommit()) {
                     conn.setAutoCommit(false);
                     restoreAutoCommit = true;
@@ -444,6 +543,9 @@ public final class Engine {
         void lock() {
             try {
                 dialect.acquireLock(conn, namespace, lockTimeout);
+                if (statementTimeout != null) {
+                    dialect.statementTimeout(conn, statementTimeout);
+                }
             } catch (LockTimeoutException e) {
                 throw e;
             } catch (SQLException e) {

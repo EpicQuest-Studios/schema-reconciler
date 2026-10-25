@@ -97,7 +97,8 @@ public final class FakeDialect implements Dialect {
     }
 
     @Override
-    public void executeScript(Connection connection, String script) throws SQLException {
+    public void executeScript(Connection connection, String script, String scratchNamespace)
+            throws SQLException {
         for (final var chunk : script.split(";")) {
             final var statement = chunk.strip();
             if (!statement.isEmpty()) {

@@ -49,6 +49,7 @@ public final class SchemaReconciler {
         private DataSource scratchDataSource;
         private ReconcilePolicy policy = ReconcilePolicy.defaults();
         private Duration lockTimeout = Duration.ofSeconds(60);
+        private Duration statementTimeout;
         private ReconcileListener listener = ReconcileListener.NONE;
 
         private Builder() {
@@ -89,6 +90,16 @@ public final class SchemaReconciler {
             return this;
         }
 
+        /**
+         * Bounds how long any single statement may run during a run — the
+         * dialect applies it after the lock is acquired (spec 3.1), so a slow
+         * applied statement cannot hold its locks unboundedly.
+         */
+        public Builder statementTimeout(Duration timeout) {
+            this.statementTimeout = Objects.requireNonNull(timeout, "timeout");
+            return this;
+        }
+
         public Builder listener(ReconcileListener listener) {
             this.listener = Objects.requireNonNull(listener, "listener");
             return this;
@@ -112,6 +123,10 @@ public final class SchemaReconciler {
             if (lockTimeout.isNegative() || lockTimeout.isZero()) {
                 throw new ConfigurationException("lockTimeout must be positive");
             }
+            if (statementTimeout != null
+                    && (statementTimeout.isNegative() || statementTimeout.isZero())) {
+                throw new ConfigurationException("statementTimeout must be positive");
+            }
             if (dialect == null && ServiceLoader.load(Dialect.class).findFirst().isEmpty()) {
                 throw new ConfigurationException(
                         "no Dialect provider discoverable via ServiceLoader for namespace "
@@ -119,7 +134,7 @@ public final class SchemaReconciler {
             }
             return new SchemaReconciler(new Engine(
                     dataSource, scratchDataSource, targetNamespace, desiredState,
-                    dialect, policy, lockTimeout, listener));
+                    dialect, policy, lockTimeout, statementTimeout, listener));
         }
     }
 }

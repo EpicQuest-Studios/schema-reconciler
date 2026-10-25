@@ -17,7 +17,8 @@ public record ReconcileReport(
         List<PlannedChange> reported,
         List<Difference> unexpected,
         List<Difference> unsupported,
-        Duration elapsed) {
+        Duration elapsed,
+        RunTimings timings) {
 
     public ReconcileReport {
         Objects.requireNonNull(outcome, "outcome");
@@ -27,5 +28,14 @@ public record ReconcileReport(
         unexpected = List.copyOf(Objects.requireNonNull(unexpected, "unexpected"));
         unsupported = List.copyOf(Objects.requireNonNull(unsupported, "unsupported"));
         Objects.requireNonNull(elapsed, "elapsed");
+        Objects.requireNonNull(timings, "timings");
+    }
+
+    public ReconcileReport(ReconcileOutcome outcome, ReconcilePlan plan,
+                           List<PlannedChange> applied, List<PlannedChange> reported,
+                           List<Difference> unexpected, List<Difference> unsupported,
+                           Duration elapsed) {
+        this(outcome, plan, applied, reported, unexpected, unsupported, elapsed,
+                RunTimings.unmeasured());
     }
 }

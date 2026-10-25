@@ -37,6 +37,11 @@ public final class DialectResolver {
         }
     }
 
+    /** The dialect when already known — explicit or previously resolved. */
+    public Dialect peek() {
+        return explicit != null ? explicit : resolved;
+    }
+
     public Dialect resolve(Connection connection) {
         final var d = resolved;
         if (d != null) {

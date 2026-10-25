@@ -2,6 +2,7 @@ package studio.epicquest.schema.reconciler.postgresql.internal;
 
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
@@ -13,6 +14,7 @@ import java.util.stream.Collectors;
 import studio.epicquest.schema.reconciler.PlanningException;
 import studio.epicquest.schema.reconciler.model.ChangeAction;
 import studio.epicquest.schema.reconciler.model.ChangeSafety;
+import studio.epicquest.schema.reconciler.model.Definition;
 import studio.epicquest.schema.reconciler.model.Difference;
 import studio.epicquest.schema.reconciler.model.ObjectId;
 import studio.epicquest.schema.reconciler.model.ObjectIds;
@@ -161,6 +163,7 @@ public final class PgRender {
     private static List<PlannedChange> drifted(ObjectId id, SchemaObject want,
                                                Difference difference, String ns) {
         return switch (id.kind()) {
+            case COLUMN -> driftedColumn(id, want, difference, ns);
             case PRIMARY_KEY, UNIQUE, FOREIGN_KEY, CHECK, INDEX, VIEW ->
                     recreate(id, want, ns, "drifted " + id);
             case SEQUENCE -> {
@@ -203,6 +206,167 @@ public final class PgRender {
                     ChangeSafety.DESTRUCTIVE, List.of(), Optional.empty(),
                     "drifted " + id + " requires a manual change"));
         };
+    }
+
+    /**
+     * A.6: decomposes column drift by what each alteration can do to existing
+     * rows (5.6 rule 1). Reversible metadata alterations — a widening {@code
+     * TYPE} from the allowlist, default changes and {@code DROP NOT NULL} —
+     * become one {@code REBUILD} change. {@code SET NOT NULL} scans and fails
+     * on violating rows, so it becomes a separate {@code DESTRUCTIVE} change
+     * (rendered, gated by policy). Generated, identity and collation changes
+     * and non-widening type changes stay manual (no statements).
+     */
+    private static List<PlannedChange> driftedColumn(ObjectId id, SchemaObject want,
+                                                     Difference difference, String ns) {
+        final var haveCanonical = difference.actual()
+                .map(d -> d.canonical()).orElse(null);
+        if (haveCanonical == null) {
+            return manualColumn(id, "drifted " + id + " requires a manual change");
+        }
+        final var wantFields = columnFields(want.definition().canonical());
+        final var haveFields = columnFields(haveCanonical);
+        for (final var key : List.of("generated", "identity", "identityOptions", "collation")) {
+            if (!Objects.equals(wantFields.get(key), haveFields.get(key))) {
+                return manualColumn(id, "drifted " + id + " (" + key + " changed)");
+            }
+        }
+        final var alter = "ALTER TABLE " + TOKEN + "."
+                + PgIdentifiers.quote(id.parent().orElse(""))
+                + " ALTER COLUMN " + PgIdentifiers.quote(id.name()) + " ";
+        final var safe = new ArrayList<String>();
+        final var wantType = wantFields.get("type");
+        if (!Objects.equals(wantType, haveFields.get("type"))) {
+            if (wantType == null || haveFields.get("type") == null
+                    || !widens(haveFields.get("type"), wantType)) {
+                return manualColumn(id, "drifted " + id + " (type change "
+                        + haveFields.get("type") + " -> " + wantType
+                        + " is not a widening)");
+            }
+            safe.add(alter + "TYPE " + wantType);
+        }
+        final var wantDefault = wantFields.get("default");
+        if (!Objects.equals(wantDefault, haveFields.get("default"))) {
+            safe.add(alter + (wantDefault != null
+                    ? "SET DEFAULT " + wantDefault : "DROP DEFAULT"));
+        }
+        final var wantNotnull =
+                Boolean.parseBoolean(wantFields.getOrDefault("notnull", "false"));
+        final var haveNotnull =
+                Boolean.parseBoolean(haveFields.getOrDefault("notnull", "false"));
+        final var setNotNull = wantNotnull && !haveNotnull;
+        if (haveNotnull && !wantNotnull) {
+            safe.add(alter + "DROP NOT NULL");
+        }
+        if (safe.isEmpty() && !setNotNull) {
+            return manualColumn(id, "drifted " + id + " requires a manual change");
+        }
+        final var changes = new ArrayList<PlannedChange>();
+        if (!safe.isEmpty()) {
+            // with SET NOT NULL deferred to its own change, the applied
+            // statements only converge the column to want-minus-notnull; the
+            // expected definition must match that state exactly
+            final var expected = setNotNull
+                    ? new Definition(canonicalWith(wantFields, "notnull",
+                            haveFields.get("notnull")))
+                    : want.definition();
+            changes.add(new PlannedChange(0, id, ChangeAction.ALTER, ChangeSafety.REBUILD,
+                    safe.stream().map(s -> bind(s, ns)).toList(),
+                    Optional.of(expected), "drifted " + id));
+        }
+        if (setNotNull) {
+            changes.add(new PlannedChange(0, id, ChangeAction.ALTER,
+                    ChangeSafety.DESTRUCTIVE,
+                    List.of(bind(alter + "SET NOT NULL", ns)),
+                    Optional.of(want.definition()),
+                    "drifted " + id + " (SET NOT NULL validates existing rows)"));
+        }
+        return changes;
+    }
+
+    /** The canonical of {@code fields}, with {@code key} replaced by {@code value}. */
+    private static String canonicalWith(Map<String, String> fields, String key, String value) {
+        final var merged = new LinkedHashMap<>(fields);
+        merged.put(key, value);
+        return merged.entrySet().stream()
+                .map(e -> e.getKey() + "=" + e.getValue())
+                .collect(Collectors.joining(";"));
+    }
+
+    private static List<PlannedChange> manualColumn(ObjectId id, String reason) {
+        return List.of(new PlannedChange(0, id, ChangeAction.ALTER,
+                ChangeSafety.DESTRUCTIVE, List.of(), Optional.empty(), reason));
+    }
+
+    /** The {@code key=value} fields of a column's canonical definition. */
+    private static Map<String, String> columnFields(String canonical) {
+        final var fields = new LinkedHashMap<String, String>();
+        for (final var part : canonical.split(";")) {
+            final var eq = part.indexOf('=');
+            if (eq > 0) {
+                fields.put(part.substring(0, eq), part.substring(eq + 1));
+            }
+        }
+        return fields;
+    }
+
+    private static final Map<String, Integer> INT_TYPES = Map.of(
+            "smallint", 1, "integer", 2, "bigint", 3);
+    private static final Pattern TYPMOD = Pattern.compile("\\((\\d+)(?:,(\\d+))?\\)");
+
+    /**
+     * Whether {@code have → want} is a widening: a total and lossless type
+     * change — every stored value converts without error, truncation or
+     * semantic change. The allowlist is the integer chain, {@code character
+     * varying} growth or conversion to {@code text}, {@code character(n)}
+     * growth, and {@code numeric} precision/scale growth. Several of these
+     * rewrite the table (the integer chain, {@code character} growth,
+     * scale-increasing {@code numeric}); that is a locking concern (OI-7),
+     * not a data-safety one. Notably excluded: {@code character → character
+     * varying/text} strips trailing spaces, and {@code → character} changes
+     * padding semantics.
+     */
+    private static boolean widens(String have, String want) {
+        final var hb = base(have);
+        final var wb = base(want);
+        final var hr = INT_TYPES.get(hb);
+        final var wr = INT_TYPES.get(wb);
+        if (hr != null && wr != null && typmod(have).length == 0 && typmod(want).length == 0) {
+            return wr > hr;
+        }
+        if (hb.equals("character varying")
+                && (wb.equals("character varying") || wb.equals("text"))) {
+            final var hm = typmod(have);
+            final var wm = typmod(want);
+            return wb.equals("text") || wm.length == 0 || (hm.length == 1 && wm[0] >= hm[0]);
+        }
+        if (hb.equals("character") && wb.equals("character")) {
+            final var hm = typmod(have);
+            final var wm = typmod(want);
+            return hm.length == 1 && wm.length == 1 && wm[0] >= hm[0];
+        }
+        if (hb.equals("numeric") && wb.equals("numeric")) {
+            final var hm = typmod(have);
+            final var wm = typmod(want);
+            return wm.length == 0
+                    || (hm.length == 2 && wm.length == 2 && wm[0] >= hm[0] && wm[1] >= hm[1]);
+        }
+        return false;
+    }
+
+    private static String base(String type) {
+        final var p = type.indexOf('(');
+        return (p < 0 ? type : type.substring(0, p)).strip();
+    }
+
+    private static int[] typmod(String type) {
+        final var m = TYPMOD.matcher(type);
+        if (!m.find()) {
+            return new int[0];
+        }
+        return m.group(2) != null
+                ? new int[] { Integer.parseInt(m.group(1)), Integer.parseInt(m.group(2)) }
+                : new int[] { Integer.parseInt(m.group(1)) };
     }
 
     private static PlannedChange additive(ObjectId id, SchemaObject want, String ns, String reason) {
@@ -257,9 +421,27 @@ public final class PgRender {
                 .collect(Collectors.toCollection(LinkedHashSet::new));
     }
 
+    /**
+     * OTHER categories whose stripped names occupy the relation/type
+     * namespace — the relkind-prefixed relations plus {@code type:} (a
+     * standalone type collides with a table's rowtype). Must match the
+     * prefixes {@code PgCatalog} assigns to those objects.
+     */
+    private static final Set<String> RELATION_NAMESPACE_OTHERS = Set.of(
+            "inherited", "matview", "foreign", "partition", "partindex",
+            "composite", "toast", "relation", "type");
+
     public static Set<String> nameScopes(ObjectId id) {
         return switch (id.kind()) {
-            case TABLE, VIEW, SEQUENCE, INDEX, OTHER -> Set.of("relation:" + id.name());
+            case OTHER -> {
+                final var name = id.name();
+                final var colon = name.indexOf(':');
+                yield colon > 0
+                        && RELATION_NAMESPACE_OTHERS.contains(name.substring(0, colon))
+                        ? Set.of("relation:" + name.substring(colon + 1))
+                        : Set.of("relation:" + name);
+            }
+            case TABLE, VIEW, SEQUENCE, INDEX -> Set.of("relation:" + id.name());
             case PRIMARY_KEY, UNIQUE -> Set.of(
                     "relation:" + id.name(),
                     "constraint:" + id.parent().orElse("") + "." + id.name());
