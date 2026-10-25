@@ -3,7 +3,7 @@ package studio.epicquest.schema.reconciler.internal;
 import studio.epicquest.schema.reconciler.model.ReconcilePlan;
 
 /**
- * The deterministic {@code toSql()} rendering of spec 4.6: a header with the
+ * The deterministic {@code toSql()} rendering of spec 4.4: a header with the
  * plan's context, then each change as an ordered comment followed by its
  * statements. No timestamps — byte-identical runs render byte-identical plans.
  */

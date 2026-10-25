@@ -67,7 +67,9 @@ public final class DialectResolver {
             selected = explicit;
         } else {
             final var matching = new ArrayList<Dialect>();
+            final var discovered = new ArrayList<String>();
             for (final var candidate : ServiceLoader.load(Dialect.class)) {
+                discovered.add(candidate.id());
                 boolean supports;
                 try {
                     supports = candidate.supports(metaData);
@@ -81,7 +83,9 @@ public final class DialectResolver {
             }
             selected = switch (matching.size()) {
                 case 0 -> throw new ConfigurationException(
-                        "no dialect supports this database: " + productName(metaData));
+                        "no dialect supports this database: " + productName(metaData)
+                                + " (discovered dialects: "
+                                + (discovered.isEmpty() ? "none" : String.join(", ", discovered)) + ")");
                 case 1 -> matching.get(0);
                 default -> throw new ConfigurationException(
                         "several dialects support " + productName(metaData) + ": "

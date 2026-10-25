@@ -335,8 +335,6 @@ class PostgreSqlConformanceTest extends DialectConformanceTest {
     @Test
     @DisplayName("environmental objects report as UNEXPECTED without blocking")
     void environmentalObjectsReportUnexpected() throws Exception {
-        // extension, policy, comment and matview live in the environment the
-        // way Komisar finds them; the desired script covers managed objects
         execute("CREATE TABLE " + qualified("t") + " (id bigint)");
         execute("CREATE EXTENSION IF NOT EXISTS pg_trgm WITH SCHEMA " + q(namespace()));
         execute("CREATE POLICY p_sel ON " + qualified("t") + " FOR SELECT USING (true)");

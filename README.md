@@ -8,20 +8,20 @@ Inspired by the Kubernetes model: a manifest is the single source of truth and a
 
 ## The problem
 
-A long-lived service typically owns a relational schema that must evolve with the code. The common approaches all have a gap:
+A long-lived service typically owns a relational schema that must evolve with the code. Common approaches leave a gap:
 
-- **Migration tools** (Flyway, Liquibase) are ordered-changelog oriented: they answer "which deltas ran so far", not "make the database look like *this*". The desired end state lives only implicitly, spread across dozens of ordered migration files, and the tools happily drift out of sync with any out-of-band change.
-- **Hand-written reconciliation** (comparing catalog rows against application-side constants) works, but duplicates the desired state: once in `schema.sql`, once in hand-maintained maps of expected tables, columns, constraints, indexes and views. The two copies silently diverge, and hand-written checkers rarely verify function bodies, trigger definitions or view text.
-- **Client-side SQL parsing** (to introspect a DDL script without running it) is brittle for vendor SQL: dollar-quoted function bodies, expression and partial indexes, and dialect-specific syntax defeat general parsers or require commercial editions.
-- **Dump-and-diff tools** (migra, apgdiff, `pg_dump` comparisons) generate migration scripts between two live databases but are CLI-oriented, PostgreSQL-specific, or unmaintained — and none embed in a Java service with an explicit data-safety policy.
+- **Ordered migrations** answer "which deltas ran so far", not "make the database look like *this*". The desired end state lives only implicitly, spread across many ordered files.
+- **Hand-written reconciliation** (comparing catalog rows against application-side constants) duplicates the desired state: once in `schema.sql`, once in hand-maintained maps of expected objects. The two copies can diverge, and such checkers tend not to cover function bodies, trigger definitions or view text.
+- **Client-side SQL parsing** (introspecting a DDL script without running it) is brittle for vendor SQL: dollar-quoted function bodies, expression and partial indexes and dialect-specific syntax are hard for a general parser.
+- **Dump-and-diff** (comparing two live databases or `pg_dump` outputs) generates migration scripts, but does not by itself give an embedded API with an explicit data-safety policy.
 
-What is missing is an embeddable library where the *desired state is declared once, as ordinary DDL*; the target database itself parses it; and a deterministic, dependency-ordered, policy-gated plan brings the live schema to that state — while provably never deleting data the caller did not opt into losing.
+What is missing is an embeddable library where the *desired state is declared once, as ordinary DDL*; the target database itself parses it; and a deterministic, dependency-ordered, policy-gated plan brings the live schema to that state — while never deleting data the caller did not opt into losing.
 
 ## The goal
 
 This repository contains two things:
 
-1. **A specification** ([SPEC.md](SPEC.md)) that defines a vendor-neutral reconciliation contract: a Java API for applications, a `Dialect` SPI implemented once per database product, the reconciliation algorithm shared by all dialects, a 32-scenario conformance suite (TCK) every dialect must pass, and a PostgreSQL profile. The specification exists so the same contract can be implemented for other relational databases — dialects are discovered via `ServiceLoader` and selected per data source.
+1. **A specification** ([SPEC.md](SPEC.md)) that defines a vendor-neutral reconciliation contract: a Java API for applications, a `Dialect` SPI implemented once per database product, the reconciliation algorithm shared by all dialects, a 36-scenario conformance suite (TCK) every dialect must pass, and a PostgreSQL profile. The specification exists so the same contract can be implemented for other relational databases — dialects are discovered via `ServiceLoader` and selected per data source.
 2. **A reference implementation** of that specification: `schema-reconciler-core` (the engine, depending only on Java SE), `schema-reconciler-postgresql` (the PostgreSQL 14+ dialect), and `schema-reconciler-tck` (the conformance suite, reusable by third-party dialects).
 
 ## How it works
@@ -103,7 +103,7 @@ RECONCILER_TEST_USER=rcl RECONCILER_TEST_PASSWORD=rcl \
 mvn verify
 ```
 
-See [SPEC.md](SPEC.md) for the full contract — including the PostgreSQL 14–19 feature-coverage matrix and the schema-corpus description in its appendices. The obfuscated schema corpus lives in `schema-reconciler-postgresql/src/test/resources/corpus/`.
+See [SPEC.md](SPEC.md) for the full contract — including the PostgreSQL 14–19 feature-coverage matrix and the schema-corpus description in Appendix C. The obfuscated schema corpus lives in `schema-reconciler-postgresql/src/test/resources/corpus/`.
 
 ## License
 

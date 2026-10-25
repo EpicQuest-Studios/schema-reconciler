@@ -87,7 +87,12 @@ final class PlanBuilder {
         List<PlannedChange> rendered;
         try {
             rendered = dialect.render(difference, desired, targetNamespace);
-        } catch (PlanningException | IllegalArgumentException e) {
+        } catch (PlanningException e) {
+            if (e.getMessage() != null && e.getMessage().contains("namespace '" + targetNamespace + "'")) {
+                throw e;
+            }
+            throw new PlanningException("namespace '" + targetNamespace + "': " + e.getMessage(), e);
+        } catch (IllegalArgumentException e) {
             throw e;
         } catch (RuntimeException e) {
             throw new PlanningException(

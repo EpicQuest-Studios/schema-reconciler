@@ -106,12 +106,12 @@ public final class PgScriptCheck {
                             first + " SCHEMA is not allowed; the core owns namespace creation");
                 }
                 if (object.equals("DATABASE") || object.equals("TABLESPACE")
-                        || object.equals("SUBSCRIPTION") || object.equals("PUBLICATION")
+                        || object.equals("SUBSCRIPTION")
                         || object.equals("SYSTEM")) {
                     throw rejected(statement,
                             first + " " + object + " cannot run inside a transaction block");
                 }
-                if (object.equals("SERVER") || object.equals("ROLE") || object.equals("USER")
+                if (object.equals("SERVER") || object.equals("PUBLICATION") || object.equals("ROLE") || object.equals("USER")
                         || object.equals("GROUP") || object.equals("EVENT")
                         || object.equals("ACCESS") || object.equals("DEFAULT")
                         || object.equals("OWNED") || object.equals("LANGUAGE")

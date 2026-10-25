@@ -461,7 +461,11 @@ public final class Engine {
         try {
             if (separate) {
                 checkSameEngine(session.conn, scratch, session.dialect);
-                session.dialect.checkAccess(scratch, null, true);
+                try {
+                    session.dialect.checkAccess(scratch, null, true);
+                } catch (ConfigurationException e) {
+                    throw names(e) ? e : new ConfigurationException(named(e.getMessage()), e);
+                }
                 if (session.dialect.capabilities().transactionalDdl()) {
                     scratch.setAutoCommit(false);
                     restoreAutoCommit = true;
@@ -495,7 +499,7 @@ public final class Engine {
                 try {
                     session.dialect.executeScript(scratch, processor.substituted(), scratchNamespace);
                 } catch (DesiredStateException e) {
-                    throw e;
+                    throw names(e) ? e : new DesiredStateException(named(e.getMessage()), e);
                 } catch (SQLException e) {
                     throw new DesiredStateException("namespace '" + namespace
                             + "': the desired-state script failed: " + e.getMessage(), e);
@@ -545,9 +549,19 @@ public final class Engine {
         final var sameEngine = tm.getDatabaseProductName().equals(sm.getDatabaseProductName())
                 && tm.getDatabaseMajorVersion() == sm.getDatabaseMajorVersion();
         if (!sameEngine || !dialect.supports(sm)) {
-            throw new ConfigurationException("the scratchDataSource is not the same engine"
+            throw new ConfigurationException("namespace '" + namespace
+                    + "': the scratchDataSource is not the same engine"
                     + " and major version as the target dataSource");
         }
+    }
+
+    private boolean names(Exception e) {
+        return e.getMessage() != null && e.getMessage().contains("namespace '" + namespace + "'");
+    }
+
+    /** Prefixes a message raised below the engine (resolver, dialect) with the target namespace (spec 7). */
+    private String named(String message) {
+        return "namespace '" + namespace + "': " + message;
     }
 
     private Session open() {
@@ -619,6 +633,9 @@ public final class Engine {
                 }
             } catch (RuntimeException | SQLException e) {
                 closeQuietly();
+                if (e instanceof ConfigurationException ce && !names(ce)) {
+                    throw new ConfigurationException(named(ce.getMessage()), ce);
+                }
                 if (e instanceof SchemaReconcilerException sre) {
                     throw sre;
                 }

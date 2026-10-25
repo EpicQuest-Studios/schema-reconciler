@@ -239,6 +239,7 @@ class PostgreSqlInternalsTest {
         for (final var sql : new String[] {
                 "CREATE SERVER s FOREIGN DATA WRAPPER w",
                 "DROP SERVER s",
+                "CREATE PUBLICATION p FOR TABLE t",
                 "CREATE FOREIGN DATA WRAPPER w",
                 "CREATE USER MAPPING FOR u SERVER s",
                 "CREATE EVENT TRIGGER e ON ddl_command_start EXECUTE FUNCTION f()",
