@@ -1,0 +1,536 @@
+package studio.epicquest.schema.reconciler.internal;
+
+import java.sql.Connection;
+import java.sql.DatabaseMetaData;
+import java.sql.SQLException;
+import java.sql.Statement;
+import java.time.Duration;
+import java.time.Instant;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.WeakHashMap;
+import javax.sql.DataSource;
+import studio.epicquest.schema.reconciler.ApplyException;
+import studio.epicquest.schema.reconciler.ConfigurationException;
+import studio.epicquest.schema.reconciler.Decision;
+import studio.epicquest.schema.reconciler.DesiredState;
+import studio.epicquest.schema.reconciler.DesiredStateException;
+import studio.epicquest.schema.reconciler.LockTimeoutException;
+import studio.epicquest.schema.reconciler.PlanningException;
+import studio.epicquest.schema.reconciler.ReconcileListener;
+import studio.epicquest.schema.reconciler.ReconcileOutcome;
+import studio.epicquest.schema.reconciler.ReconcilePolicy;
+import studio.epicquest.schema.reconciler.ReconcileReport;
+import studio.epicquest.schema.reconciler.SchemaReconcilerException;
+import studio.epicquest.schema.reconciler.StalePlanException;
+import studio.epicquest.schema.reconciler.VerificationException;
+import studio.epicquest.schema.reconciler.model.Definition;
+import studio.epicquest.schema.reconciler.model.Difference;
+import studio.epicquest.schema.reconciler.model.DifferenceType;
+import studio.epicquest.schema.reconciler.model.ObjectId;
+import studio.epicquest.schema.reconciler.model.PlannedChange;
+import studio.epicquest.schema.reconciler.model.ReconcilePlan;
+import studio.epicquest.schema.reconciler.model.SchemaSnapshot;
+import studio.epicquest.schema.reconciler.spi.Dialect;
+
+/**
+ * The shared step machine of spec 5.1 behind {@code plan()}, {@code reconcile()}
+ * and {@code apply(plan)}.
+ */
+public final class Engine {
+
+    private static final System.Logger LOG =
+            System.getLogger("studio.epicquest.schema.reconciler");
+
+    /** Metadata retained per issued plan for {@code apply()}. */
+    private record PlanMeta(SchemaSnapshot desired,
+                            Map<ObjectId, Map<ObjectId, Definition>> coveredByParent) { }
+
+    private final DataSource dataSource;
+    private final DataSource scratchDataSource;
+    private final String namespace;
+    private final DesiredState desiredState;
+    private final ReconcilePolicy policy;
+    private final Duration lockTimeout;
+    private final ReconcileListener listener;
+    private final DialectResolver resolver;
+    private final Map<ReconcilePlan, PlanMeta> planMeta =
+            Collections.synchronizedMap(new WeakHashMap<>());
+
+    public Engine(DataSource dataSource, DataSource scratchDataSource, String namespace,
+                  DesiredState desiredState, Dialect dialect, ReconcilePolicy policy,
+                  Duration lockTimeout, ReconcileListener listener) {
+        this.dataSource = dataSource;
+        this.scratchDataSource = scratchDataSource;
+        this.namespace = namespace;
+        this.desiredState = desiredState;
+        this.policy = policy;
+        this.lockTimeout = lockTimeout;
+        this.listener = listener;
+        this.resolver = new DialectResolver(dialect);
+    }
+
+    /** Spec 5.1 plan(): steps 1–5, returning the plan without evaluating policy or applying. */
+    public ReconcilePlan plan() {
+        try (Session session = open()) {
+            session.lock();
+            final var actual = session.readActual();
+            final var desired = loadDesired(session);
+            final var built = buildPlan(session, actual, desired);
+            notifyPlanned(built.plan(), List.of());
+            planMeta.put(built.plan(), new PlanMeta(desired, built.coveredByParent()));
+            return built.plan();
+        }
+    }
+
+    /** Spec 5.1 reconcile(): the full sequence. */
+    public ReconcileReport reconcile() {
+        final var start = Instant.now();
+        try (Session session = open()) {
+            session.lock();
+            final var actual = session.readActual();
+            final var desired = loadDesired(session);
+            final var built = buildPlan(session, actual, desired);
+            notifyPlanned(built.plan(), List.of());
+            PolicyEvaluator.Evaluation evaluation =
+                    new PolicyEvaluator(policy).evaluate(built.plan(), actual, desired);
+            final var outcome = applyAndVerify(session, built.plan(), evaluation, desired,
+                    built.coveredByParent());
+            session.commit();
+            final var unexpected = unexpected(built.plan());
+            final var unsupported = unsupported(built.plan());
+            logUnexpectedAndUnsupported(unexpected, unsupported);
+            return new ReconcileReport(outcome.outcome(), built.plan(), outcome.applied(),
+                    outcome.reported(), unexpected, unsupported,
+                    Duration.between(start, Instant.now()));
+        }
+    }
+
+    /** Spec 5.1 apply(): the same sequence, driven by a previously issued plan. */
+    public ReconcileReport apply(ReconcilePlan plan) {
+        final var start = Instant.now();
+        try (Session session = open()) {
+            session.lock();
+            final var actual = session.readActual();
+            verifyPlan(plan, session.dialect, actual);
+            final var desired = desiredFor(plan, session);
+            notifyPlanned(plan, List.of());
+            PolicyEvaluator.Evaluation evaluation =
+                    new PolicyEvaluator(policy).evaluate(plan, actual, desired);
+            Map<ObjectId, Map<ObjectId, Definition>> covered =
+                    Optional.ofNullable(planMeta.get(plan))
+                            .map(PlanMeta::coveredByParent)
+                            .orElseGet(() -> PlanBuilder.coverageOf(
+                                    session.dialect, namespace, plan.differences(), desired));
+            final var outcome = applyAndVerify(session, plan, evaluation, desired, covered);
+            session.commit();
+            final var unexpected = unexpected(plan);
+            final var unsupported = unsupported(plan);
+            logUnexpectedAndUnsupported(unexpected, unsupported);
+            return new ReconcileReport(outcome.outcome(), plan, outcome.applied(),
+                    outcome.reported(), unexpected, unsupported,
+                    Duration.between(start, Instant.now()));
+        }
+    }
+
+    private record RunOutcome(ReconcileOutcome outcome, List<PlannedChange> applied,
+                              List<PlannedChange> reported) { }
+
+    private RunOutcome applyAndVerify(Session session, ReconcilePlan plan,
+                                      PolicyEvaluator.Evaluation evaluation,
+                                      SchemaSnapshot desired,
+                                      Map<ObjectId, Map<ObjectId, Definition>> coveredByParent) {
+        final var applied = new ArrayList<PlannedChange>();
+        final var reported = new ArrayList<PlannedChange>();
+        session.bindNamespace();
+        for (var change : plan.changes()) {
+            if (evaluation.decisions().get(change) == Decision.APPLY) {
+                notifyApplying(change, applied);
+                final var t0 = Instant.now();
+                for (final var sql : change.statements()) {
+                    try {
+                        session.execute(sql);
+                    } catch (SQLException e) {
+                        throw new ApplyException("namespace '" + namespace + "': change "
+                                + change.order() + " failed: " + e.getMessage(), e,
+                                List.copyOf(applied), change);
+                    }
+                }
+                applied.add(change);
+                notifyApplied(change, Duration.between(t0, Instant.now()), applied);
+            } else {
+                final var blocker = evaluation.demotedBy().get(change);
+                if (blocker != null) {
+                    change = new PlannedChange(change.order(), change.target(), change.action(),
+                            change.safety(), change.statements(), change.expected(),
+                            change.reason() + " (blocked by " + blocker + ")");
+                }
+                reported.add(change);
+                LOG.log(System.Logger.Level.WARNING,
+                        "namespace ''{0}'': change {1} ({2} {3}) not applied: {4}",
+                        namespace, change.order(), change.action(), change.target(),
+                        change.reason());
+                notifyReported(change, applied);
+            }
+        }
+        verify(session, applied, coveredByParent);
+        final var outcome = applied.isEmpty()
+                ? (plan.changes().isEmpty() ? ReconcileOutcome.UP_TO_DATE
+                        : ReconcileOutcome.REPORTED_ONLY)
+                : ReconcileOutcome.RECONCILED;
+        return new RunOutcome(outcome, List.copyOf(applied), List.copyOf(reported));
+    }
+
+    private void verify(Session session, List<PlannedChange> applied,
+                        Map<ObjectId, Map<ObjectId, Definition>> coveredByParent) {
+        final var expectations = new LinkedHashMap<ObjectId, Definition>();
+        for (final var change : applied) {
+            change.expected().ifPresent(d -> expectations.put(change.target(), d));
+            final var covered = coveredByParent.get(change.target());
+            if (covered != null) {
+                expectations.putAll(covered);
+            }
+        }
+        if (expectations.isEmpty()) {
+            return;
+        }
+        final var after = session.readActual();
+        final var remaining = new ArrayList<Difference>();
+        expectations.forEach((id, expected) -> {
+            final var object = after.objects().get(id);
+            if (object == null) {
+                remaining.add(new Difference(id, DifferenceType.MISSING,
+                        Optional.of(expected), Optional.empty()));
+            } else if (!object.definition().equals(expected)) {
+                remaining.add(new Difference(id, DifferenceType.DRIFTED,
+                        Optional.of(expected), Optional.of(object.definition())));
+            }
+        });
+        if (!remaining.isEmpty()) {
+            throw new VerificationException("namespace '" + namespace + "': " + remaining.size()
+                    + " object(s) did not converge after apply: " + remaining.stream()
+                            .map(d -> d.id().toString()).toList(), List.copyOf(remaining));
+        }
+    }
+
+    private void verifyPlan(ReconcilePlan plan, Dialect dialect, SchemaSnapshot actual) {
+        if (!namespace.equals(plan.targetNamespace()) || !dialect.id().equals(plan.dialectId())) {
+            throw new IllegalArgumentException("plan targets namespace '"
+                    + plan.targetNamespace() + "' on dialect '" + plan.dialectId()
+                    + "', this reconciler is bound to '" + namespace + "' on '" + dialect.id() + "'");
+        }
+        if (!actual.fingerprint().equals(plan.actualFingerprint())) {
+            throw new StalePlanException("namespace '" + namespace
+                    + "': the target changed since this plan was issued", plan);
+        }
+    }
+
+    private SchemaSnapshot desiredFor(ReconcilePlan plan, Session session) {
+        final var meta = planMeta.get(plan);
+        if (meta != null) {
+            return meta.desired();
+        }
+        return loadDesired(session);
+    }
+
+    private List<Difference> unexpected(ReconcilePlan plan) {
+        return plan.differences().stream()
+                .filter(d -> d.type() == DifferenceType.UNEXPECTED).toList();
+    }
+
+    private List<Difference> unsupported(ReconcilePlan plan) {
+        if (policy.unsupported() != Decision.REPORT) {
+            return List.of();
+        }
+        return plan.differences().stream()
+                .filter(d -> d.type() == DifferenceType.UNSUPPORTED).toList();
+    }
+
+    /**
+     * The WARNING logs of spec 3.3 and 5.5: unexpected objects and, under a
+     * REPORT unsupported policy, each UNSUPPORTED difference.
+     */
+    private void logUnexpectedAndUnsupported(List<Difference> unexpected,
+                                             List<Difference> unsupported) {
+        for (final var d : unexpected) {
+            LOG.log(System.Logger.Level.WARNING,
+                    "namespace ''{0}'': unexpected object {1} is not in the desired state"
+                            + " and was left unchanged",
+                    namespace, d.id());
+        }
+        for (final var d : unsupported) {
+            LOG.log(System.Logger.Level.WARNING,
+                    "namespace ''{0}'': unsupported object {1} requires manual handling",
+                    namespace, d.id());
+        }
+    }
+
+    private PlanBuilder.Built buildPlan(Session session, SchemaSnapshot actual, SchemaSnapshot desired) {
+        final var differences = Differ.diff(actual, desired, session.dialect);
+        return new PlanBuilder(session.dialect, namespace, actual, desired).build(differences);
+    }
+
+    private SchemaSnapshot loadDesired(Session session) {
+        final var separate = scratchDataSource != null;
+        Connection scratch;
+        try {
+            scratch = separate ? scratchDataSource.getConnection() : session.conn;
+        } catch (SQLException e) {
+            throw new SchemaReconcilerException(
+                    "namespace '" + namespace + "': could not obtain scratch connection", e);
+        }
+        var restoreAutoCommit = false;
+        try {
+            if (separate) {
+                checkSameEngine(session.conn, scratch, session.dialect);
+                if (session.dialect.capabilities().transactionalDdl()) {
+                    scratch.setAutoCommit(false);
+                    restoreAutoCommit = true;
+                }
+            }
+            String scratchNamespace;
+            try {
+                scratchNamespace = session.dialect.createScratchNamespace(scratch, namespace);
+            } catch (SQLException e) {
+                throw new DesiredStateException("namespace '" + namespace
+                        + "': could not create the scratch namespace", e);
+            }
+            try {
+                ScriptProcessor processor =
+                        new ScriptProcessor(desiredState.script(), namespace, scratchNamespace, session.dialect);
+                if (!processor.hasPlaceholder()
+                        && !session.dialect.capabilities().sessionDefaultNamespace()) {
+                    throw new DesiredStateException("namespace '" + namespace
+                            + "': the script contains no ${namespace} placeholder and dialect '"
+                            + session.dialect.id() + "' has no session default namespace");
+                }
+                if (session.dialect.capabilities().sessionDefaultNamespace()) {
+                    session.dialect.bindSessionNamespace(scratch, scratchNamespace);
+                }
+                try {
+                    session.dialect.executeScript(scratch, processor.substituted());
+                } catch (DesiredStateException e) {
+                    throw e;
+                } catch (SQLException e) {
+                    throw new DesiredStateException("namespace '" + namespace
+                            + "': the desired-state script failed: " + e.getMessage(), e);
+                }
+                return session.dialect.readSnapshot(scratch, scratchNamespace);
+            } finally {
+                try {
+                    session.dialect.dropScratchNamespace(scratch, scratchNamespace);
+                } catch (SQLException e) {
+                    throw new SchemaReconcilerException("namespace '" + namespace
+                            + "': could not drop scratch namespace '" + scratchNamespace + "'", e);
+                }
+            }
+        } catch (SQLException e) {
+            throw new SchemaReconcilerException(
+                    "namespace '" + namespace + "': scratch processing failed", e);
+        } finally {
+            if (separate) {
+                try {
+                    scratch.rollback();
+                } catch (SQLException ignored) {
+                    // already closed or committed inside dropScratchNamespace
+                }
+                try {
+                    if (restoreAutoCommit) {
+                        scratch.setAutoCommit(true);
+                    }
+                } catch (SQLException e) {
+                    LOG.log(System.Logger.Level.WARNING,
+                            "could not restore auto-commit on the scratch connection", e);
+                } finally {
+                    try {
+                        scratch.close();
+                    } catch (SQLException e) {
+                        throw new SchemaReconcilerException(
+                                "namespace '" + namespace + "': could not close the scratch connection", e);
+                    }
+                }
+            }
+        }
+    }
+
+    private void checkSameEngine(Connection target, Connection scratch, Dialect dialect)
+            throws SQLException {
+        final var tm = target.getMetaData();
+        final var sm = scratch.getMetaData();
+        final var sameEngine = tm.getDatabaseProductName().equals(sm.getDatabaseProductName())
+                && tm.getDatabaseMajorVersion() == sm.getDatabaseMajorVersion();
+        if (!sameEngine || !dialect.supports(sm)) {
+            throw new ConfigurationException("the scratchDataSource is not the same engine"
+                    + " and major version as the target dataSource");
+        }
+    }
+
+    private Session open() {
+        return new Session();
+    }
+
+    private void notifyPlanned(ReconcilePlan plan, List<PlannedChange> applied) {
+        try {
+            listener.planned(plan);
+        } catch (RuntimeException e) {
+            throw new ApplyException("namespace '" + namespace + "': listener aborted the run", e,
+                    List.copyOf(applied), null);
+        }
+    }
+
+    private void notifyApplying(PlannedChange change, List<PlannedChange> applied) {
+        try {
+            listener.applying(change);
+        } catch (RuntimeException e) {
+            throw new ApplyException("namespace '" + namespace + "': listener aborted the run", e,
+                    List.copyOf(applied), change);
+        }
+    }
+
+    private void notifyApplied(PlannedChange change, Duration elapsed, List<PlannedChange> applied) {
+        try {
+            listener.applied(change, elapsed);
+        } catch (RuntimeException e) {
+            throw new ApplyException("namespace '" + namespace + "': listener aborted the run", e,
+                    List.copyOf(applied), change);
+        }
+    }
+
+    private void notifyReported(PlannedChange change, List<PlannedChange> applied) {
+        try {
+            listener.reported(change);
+        } catch (RuntimeException e) {
+            throw new ApplyException("namespace '" + namespace + "': listener aborted the run", e,
+                    List.copyOf(applied), null);
+        }
+    }
+
+    /** One reconcile run's connection, dialect, lock and transaction lifecycle. */
+    private final class Session implements AutoCloseable {
+
+        private final Dialect dialect;
+        private final Connection conn;
+        private boolean restoreAutoCommit;
+        private boolean closed;
+
+        Session() {
+            try {
+                conn = dataSource.getConnection();
+            } catch (SQLException e) {
+                throw new SchemaReconcilerException(
+                        "namespace '" + namespace + "': could not obtain a connection", e);
+            }
+            try {
+                this.dialect = resolver.resolve(conn);
+                DialectResolver.quoteOf(dialect, namespace);
+                if (dialect.capabilities().transactionalDdl() && conn.getAutoCommit()) {
+                    conn.setAutoCommit(false);
+                    restoreAutoCommit = true;
+                }
+            } catch (RuntimeException | SQLException e) {
+                closeQuietly();
+                if (e instanceof SchemaReconcilerException sre) {
+                    throw sre;
+                }
+                throw new SchemaReconcilerException(
+                        "namespace '" + namespace + "': could not prepare the connection", e);
+            }
+        }
+
+        void lock() {
+            try {
+                dialect.acquireLock(conn, namespace, lockTimeout);
+            } catch (LockTimeoutException e) {
+                throw e;
+            } catch (SQLException e) {
+                throw new SchemaReconcilerException(
+                        "namespace '" + namespace + "': could not acquire the reconcile lock", e);
+            }
+        }
+
+        SchemaSnapshot readActual() {
+            try {
+                return dialect.readSnapshot(conn, namespace);
+            } catch (SQLException e) {
+                throw new SchemaReconcilerException(
+                        "namespace '" + namespace + "': could not read the catalog snapshot", e);
+            }
+        }
+
+        void bindNamespace() {
+            if (dialect.capabilities().sessionDefaultNamespace()) {
+                try {
+                    dialect.bindSessionNamespace(conn, namespace);
+                } catch (SQLException e) {
+                    throw new SchemaReconcilerException(
+                            "namespace '" + namespace + "': could not bind the session namespace", e);
+                }
+            }
+        }
+
+        void execute(String sql) throws SQLException {
+            try (Statement statement = conn.createStatement()) {
+                statement.execute(sql);
+            }
+        }
+
+        void commit() {
+            try {
+                conn.commit();
+            } catch (SQLException e) {
+                throw new SchemaReconcilerException(
+                        "namespace '" + namespace + "': commit failed", e);
+            }
+        }
+
+        @Override
+        public void close() {
+            if (closed) {
+                return;
+            }
+            closed = true;
+            try {
+                // roll back first: it clears an aborted transaction and
+                // releases transaction-scoped locks, so explicit lock
+                // release afterwards runs on a clean session
+                try {
+                    conn.rollback();
+                } catch (SQLException e) {
+                    LOG.log(System.Logger.Level.WARNING, "rollback failed", e);
+                }
+                try {
+                    dialect.releaseLock(conn, namespace);
+                } catch (SQLException | RuntimeException e) {
+                    LOG.log(System.Logger.Level.WARNING, "lock release failed", e);
+                }
+                try {
+                    if (restoreAutoCommit) {
+                        conn.setAutoCommit(true);
+                    }
+                } catch (SQLException e) {
+                    throw new SchemaReconcilerException(
+                            "namespace '" + namespace + "': could not restore auto-commit", e);
+                }
+            } finally {
+                try {
+                    conn.close();
+                } catch (SQLException e) {
+                    throw new SchemaReconcilerException(
+                            "namespace '" + namespace + "': could not close the connection", e);
+                }
+            }
+        }
+
+        private void closeQuietly() {
+            try {
+                conn.close();
+            } catch (SQLException ignored) {
+                // best effort
+            }
+        }
+    }
+}
