@@ -332,6 +332,32 @@ class PostgreSqlDependenciesTest {
     }
 
     @Test
+    @DisplayName("a FOR TABLES IN SCHEMA publication binding is detected on PostgreSQL 15+ (5.4)")
+    void schemaPublicationBindingDetected() throws Exception {
+        int major;
+        try (var conn = ds.getConnection()) {
+            major = conn.getMetaData().getDatabaseMajorVersion();
+        }
+        assumeTrue(major >= 15, "pg_publication_namespace exists on PostgreSQL 15+");
+        final var ns = namespace();
+        try {
+            PgTestDatabase.execute(ds, "CREATE PUBLICATION dep_pub_ns FOR TABLES IN SCHEMA "
+                    + dialect.quoteIdentifier(ns));
+            try (var conn = ds.getConnection()) {
+                conn.setAutoCommit(false);
+                final var snapshot = dialect.readSnapshot(conn, ns);
+                assertTrue(snapshot.objects().keySet().stream()
+                                .anyMatch(id -> id.name().equals("publication:dep_pub_ns")),
+                        "schema publication binding missing: "
+                                + snapshot.objects().keySet());
+            }
+        } finally {
+            PgTestDatabase.execute(ds, "DROP PUBLICATION IF EXISTS dep_pub_ns");
+            drop(ns);
+        }
+    }
+
+    @Test
     @DisplayName("partition-inherited constraints and cloned triggers are not standalone objects (5.4)")
     void partitionInheritedObjectsDoNotLoad() throws Exception {
         final var ns = namespace();

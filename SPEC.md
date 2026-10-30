@@ -858,8 +858,9 @@ functions (`pg_proc` `a`, `w`), non-view rules (`pg_rewrite`), statistics
 otherwise unrepresentable targets (`pg_description`), security labels
 (`pg_seclabel`), granted privileges (non-null `relacl`, `proacl`, `typacl`; compared by content: the ACL entries as sorted `grantor>grantee:PRIVILEGE[*]` tokens, with the owner written `<owner>` and `*` marking a grant option, so a target holding the same grants reports no difference), ownership changed away from the connecting role
 (`relowner`, `proowner`, `typowner`) and publication bindings
-(`pg_publication_rel` for tables, `pg_publication_sequences` for sequences
-on PostgreSQL 19+). Three catalog object kinds have no namespace of their
+(`pg_publication_rel` for tables, `pg_publication_namespace` for
+`FOR TABLES IN SCHEMA` on PostgreSQL 15+, `pg_publication_sequences` for
+sequences on PostgreSQL 19+). Three catalog object kinds have no namespace of their
 own but are detected through a namespace anchor instead: `pg_cast` rows
 whose source type, target type or cast function is in the namespace,
 `pg_transform` rows anchored by their type or SQL functions, and
@@ -1042,7 +1043,7 @@ Coverage of the PostgreSQL SQL command set by the reference dialect, measured ag
 
 ### Detected but unsupported (`OTHER` → `UNSUPPORTED` per 5.4)
 
-`EXCLUDE` constraints, `CREATE TYPE` for non-enum types (range/multirange/base/composite — composites stay `OTHER` because their `relkind` `c` rowtype collides with the relation namespace), `CREATE FOREIGN TABLE`, `IMPORT FOREIGN SCHEMA`, partitioned tables and indexes, classic-inheritance children, `CREATE AGGREGATE`, window functions, `CREATE RULE`, `CREATE STATISTICS`, `CREATE COLLATION`, `CREATE CONVERSION`, `CREATE TEXT SEARCH CONFIGURATION|DICTIONARY|PARSER|TEMPLATE`, `CREATE OPERATOR`, `CREATE OPERATOR CLASS`, `CREATE OPERATOR FAMILY`, `CREATE CAST` and `CREATE TRANSFORM` when anchored to a namespace object, `COMMENT ON` an unmanaged target, `SECURITY LABEL`, granted privileges, ownership reassignment, `FOR TABLE` publication bindings and sequence publication bindings (`pg_publication_sequences`, PostgreSQL 19+). Publication bindings are observable on the target only: the script check rejects every `PUBLICATION` statement, so a script cannot create one.
+`EXCLUDE` constraints, `CREATE TYPE` for non-enum types (range/multirange/base/composite — composites stay `OTHER` because their `relkind` `c` rowtype collides with the relation namespace), `CREATE FOREIGN TABLE`, `IMPORT FOREIGN SCHEMA`, partitioned tables and indexes, classic-inheritance children, `CREATE AGGREGATE`, window functions, `CREATE RULE`, `CREATE STATISTICS`, `CREATE COLLATION`, `CREATE CONVERSION`, `CREATE TEXT SEARCH CONFIGURATION|DICTIONARY|PARSER|TEMPLATE`, `CREATE OPERATOR`, `CREATE OPERATOR CLASS`, `CREATE OPERATOR FAMILY`, `CREATE CAST` and `CREATE TRANSFORM` when anchored to a namespace object, `COMMENT ON` an unmanaged target, `SECURITY LABEL`, granted privileges, ownership reassignment, `FOR TABLE` publication bindings, `FOR TABLES IN SCHEMA` publication bindings (`pg_publication_namespace`, PostgreSQL 15+) and sequence publication bindings (`pg_publication_sequences`, PostgreSQL 19+). Publication bindings are observable on the target only: the script check rejects every `PUBLICATION` statement, so a script cannot create one.
 
 ### Out of scope (cluster-level or statement-only, per 1.5/3.2)
 

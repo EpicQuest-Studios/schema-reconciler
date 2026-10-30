@@ -1323,6 +1323,25 @@ public final class PgCatalog {
                     }
                 }
             }
+            // FOR TABLES IN SCHEMA bindings — pg_publication_namespace anchors
+            // the publication to the schema itself (PostgreSQL 15+)
+            if (serverMajor >= 15) {
+                try (PreparedStatement ps = conn.prepareStatement("""
+                        SELECT 'publication:' || p.pubname AS name
+                        FROM pg_publication_namespace pn
+                        JOIN pg_namespace n ON n.oid = pn.pnnspid AND n.nspname = ?
+                        JOIN pg_publication p ON p.oid = pn.pnpubid
+                        ORDER BY 1
+                        """)) {
+                    ps.setString(1, ns);
+                    try (ResultSet rs = ps.executeQuery()) {
+                        while (rs.next()) {
+                            define(new ObjectId(ObjectKind.OTHER, rs.getString("name")),
+                                    "publication", Map.of());
+                        }
+                    }
+                }
+            }
             // casts have no namespace; they are visible through a namespace
             // source/target type or cast function (a cast between two foreign
             // types has no namespace anchor and stays outside the model)
