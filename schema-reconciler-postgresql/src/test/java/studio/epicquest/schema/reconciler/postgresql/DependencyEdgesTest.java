@@ -82,6 +82,16 @@ class DependencyEdgesTest {
                 + "CREATE TABLE pt (k int) PARTITION BY RANGE (k); "
                 + "CREATE TABLE pc PARTITION OF pt FOR VALUES FROM (0) TO (10)",
                 id(ObjectKind.OTHER, "inherited:pc"), id(ObjectKind.OTHER, "partition:pt")),
+        new Edge("comment -> table", TYPES + "COMMENT ON TABLE t IS 'x'",
+                id(ObjectKind.COMMENT, "t"), id(ObjectKind.TABLE, "t")),
+        new Edge("comment -> column", TYPES + "COMMENT ON COLUMN t.note IS 'x'",
+                id(ObjectKind.COMMENT, "note", "t"), id(ObjectKind.COLUMN, "note", "t")),
+        new Edge("policy -> table", TYPES
+                + "ALTER TABLE t ENABLE ROW LEVEL SECURITY; "
+                + "CREATE POLICY p_sel ON t FOR SELECT USING (id > 0)",
+                id(ObjectKind.POLICY, "p_sel", "t"), id(ObjectKind.TABLE, "t")),
+        new Edge("domain -> base type", TYPES + "CREATE DOMAIN dm AS mood",
+                id(ObjectKind.DOMAIN, "dm"), id(ObjectKind.TYPE, "mood")),
     };
 
     @Test

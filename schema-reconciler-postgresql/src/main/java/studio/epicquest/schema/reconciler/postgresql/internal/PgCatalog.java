@@ -12,6 +12,7 @@ import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import studio.epicquest.schema.reconciler.model.Definition;
@@ -42,6 +43,8 @@ public final class PgCatalog {
     public static final String NOTNULL = "notnull";
     public static final String DEFAULT = "default";
     public static final String SIG_ARGS = "sigargs";
+    /** {@code f} for a function, {@code p} for a procedure (pg_proc.prokind). */
+    public static final String PROKIND = "prokind";
     public static final String RETURN_TYPE = "returnType";
     /** Table storage options ({@code fillfactor=70, ...}) for {@code CREATE TABLE ... WITH}. */
     public static final String TABLE_OPTIONS = "tableOptions";
@@ -70,6 +73,7 @@ public final class PgCatalog {
         data.loadDomains(conn);
         data.loadPolicies(conn);
         data.loadOther(conn);
+        data.loadComments(conn);
         data.loadDependencies(conn);
         data.loadExternalDependents(conn);
         return data.snapshot();
@@ -89,6 +93,7 @@ public final class PgCatalog {
         private final Map<Long, ObjectId> conByIndexOid = new HashMap<>();
         private final Map<Long, ObjectId> typeByOid = new HashMap<>();
         private final Map<Long, ObjectId> polByOid = new HashMap<>();
+        private final Map<Long, ObjectId> tgByOid = new HashMap<>();
         private final Map<Long, ObjectId> collByOid = new HashMap<>();
         private final Map<Long, ObjectId> langByOid = new HashMap<>();
         private final Map<ObjectId, Set<ObjectId>> deps = new HashMap<>();
@@ -660,6 +665,7 @@ public final class PgCatalog {
                                 CREATE_SQL, def,
                                 DROP_SQL, "DROP " + dropWord + " " + qName + "(" + sigargs + ")",
                                 SIG_ARGS, sigargs,
+                                PROKIND, prokind,
                                 RETURN_TYPE, rettype));
                     }
                 }
@@ -687,6 +693,7 @@ public final class PgCatalog {
                         final var enabled = rs.getString("tgenabled");
                         final var def = rs.getString("def");
                         final var id = new ObjectId(ObjectKind.TRIGGER, name, parent);
+                        tgByOid.put(rs.getLong("oid"), id);
                         final var qParent = tableRef(parent);
                         final var qName = PgIdentifiers.quote(name);
                         final var attrs = new LinkedHashMap<String, String>();
@@ -1162,33 +1169,7 @@ public final class PgCatalog {
                     }
                 }
             }
-            // comments on namespace objects (pg_description). pg_extension is
-            // not in NS_OBJECTS: an extension's shipped description is
-            // database-wide metadata (COMMENT ON EXTENSION is rejected), and
-            // an anchored OTHER here would poison desired state for the
-            // managed EXTENSION object — the extension row itself reports.
-            try (PreparedStatement ps = conn.prepareStatement("""
-                    SELECT 'comment:' || o.name
-                            || CASE WHEN a.attname IS NULL THEN '' ELSE '.' || a.attname END AS name,
-                            d.objoid
-                    FROM pg_description d
-                    JOIN (""" + NS_OBJECTS + """
-                    ) o ON o.cls = d.classoid AND o.obj = d.objoid
-                    LEFT JOIN pg_attribute a ON d.classoid = 'pg_class'::regclass
-                            AND a.attrelid = d.objoid AND a.attnum = d.objsubid
-                    ORDER BY 1
-                    """)) {
-                bindNamespace(ps, 17);
-                try (ResultSet rs = ps.executeQuery()) {
-                    while (rs.next()) {
-                        if (extMember(rs.getLong("objoid"))) {
-                            continue;
-                        }
-                        define(new ObjectId(ObjectKind.OTHER, rs.getString("name")),
-                                "comment", Map.of());
-                    }
-                }
-            }
+
             // security labels on namespace objects (pg_seclabel)
             try (PreparedStatement ps = conn.prepareStatement("""
                     SELECT 'seclabel:' || o.name
@@ -1392,6 +1373,142 @@ public final class PgCatalog {
                     }
                 }
             }
+        }
+
+        /**
+         * Descriptions on namespace objects (pg_description). A description on
+         * a managed object becomes a managed {@link ObjectKind#COMMENT} object
+         * whose {@link ObjectId} mirrors the target (its name, and its parent
+         * for child objects); a description on anything else stays the OTHER
+         * {@code comment:<name>} object, undeclarable and reported on every
+         * run. pg_extension is not in NS_OBJECTS — an extension's shipped
+         * description is database-wide metadata (COMMENT ON EXTENSION is
+         * rejected), and an anchored object here would poison desired state
+         * for the managed EXTENSION object; the extension row itself reports.
+         * Comments sharing the mirrored id (a column and a policy with the
+         * same name on one table, say) merge into one COMMENT object, as on
+         * both sides of the diff, so they still converge — documented in A.5.
+         */
+        void loadComments(Connection conn) throws SQLException {
+            try (PreparedStatement ps = conn.prepareStatement("""
+                    SELECT o.cls::text AS cls, d.objoid, d.objsubid,
+                           o.name AS target, a.attname, d.description
+                    FROM pg_description d
+                    JOIN (""" + NS_OBJECTS + """
+                    ) o ON o.cls = d.classoid AND o.obj = d.objoid
+                    LEFT JOIN pg_attribute a ON d.classoid = 'pg_class'::regclass
+                            AND a.attrelid = d.objoid AND a.attnum = d.objsubid
+                    ORDER BY 1, 2, 3
+                    """)) {
+                bindNamespace(ps, 17);
+                try (ResultSet rs = ps.executeQuery()) {
+                    while (rs.next()) {
+                        if (extMember(rs.getLong("objoid"))) {
+                            continue;
+                        }
+                        final var attname = rs.getString("attname");
+                        final var target = commentTarget(rs.getString("cls"),
+                                rs.getLong("objoid"), rs.getInt("objsubid"), attname);
+                        if (target != null && target.kind() != ObjectKind.OTHER
+                                && objects.containsKey(target)) {
+                            var cid = commentId(target, "");
+                            if (objects.containsKey(cid)) {
+                                // two targets share the mirrored id (a column
+                                // and a same-named policy, say): the later one
+                                // gains a (kind) suffix so both surface (A.5)
+                                cid = commentId(target, " (" + target.kind().name()
+                                        .toLowerCase(Locale.ROOT) + ")");
+                            }
+                            final var text = rs.getString("description");
+                            define(cid, text,
+                                    Map.of(CREATE_SQL, commentSql(target, text)));
+                            dep(cid, target);
+                        } else {
+                            define(new ObjectId(ObjectKind.OTHER, "comment:"
+                                    + rs.getString("target")
+                                    + (attname == null ? "" : "." + attname)),
+                                    "comment", Map.of());
+                        }
+                    }
+                }
+            }
+        }
+
+        /** The mirrored COMMENT id for a managed target, with the optional
+         *  name suffix used to break collisions. */
+        private static ObjectId commentId(ObjectId target, String suffix) {
+            final var name = target.name() + suffix;
+            return target.parent().isPresent()
+                    ? new ObjectId(ObjectKind.COMMENT, name, target.parent().get())
+                    : new ObjectId(ObjectKind.COMMENT, name);
+        }
+
+        /** The managed object a description row annotates, or null when the
+         *  annotated catalog entry maps to no managed object. */
+        private ObjectId commentTarget(String cls, long objoid, int objsubid,
+                                       String attname) {
+            switch (cls) {
+                case "pg_class":
+                    if (objsubid == 0) {
+                        return relByOid.get(objoid);
+                    }
+                    final var rel = relByOid.get(objoid);
+                    return rel != null && rel.kind() == ObjectKind.TABLE
+                            ? new ObjectId(ObjectKind.COLUMN, attname, rel.name())
+                            : null;
+                case "pg_proc":
+                    return procByOid.get(objoid);
+                case "pg_constraint":
+                    return conByOid.get(objoid);
+                case "pg_policy":
+                    return polByOid.get(objoid);
+                case "pg_type":
+                    return typeByOid.get(objoid);
+                case "pg_trigger":
+                    return tgByOid.get(objoid);
+                default:
+                    return null;
+            }
+        }
+
+        /** The {@code COMMENT ON <target> IS 'text'} statement for a managed target. */
+        private String commentSql(ObjectId target, String text) {
+            final var n = "${namespace}";
+            final var name = PgIdentifiers.quote(target.name());
+            final var parent = target.parent().orElse(null);
+            final var qParent = parent == null
+                    ? null : n + "." + PgIdentifiers.quote(parent);
+            final var prefix = switch (target.kind()) {
+                case TABLE -> "COMMENT ON TABLE " + n + "." + name;
+                case VIEW -> "COMMENT ON VIEW " + n + "." + name;
+                case MATERIALIZED_VIEW -> "COMMENT ON MATERIALIZED VIEW " + n + "." + name;
+                case SEQUENCE -> "COMMENT ON SEQUENCE " + n + "." + name;
+                case INDEX -> "COMMENT ON INDEX " + n + "." + name;
+                case COLUMN -> "COMMENT ON COLUMN " + qParent + "." + name;
+                case PRIMARY_KEY, UNIQUE, FOREIGN_KEY, CHECK ->
+                        "COMMENT ON CONSTRAINT " + name + " ON " + qParent;
+                case TRIGGER -> "COMMENT ON TRIGGER " + name + " ON " + qParent;
+                case POLICY -> "COMMENT ON POLICY " + name + " ON " + qParent;
+                case TYPE -> "COMMENT ON TYPE " + n + "." + name;
+                case DOMAIN -> "COMMENT ON DOMAIN " + n + "." + name;
+                case ROUTINE -> routineCommentSql(target);
+                default -> throw new IllegalStateException(
+                        "no COMMENT ON form for " + target.kind());
+            };
+            return prefix + " IS " + sqlLiteral(text);
+        }
+
+        /** {@code COMMENT ON FUNCTION|PROCEDURE <name>(<sigargs>)}. */
+        private String routineCommentSql(ObjectId target) {
+            final var o = objects.get(target);
+            final var kind = o.attrs.getOrDefault(PROKIND, "f").equals("p")
+                    ? "PROCEDURE" : "FUNCTION";
+            final var paren = target.name().indexOf('(');
+            final var fname = paren > 0 ? target.name().substring(0, paren)
+                    : target.name();
+            final var sigargs = o.attrs.getOrDefault(SIG_ARGS, "");
+            return "COMMENT ON " + kind + " ${namespace}."
+                    + PgIdentifiers.quote(fname) + "(" + sigargs + ")";
         }
 
         void loadDependencies(Connection conn) throws SQLException {

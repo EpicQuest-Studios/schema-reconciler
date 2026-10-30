@@ -95,9 +95,7 @@ class ProfileRulesTest {
             }
         }
         assertEquals(48, spec.size());
-        // widened-object scenarios land per managed kind — strict equality
-        // returns once C-37..C-48 are all implemented
-        assertTrue(spec.containsAll(tck), "TCK scenario without a SPEC.md row: " + tck);
+        assertEquals(spec, tck, "TCK scenarios and SPEC.md rows must match 1:1");
     }
 
     @Test

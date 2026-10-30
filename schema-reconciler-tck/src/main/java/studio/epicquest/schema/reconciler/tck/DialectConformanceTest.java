@@ -1133,4 +1133,94 @@ public abstract class DialectConformanceTest {
         assertEquals(ReconcileOutcome.UP_TO_DATE,
                 reconciler(ddl).reconcile().outcome());
     }
+
+    @Test
+    @DisplayName("C-46 comment missing/drifted: ALTER REBUILD")
+    void c46CommentMissingAndDrifted() throws Exception {
+        assumeKind(ObjectKind.COMMENT);
+        final var script = """
+                CREATE TABLE t (id bigint);
+                COMMENT ON TABLE t IS 'kept table'
+                """;
+        final var report = reconciler(script).reconcile();
+        assertEquals(ReconcileOutcome.RECONCILED, report.outcome());
+        assertTrue(report.applied().stream().anyMatch(c ->
+                        c.target().kind() == ObjectKind.COMMENT
+                                && c.action() == ChangeAction.ALTER
+                                && c.safety() == ChangeSafety.REBUILD),
+                "expected an ALTER/REBUILD comment change: " + report.applied());
+        assertEquals(ReconcileOutcome.UP_TO_DATE,
+                reconciler(script).reconcile().outcome());
+        // a changed comment rewrites in place
+        final var drifted = reconciler("""
+                CREATE TABLE t (id bigint);
+                COMMENT ON TABLE t IS 'renamed table'
+                """).reconcile();
+        assertEquals(ReconcileOutcome.RECONCILED, drifted.outcome());
+        assertTrue(drifted.applied().stream().anyMatch(c ->
+                        c.target().kind() == ObjectKind.COMMENT
+                                && c.safety() == ChangeSafety.REBUILD),
+                "expected a REBUILD comment change: " + drifted.applied());
+        assertEquals(ReconcileOutcome.UP_TO_DATE, reconciler("""
+                CREATE TABLE t (id bigint);
+                COMMENT ON TABLE t IS 'renamed table'
+                """).reconcile().outcome());
+    }
+
+    @Test
+    @DisplayName("C-47 unexpected comment is reported, never dropped")
+    void c47UnexpectedComment() throws Exception {
+        assumeKind(ObjectKind.COMMENT);
+        execute("CREATE TABLE " + qualified("t") + " (id bigint)");
+        execute("COMMENT ON TABLE " + qualified("t") + " IS 'ambient'");
+        final var report = reconciler("CREATE TABLE t (id bigint)").reconcile();
+        assertEquals(ReconcileOutcome.UP_TO_DATE, report.outcome());
+        assertTrue(report.unexpected().stream().anyMatch(d ->
+                        d.id().kind() == ObjectKind.COMMENT),
+                "expected the ambient comment reported: " + report.unexpected());
+        // and it is still there afterwards
+        try (var c = dataSource().getConnection();
+                final var s = c.createStatement();
+                final var rs = s.executeQuery(
+                        "SELECT obj_description('" + qualified("t") + "'::regclass)")) {
+            rs.next();
+            assertEquals("ambient", rs.getString(1),
+                    "the unexpected comment must survive reconcile");
+        }
+    }
+
+    @Test
+    @DisplayName("C-48 interlocked new kinds reconcile in dependency order")
+    void c48InterlockedNewKinds() throws Exception {
+        assumeKind(ObjectKind.DOMAIN);
+        assumeKind(ObjectKind.MATERIALIZED_VIEW);
+        assumeKind(ObjectKind.POLICY);
+        assumeKind(ObjectKind.COMMENT);
+        final var script = """
+                CREATE DOMAIN posint AS integer CHECK (VALUE > 0);
+                CREATE TABLE t (id posint, note text);
+                ALTER TABLE t ENABLE ROW LEVEL SECURITY;
+                CREATE POLICY p_sel ON t FOR SELECT USING (id > 0);
+                COMMENT ON TABLE t IS 'governed table';
+                CREATE MATERIALIZED VIEW mv AS SELECT id, note FROM t;
+                CREATE INDEX mv_note ON mv (note)
+                """;
+        final var report = reconciler(script).reconcile();
+        assertEquals(ReconcileOutcome.RECONCILED, report.outcome());
+        final var order = report.applied().stream()
+                .map(c -> c.target().kind()).toList();
+        final var domainAt = order.indexOf(ObjectKind.DOMAIN);
+        final var tableAt = order.indexOf(ObjectKind.TABLE);
+        final var policyAt = order.indexOf(ObjectKind.POLICY);
+        final var matviewAt = order.indexOf(ObjectKind.MATERIALIZED_VIEW);
+        final var indexAt = order.indexOf(ObjectKind.INDEX);
+        final var commentAt = order.indexOf(ObjectKind.COMMENT);
+        assertTrue(domainAt >= 0 && tableAt > domainAt,
+                "domain must precede the table that uses it: " + order);
+        assertTrue(policyAt > tableAt && matviewAt > tableAt
+                && indexAt > matviewAt && commentAt > tableAt,
+                "dependents must follow their prerequisite: " + order);
+        assertEquals(ReconcileOutcome.UP_TO_DATE,
+                reconciler(script).reconcile().outcome());
+    }
 }

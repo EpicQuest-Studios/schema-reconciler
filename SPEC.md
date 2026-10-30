@@ -1022,7 +1022,7 @@ Coverage of the PostgreSQL SQL command set by the reference dialect, measured ag
 | `CREATE DOMAIN` / `ALTER DOMAIN` | `DOMAIN` objects incl. base type, `NOT NULL`, `DEFAULT`, `CHECK` constraints |
 | `CREATE POLICY` / `ALTER POLICY` / `DROP POLICY`, `ALTER TABLE ... ENABLE|DISABLE ROW LEVEL SECURITY` | `POLICY` objects; `relrowsecurity` is part of the `TABLE` canonical definition |
 | `CREATE EXTENSION` | `EXTENSION` objects, presence-only; member objects stay excluded; `ALTER EXTENSION` is rejected (version upgrades out of scope) |
-| `COMMENT ON` | `COMMENT` objects on managed targets (`TABLE`, `COLUMN`, `VIEW`, `MATERIALIZED_VIEW`, `SEQUENCE`, `INDEX`, constraint kinds, `ROUTINE`, `TRIGGER`, `TYPE`, `DOMAIN`, `POLICY`, `EXTENSION`); on any other target it is detected as `OTHER` — see below |
+| `COMMENT ON` | `COMMENT` objects on managed targets (`TABLE`, `COLUMN`, `VIEW`, `MATERIALIZED_VIEW`, `SEQUENCE`, `INDEX`, constraint kinds, `ROUTINE`, `TRIGGER`, `TYPE`, `DOMAIN`, `POLICY`); on any other target it is detected as `OTHER` — see below. `COMMENT ON EXTENSION` stays rejected: an extension's shipped description is database-wide metadata anchored to the extension row, which already reports |
 | `CREATE SEQUENCE` / `ALTER SEQUENCE` | `SEQUENCE` objects; serial-owned and identity sequences folded per A.5 |
 | `CREATE FUNCTION` / `CREATE PROCEDURE` | `ROUTINE` objects (`prokind` `f`, `p`) |
 | `CREATE TRIGGER` | `TRIGGER` objects incl. `tgenabled` state; constraint triggers are excluded by `tgisinternal` |

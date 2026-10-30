@@ -45,6 +45,12 @@ class CanonicalDefinitionTest {
                 s.execute("CREATE TRIGGER tr BEFORE INSERT ON t FOR EACH ROW EXECUTE FUNCTION trg()");
                 s.execute("CREATE TYPE mood AS ENUM ('b', 'a')");
                 s.execute("CREATE MATERIALIZED VIEW mv AS SELECT id FROM t");
+                s.execute("CREATE DOMAIN loctext AS text COLLATE \"C\""
+                        + " NOT NULL DEFAULT 'x' CHECK (VALUE <> '')");
+                s.execute("ALTER TABLE t ENABLE ROW LEVEL SECURITY");
+                s.execute("CREATE POLICY p_sel ON t AS RESTRICTIVE FOR SELECT"
+                        + " TO PUBLIC USING (id > 0)");
+                s.execute("COMMENT ON TABLE t IS 'kept'");
 
                 final var snapshot = dialect.readSnapshot(c, schema);
                 final var ns = schema;
@@ -60,6 +66,31 @@ class CanonicalDefinitionTest {
 
                 final var mood = snapshot.objects().get(new ObjectId(ObjectKind.TYPE, "mood"));
                 assertEquals("typtype=e;labels='b','a'", mood.definition().canonical());
+
+                final var loctext = snapshot.objects().get(
+                        new ObjectId(ObjectKind.DOMAIN, "loctext"));
+                assertEquals("basetype=text;notnull=true;collation=\"C\";default="
+                        + query(s, "SELECT pg_get_expr(typdefaultbin, 0)"
+                                + " FROM pg_type WHERE typname = 'loctext'")
+                        + ";check.loctext_check=" + query(s,
+                        "SELECT pg_get_constraintdef(oid) FROM pg_constraint"
+                                + " WHERE contypid = 'loctext'::regtype AND contype = 'c'"),
+                        loctext.definition().canonical());
+
+                final var policy = snapshot.objects().get(
+                        new ObjectId(ObjectKind.POLICY, "p_sel", "t"));
+                assertEquals("cmd=r;permissive=false;roles=PUBLIC;using="
+                        + query(s, "SELECT pg_get_expr(polqual, polrelid)"
+                                + " FROM pg_policy WHERE polname = 'p_sel'"),
+                        policy.definition().canonical());
+
+                final var table = snapshot.objects().get(new ObjectId(ObjectKind.TABLE, "t"));
+                assertTrue(table.definition().canonical().contains(";rls=true"),
+                        table.definition().canonical());
+
+                final var comment = snapshot.objects().get(
+                        new ObjectId(ObjectKind.COMMENT, "t"));
+                assertEquals("kept", comment.definition().canonical());
 
                 final var index = snapshot.objects().get(new ObjectId(ObjectKind.INDEX, "t_name", "t"));
                 assertEquals(PgSql.normalize(query(s,

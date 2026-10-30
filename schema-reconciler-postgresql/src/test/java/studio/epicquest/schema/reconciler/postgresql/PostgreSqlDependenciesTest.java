@@ -253,7 +253,7 @@ class PostgreSqlDependenciesTest {
                     CREATE CAST (${namespace}.mood AS text)
                         WITH FUNCTION ${namespace}.mood_text(${namespace}.mood);
                     CREATE STATISTICS ${namespace}.st ON a, b FROM ${namespace}.t;
-                    COMMENT ON TABLE ${namespace}.t IS 'noted';
+                    COMMENT ON TABLE ${namespace}.i IS 'noted';
                     CREATE RULE r1 AS ON INSERT TO ${namespace}.t DO INSTEAD NOTHING;
                     ALTER TABLE ${namespace}.t ADD CONSTRAINT ex
                         EXCLUDE USING gist (ts WITH &&);
@@ -265,7 +265,7 @@ class PostgreSqlDependenciesTest {
             for (final var expected : new String[]{
                     "i",                     // inherited table
                     "type:span", "cast:",    // enums are managed TYPE; ranges stay OTHER
-                    "statistics:t.st", "comment:t", "rule:t.r1",
+                    "statistics:t.st", "comment:i", "rule:t.r1",
                     "constraint:t.ex", "ownership:t", "privileges:i"}) {
                 assertTrue(names.stream().anyMatch(n -> n.contains(expected)),
                         expected + " missing from " + names);
