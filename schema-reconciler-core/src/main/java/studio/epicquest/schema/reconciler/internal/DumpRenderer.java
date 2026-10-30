@@ -31,7 +31,7 @@ final class DumpRenderer {
                 .append("-- dialect: ").append(dialect.id()).append('\n')
                 .append("-- namespace: ").append(dialect.quoteIdentifier(namespace)).append('\n')
                 .append("-- fingerprint: ").append(snapshot.fingerprint()).append('\n');
-        for (final var object : order(snapshot)) {
+        for (final var object : order(dialect, snapshot)) {
             final var statements = dialect.dumpStatements(object);
             if (statements.isEmpty()) {
                 out.append("-- ").append(folded(object, snapshot) ? "folded" : "unsupported")
@@ -52,9 +52,9 @@ final class DumpRenderer {
      * a dependency cycle emits its members in plain ORDER after the
      * acyclic prefix.
      */
-    private static List<SchemaObject> order(SchemaSnapshot snapshot) {
+    private static List<SchemaObject> order(Dialect dialect, SchemaSnapshot snapshot) {
         final var objects = snapshot.objects();
-        final var prereqs = Dependencies.prerequisitesOf(snapshot);
+        final var prereqs = Dependencies.prerequisitesOf(dialect, snapshot);
         final var pending = new HashMap<ObjectId, Set<ObjectId>>();
         prereqs.forEach((id, reqs) -> {
             final var present = new HashSet<>(reqs);

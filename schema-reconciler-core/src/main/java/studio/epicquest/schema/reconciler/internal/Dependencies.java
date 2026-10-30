@@ -11,6 +11,7 @@ import studio.epicquest.schema.reconciler.model.ObjectIds;
 import studio.epicquest.schema.reconciler.model.ObjectKind;
 import studio.epicquest.schema.reconciler.model.SchemaObject;
 import studio.epicquest.schema.reconciler.model.SchemaSnapshot;
+import studio.epicquest.schema.reconciler.spi.Dialect;
 
 /**
  * Dependency-graph helpers. A prerequisite edge is a {@code dependsOn} entry
@@ -27,8 +28,9 @@ final class Dependencies {
     }
 
     /** object -> the objects it requires (dependsOn plus parent, minus itself). */
-    static Map<ObjectId, Set<ObjectId>> prerequisitesOf(SchemaSnapshot snapshot) {
-        final var parentables = parentables(snapshot.objects());
+    static Map<ObjectId, Set<ObjectId>> prerequisitesOf(Dialect dialect,
+                                                        SchemaSnapshot snapshot) {
+        final var parentables = parentables(dialect, snapshot.objects());
         final var out = new HashMap<ObjectId, Set<ObjectId>>();
         for (final var object : snapshot.objects().values()) {
             final var prereqs = new LinkedHashSet<ObjectId>(object.dependsOn());
@@ -61,10 +63,14 @@ final class Dependencies {
         return seen;
     }
 
-    private static Map<String, ObjectId> parentables(Map<ObjectId, SchemaObject> objects) {
+    private static Map<String, ObjectId> parentables(Dialect dialect,
+            Map<ObjectId, SchemaObject> objects) {
         // same-catalog names are unique, so two managed objects never collide
         // on a resolvable name — but an OTHER's cross-catalog name can, and
-        // the managed object must win
+        // the managed object must win. Only an OTHER whose stripped name is a
+        // relation name in the dialect's own scopes can be a parent: a
+        // constraint's stripped name is the synthetic "<parent>.<name>" and
+        // its relation scope is the backing index's name, never a parent.
         final var map = new HashMap<String, ObjectId>();
         objects.values().stream()
                 .sorted((a, b) -> ObjectIds.ORDER.compare(a.id(), b.id()))
@@ -72,7 +78,10 @@ final class Dependencies {
                         && o.id().kind() != ObjectKind.OTHER)
                 .forEach(o -> map.putIfAbsent(resolvableName(o.id()), o.id()));
         objects.values().stream()
-                .filter(o -> o.id().kind() == ObjectKind.OTHER)
+                .sorted((a, b) -> ObjectIds.ORDER.compare(a.id(), b.id()))
+                .filter(o -> o.id().kind() == ObjectKind.OTHER
+                        && dialect.nameScopes(o.id())
+                                .contains("relation:" + resolvableName(o.id())))
                 .forEach(o -> map.putIfAbsent(resolvableName(o.id()), o.id()));
         return map;
     }

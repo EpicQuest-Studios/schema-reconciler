@@ -188,10 +188,34 @@ public final class FakeDialect implements Dialect {
         return children;
     }
 
+    /** OTHER categories whose stripped names occupy the relation namespace (mirrors PgRender). */
+    private static final Set<String> RELATION_NAMESPACE_OTHERS = Set.of(
+            "inherited", "foreign", "partition", "partindex",
+            "composite", "toast", "relation", "type");
+
     @Override
     public Set<String> nameScopes(ObjectId id) {
         return switch (id.kind()) {
-            case TABLE, VIEW, SEQUENCE, INDEX, OTHER, MATERIALIZED_VIEW, TYPE, DOMAIN ->
+            case OTHER -> {
+                final var name = id.name();
+                final var colon = name.indexOf(':');
+                if (colon > 0) {
+                    final var category = name.substring(0, colon);
+                    final var stripped = name.substring(colon + 1);
+                    if (RELATION_NAMESPACE_OTHERS.contains(category)) {
+                        yield Set.of("relation:" + stripped);
+                    }
+                    if (category.equals("constraint")) {
+                        yield Set.of("constraint:" + stripped,
+                                "relation:" + stripped.substring(stripped.lastIndexOf('.') + 1));
+                    }
+                    if (category.equals("routine")) {
+                        yield Set.of("routine:" + stripped);
+                    }
+                }
+                yield Set.of("relation:" + name);
+            }
+            case TABLE, VIEW, SEQUENCE, INDEX, MATERIALIZED_VIEW, TYPE, DOMAIN ->
                     Set.of("relation:" + id.name());
             case PRIMARY_KEY, UNIQUE -> Set.of(
                     "constraint:" + id.parent().orElse("") + "." + id.name(),

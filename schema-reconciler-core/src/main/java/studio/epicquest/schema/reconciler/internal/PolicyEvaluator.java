@@ -17,6 +17,7 @@ import studio.epicquest.schema.reconciler.model.ObjectId;
 import studio.epicquest.schema.reconciler.model.PlannedChange;
 import studio.epicquest.schema.reconciler.model.ReconcilePlan;
 import studio.epicquest.schema.reconciler.model.SchemaSnapshot;
+import studio.epicquest.schema.reconciler.spi.Dialect;
 
 /**
  * Policy evaluation of spec 3.3, in the spec's exact order: fail check,
@@ -30,8 +31,10 @@ final class PolicyEvaluator {
             Map<PlannedChange, ObjectId> demotedBy) { }
 
     private final ReconcilePolicy policy;
+    private final Dialect dialect;
 
-    PolicyEvaluator(ReconcilePolicy policy) {
+    PolicyEvaluator(Dialect dialect, ReconcilePolicy policy) {
+        this.dialect = dialect;
         this.policy = policy;
     }
 
@@ -74,7 +77,7 @@ final class PolicyEvaluator {
                 .forEach(blocked::add);
 
         final var demotedBy = new LinkedHashMap<PlannedChange, ObjectId>();
-        final var desiredDeps = Dependencies.prerequisitesOf(desired);
+        final var desiredDeps = Dependencies.prerequisitesOf(dialect, desired);
         var changed = true;
         while (changed) {
             changed = false;

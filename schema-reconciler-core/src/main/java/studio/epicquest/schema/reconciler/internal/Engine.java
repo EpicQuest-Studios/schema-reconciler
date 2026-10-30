@@ -210,7 +210,8 @@ public final class Engine {
             }
             notifyPlanned(built.plan(), List.of());
             PolicyEvaluator.Evaluation evaluation =
-                    new PolicyEvaluator(policy).evaluate(built.plan(), actual, desired);
+                    new PolicyEvaluator(session.dialect, policy)
+                            .evaluate(built.plan(), actual, desired);
             final var outcome = applyAndVerify(session, built.plan(), evaluation, desired,
                     built.coveredByParent(), clock);
             session.commit();
@@ -264,7 +265,8 @@ public final class Engine {
             }
             notifyPlanned(plan, List.of());
             PolicyEvaluator.Evaluation evaluation =
-                    new PolicyEvaluator(policy).evaluate(plan, actual, desired);
+                    new PolicyEvaluator(session.dialect, policy)
+                            .evaluate(plan, actual, desired);
             Map<ObjectId, Map<ObjectId, Definition>> covered =
                     Optional.ofNullable(metaOf(plan))
                             .map(PlanMeta::coveredByParent)

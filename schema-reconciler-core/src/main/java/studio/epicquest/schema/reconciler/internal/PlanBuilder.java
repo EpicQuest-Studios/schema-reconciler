@@ -161,7 +161,7 @@ final class PlanBuilder {
      * and actual snapshots, or UNEXPECTED ones, fail planning.
      */
     private void addDependentRebuilds(List<PlannedChange> changes) {
-        final var actualDeps = Dependencies.prerequisitesOf(actual);
+        final var actualDeps = Dependencies.prerequisitesOf(dialect, actual);
         final var dependents = Dependencies.reverse(actualDeps);
 
         final var targets = changes.stream().map(PlannedChange::target)
@@ -274,9 +274,9 @@ final class PlanBuilder {
      * desired snapshot.
      */
     private List<PlannedChange> orderChanges(List<PlannedChange> changes) {
-        final var desiredDeps = Dependencies.prerequisitesOf(desired);
+        final var desiredDeps = Dependencies.prerequisitesOf(dialect, desired);
         Map<ObjectId, Set<ObjectId>> actualDependents =
-                Dependencies.reverse(Dependencies.prerequisitesOf(actual));
+                Dependencies.reverse(Dependencies.prerequisitesOf(dialect, actual));
 
         final var drops = changes.stream()
                 .filter(c -> c.action() == ChangeAction.DROP).toList();
