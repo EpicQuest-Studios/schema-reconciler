@@ -166,6 +166,25 @@ class ScriptCheckSpecListsTest {
     }
 
     @Test
+    void aLiteralThatIsTheScratchNameIsRejected() {
+        // ${namespace} substituted inside a literal produces '"scr"' — the
+        // baked name differs on every run and could never converge
+        for (final var sql : new String[] {
+                "CREATE TABLE t (c text DEFAULT '\"scr\"')",
+                "CREATE TABLE t (c text DEFAULT 'scr')",
+                "COMMENT ON TABLE t IS 'scr'",
+                "SELECT $tag$\"scr\"$tag$"}) {
+            assertThrows(DesiredStateException.class,
+                    () -> PgScriptCheck.check(sql, SCRATCH), sql);
+        }
+        // the scratch name as a qualifier, embedded in data, or inside a
+        // DO body (transient — it cannot reach a canonical) stays legal
+        PgScriptCheck.check("SELECT nextval('scr.seq')", SCRATCH);
+        PgScriptCheck.check("CREATE TABLE t (c text DEFAULT 'a''scr''b')", SCRATCH);
+        PgScriptCheck.check("DO 'BEGIN PERFORM ''scr''; END'", SCRATCH);
+    }
+
+    @Test
     void everyStatementTheSpecCallsLegalPasses() {
         for (final var sql : new String[] {
                 "CREATE FOREIGN TABLE ft (a int) SERVER srv",

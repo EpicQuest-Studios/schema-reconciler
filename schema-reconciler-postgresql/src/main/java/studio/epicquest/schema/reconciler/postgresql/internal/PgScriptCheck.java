@@ -232,6 +232,7 @@ public final class PgScriptCheck {
                     checkSequenceCalls(statement, collapseEscapes(statement.text()),
                             scratchNamespace);
                 }
+                checkScratchLiteral(statement, scratchNamespace);
             }
             if (SESSION_STATE.contains(first)) {
                 throw rejected(statement,
@@ -522,6 +523,26 @@ public final class PgScriptCheck {
                     throw rejected(statement, "'" + qualifier + "…' names a sequence in another"
                             + " namespace; sequence values do not roll back (3.2 rule 1)");
                 }
+            }
+        }
+    }
+
+    /**
+     * A string literal that IS the scratch name — {@code '"rcl_x"'} or
+     * {@code 'rcl_x'} — is the residue of a bare {@code ${namespace}} token
+     * placed inside a literal (3.2 substitutes the token textually). The
+     * baked name differs on every run, so the object could never converge;
+     * reject like rule 5. A literal that carries the scratch name as a
+     * qualifier ({@code 'rcl_x.seq'}) stays legal.
+     */
+    private static void checkScratchLiteral(PgSql.StatementTokens statement,
+                                            String scratchNamespace) {
+        final var quotedScratch = PgIdentifiers.quote(scratchNamespace);
+        for (final var body : PgSql.literalBodies(statement.text())) {
+            if (body.equals(scratchNamespace) || body.equals(quotedScratch)) {
+                throw rejected(statement, "'" + body
+                        + "' is the scratch namespace substituted into a literal;"
+                        + " a bare ${namespace} inside a literal bakes an unstable name");
             }
         }
     }
