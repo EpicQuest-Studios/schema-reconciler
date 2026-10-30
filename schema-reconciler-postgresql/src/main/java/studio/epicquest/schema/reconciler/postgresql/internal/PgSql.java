@@ -43,6 +43,28 @@ public final class PgSql {
                 .replaceAll(Matcher.quoteReplacement("${namespace}."));
     }
 
+    /**
+     * Splits on {@code separator} occurrences outside string literals,
+     * quoted identifiers, dollar-quoted bodies and comments — canonical
+     * {@code key=value} fields can carry quoted punctuation inside
+     * expression, label and identifier values.
+     */
+    static List<String> splitOutsideLiterals(String text, char separator) {
+        final var parts = new ArrayList<String>();
+        var start = 0;
+        for (var i = 0; i < text.length(); i++) {
+            final var span = nextSpan(text, i);
+            if (span != null) {
+                i = span[1] - 1;
+            } else if (text.charAt(i) == separator) {
+                parts.add(text.substring(start, i));
+                start = i + 1;
+            }
+        }
+        parts.add(text.substring(start));
+        return parts;
+    }
+
     /** One trailing {@code ;}, trimmed — deparsed definitions carry one. */
     public static String dropTerminator(String text) {
         final var t = text.stripTrailing();

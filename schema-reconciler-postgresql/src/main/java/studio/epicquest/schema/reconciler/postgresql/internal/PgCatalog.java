@@ -2225,7 +2225,7 @@ public final class PgCatalog {
 
         /** A scalar {@code name=value} field of a canonical definition. */
         private static String canonicalField(String canonical, String name) {
-            for (final var part : canonical.split(";")) {
+            for (final var part : PgSql.splitOutsideLiterals(canonical, ';')) {
                 if (part.startsWith(name + "=")) {
                     return part.substring(name.length() + 1);
                 }

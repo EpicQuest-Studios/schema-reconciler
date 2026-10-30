@@ -622,17 +622,6 @@ class PostgreSqlConformanceTest extends DialectConformanceTest {
     @Test
     @DisplayName("an unlogged sequence keeps its persistence and drifts in place")
     void unloggedSequenceConverges() throws Exception {
-        try {
-            unloggedSequenceConvergesBody();
-        } catch (PolicyViolationException e) {
-            System.err.println("PLAN>\n" + e.plan().toSql());
-            e.plan().differences().forEach(d -> System.err.println("DIFF> " + d));
-            e.plan().changes().forEach(c -> System.err.println("CHANGE> " + c));
-            throw e;
-        }
-    }
-
-    private void unloggedSequenceConvergesBody() throws Exception {
         assertEquals(ReconcileOutcome.RECONCILED,
                 reconciler("CREATE UNLOGGED SEQUENCE s").reconcile().outcome());
         assertEquals(ReconcileOutcome.UP_TO_DATE,

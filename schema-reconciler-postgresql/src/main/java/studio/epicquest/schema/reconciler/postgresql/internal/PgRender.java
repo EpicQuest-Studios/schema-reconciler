@@ -565,39 +565,12 @@ public final class PgRender {
     }
 
     /**
-     * {@code ;}-split that skips single-quoted literals (with {@code ''}
-     * escapes): canonical field values can carry quoted punctuation inside
-     * expressions and labels.
+     * {@code ;}-split that skips quoted literals, quoted identifiers and
+     * dollar-quoted bodies: canonical field values can carry quoted
+     * punctuation inside expressions, labels and identifier names.
      */
     private static List<String> splitCanonical(String text) {
-        final var parts = new ArrayList<String>();
-        var start = 0;
-        for (var i = 0; i < text.length(); i++) {
-            if (text.charAt(i) == '\'') {
-                i = literalEnd(text, i);
-            } else if (text.charAt(i) == ';') {
-                parts.add(text.substring(start, i));
-                start = i + 1;
-            }
-        }
-        parts.add(text.substring(start));
-        return parts;
-    }
-
-    /** The index of the closing quote of the literal starting at {@code open} (or end of text). */
-    private static int literalEnd(String text, int open) {
-        var i = open + 1;
-        while (i < text.length()) {
-            if (text.charAt(i) == '\'') {
-                if (i + 1 < text.length() && text.charAt(i + 1) == '\'') {
-                    i += 2;
-                    continue;
-                }
-                return i;
-            }
-            i++;
-        }
-        return text.length();
+        return PgSql.splitOutsideLiterals(text, ';');
     }
 
     /**
@@ -610,16 +583,9 @@ public final class PgRender {
             return List.of();
         }
         final var out = new ArrayList<String>();
-        var start = 0;
-        for (var i = 0; i <= labels.length(); i++) {
-            if (i == labels.length() || labels.charAt(i) == ',') {
-                final var tok = labels.substring(start, i);
-                if (tok.length() >= 2 && tok.startsWith("'") && tok.endsWith("'")) {
-                    out.add(tok.substring(1, tok.length() - 1).replace("''", "'"));
-                }
-                start = i + 1;
-            } else if (labels.charAt(i) == '\'') {
-                i = literalEnd(labels, i);
+        for (final var tok : PgSql.splitOutsideLiterals(labels, ',')) {
+            if (tok.length() >= 2 && tok.startsWith("'") && tok.endsWith("'")) {
+                out.add(tok.substring(1, tok.length() - 1).replace("''", "'"));
             }
         }
         return out;

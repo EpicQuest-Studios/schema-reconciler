@@ -623,6 +623,19 @@ class PostgreSqlInternalsTest {
     }
 
     @Test
+    void driftedColumnQuotedSemicolonsDoNotSplitCanonicalFields() {
+        // ';' inside a 'literal' or a "quoted identifier" is value content,
+        // not a field separator — only the default differs
+        final var want = "type=\"a;b\";notnull=false;default='x;y'";
+        final var d = driftedColumn(want,
+                "type=\"a;b\";notnull=false;default='x;z'");
+        final var change = PgRender.render(d, columnSnap(want), "core").get(0);
+        assertEquals(ChangeSafety.REBUILD, change.safety());
+        assertEquals(List.of("ALTER TABLE \"core\".\"t\" ALTER COLUMN \"c\""
+                + " SET DEFAULT 'x;y'"), change.statements());
+    }
+
+    @Test
     void driftedColumnNotNullSplitsByDataRisk() {
         // DROP NOT NULL is a metadata change (REBUILD); SET NOT NULL validates
         // existing rows and can fail on them (rendered DESTRUCTIVE, 5.6 rule 1)
