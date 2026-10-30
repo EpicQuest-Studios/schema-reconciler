@@ -153,6 +153,9 @@ public final class PgScriptCheck {
     private static final Set<String> SIGNATURE_TARGET_KINDS = Set.of(
             "FUNCTION", "PROCEDURE", "ROUTINE", "AGGREGATE", "OPERATOR");
 
+    /** The {@code ${namespace}} placeholder text of spec 3.2. */
+    private static final String TOKEN = "${namespace}";
+
     /** CREATE/DROP/ALTER objects with no namespace anchor (spec 5.4). */
     private static final Set<String> DATABASE_WIDE_OBJECTS = Set.of(
             "SERVER", "PUBLICATION", "ROLE", "USER", "GROUP", "EVENT",
@@ -528,12 +531,15 @@ public final class PgScriptCheck {
     }
 
     /**
-     * A string literal that IS the scratch name — {@code '"rcl_x"'} or
+     * A namespace literal that can never converge (rule-5 rationale): a
+     * string whose whole content is the scratch name — {@code '"rcl_x"'} or
      * {@code 'rcl_x'} — is the residue of a bare {@code ${namespace}} token
-     * placed inside a literal (3.2 substitutes the token textually). The
-     * baked name differs on every run, so the object could never converge;
-     * reject like rule 5. A literal that carries the scratch name as a
-     * qualifier ({@code 'rcl_x.seq'}) stays legal.
+     * inside a literal, baked freshly every run; and literal text carrying
+     * the token without a {@code .} after it — {@code '${namespace}'},
+     * {@code 'a${namespace}b'} — binds to the quoted target on apply but
+     * normalisation sees no qualifier, so it drifts forever. A token
+     * followed by {@code .} stays legal: {@code '${namespace}.seq'} binds
+     * to {@code '"target".seq'} which normalisation maps back.
      */
     private static void checkScratchLiteral(PgSql.StatementTokens statement,
                                             String scratchNamespace) {
@@ -543,6 +549,14 @@ public final class PgScriptCheck {
                 throw rejected(statement, "'" + body
                         + "' is the scratch namespace substituted into a literal;"
                         + " a bare ${namespace} inside a literal bakes an unstable name");
+            }
+            for (var p = body.indexOf(TOKEN); p >= 0; p = body.indexOf(TOKEN, p + 1)) {
+                if (p + TOKEN.length() >= body.length()
+                        || body.charAt(p + TOKEN.length()) != '.') {
+                    throw rejected(statement, "'" + TOKEN + "' inside a literal has no"
+                            + " target form it can converge to; use " + TOKEN + "."
+                            + " for namespace references or a literal value");
+                }
             }
         }
     }

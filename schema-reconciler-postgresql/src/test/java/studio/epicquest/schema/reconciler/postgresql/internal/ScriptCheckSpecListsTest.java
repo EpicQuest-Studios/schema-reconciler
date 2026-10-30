@@ -173,13 +173,20 @@ class ScriptCheckSpecListsTest {
                 "CREATE TABLE t (c text DEFAULT '\"scr\"')",
                 "CREATE TABLE t (c text DEFAULT 'scr')",
                 "COMMENT ON TABLE t IS 'scr'",
-                "SELECT $tag$\"scr\"$tag$"}) {
+                "SELECT $tag$\"scr\"$tag$",
+                // the escaped token form left in place by $${namespace} —
+                // it would bind to the quoted target on apply and drift forever
+                "CREATE TABLE t (c text DEFAULT '${namespace}')",
+                "CREATE TABLE t (c text DEFAULT 'a${namespace}b')"}) {
             assertThrows(DesiredStateException.class,
                     () -> PgScriptCheck.check(sql, SCRATCH), sql);
         }
         // the scratch name as a qualifier, embedded in data, or inside a
         // DO body (transient — it cannot reach a canonical) stays legal
         PgScriptCheck.check("SELECT nextval('scr.seq')", SCRATCH);
+        // a token followed by '.' converges: it binds '"target".seq' which
+        // normalisation maps back — only the bare-token form is unstable
+        PgScriptCheck.check("SELECT '${namespace}.seq'", SCRATCH);
         PgScriptCheck.check("CREATE TABLE t (c text DEFAULT 'a''scr''b')", SCRATCH);
         PgScriptCheck.check("DO 'BEGIN PERFORM ''scr''; END'", SCRATCH);
     }
