@@ -12,7 +12,7 @@
 
     <artifactId>schema-reconciler-postgresql</artifactId>
     <name>Schema Reconciler PostgreSQL Dialect</name>
-    <description>PostgreSQL 18 dialect, the reference implementation.</description>
+    <description>PostgreSQL 14+ dialect, the reference implementation.</description>
 
     <dependencies>
         <dependency>
