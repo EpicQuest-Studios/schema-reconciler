@@ -5,6 +5,7 @@ import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Statement;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -66,6 +67,7 @@ public final class PgCatalog {
         data.loadRoutines(conn);
         data.loadTriggers(conn);
         data.loadEnums(conn);
+        data.loadDomains(conn);
         data.loadOther(conn);
         data.loadDependencies(conn);
         data.loadExternalDependents(conn);
@@ -796,18 +798,101 @@ public final class PgCatalog {
             }
         }
 
+        /**
+         * Domains: the canonical definition is the base type (deparsed by
+         * {@code format_type}), the nullability flag, the deparsed default
+         * expression and the check constraints by name. The {@code typeByOid}
+         * entry resolves column and table dependency edges to the managed
+         * {@link ObjectKind#DOMAIN} object; the base type and the checks'
+         * referenced routines and types join the dependency graph in
+         * {@code loadDependencies}.
+         */
+        void loadDomains(Connection conn) throws SQLException {
+            final var checks = new LinkedHashMap<Long, List<String>>();
+            try (PreparedStatement ps = conn.prepareStatement("""
+                    SELECT c.contypid AS dom, c.conname, pg_get_constraintdef(c.oid) AS def
+                    FROM pg_constraint c
+                    JOIN pg_type t ON t.oid = c.contypid
+                    JOIN pg_namespace n ON n.oid = t.typnamespace AND n.nspname = ?
+                    WHERE c.contype = 'c'
+                    ORDER BY c.contypid, c.conname
+                    """)) {
+                ps.setString(1, ns);
+                try (ResultSet rs = ps.executeQuery()) {
+                    while (rs.next()) {
+                        checks.computeIfAbsent(rs.getLong("dom"), k -> new ArrayList<>())
+                                .add(rs.getString("conname") + "\0" + rs.getString("def"));
+                    }
+                }
+            }
+            try (PreparedStatement ps = conn.prepareStatement("""
+                    SELECT t.oid, t.typname,
+                           format_type(t.typbasetype, t.typtypmod) AS basetype,
+                           t.typnotnull, pg_get_expr(t.typdefaultbin, 0) AS dflt,
+                           NULLIF(t.typcollation, 0)::regcollation::text AS coll,
+                           t.typbasetype
+                    FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace
+                    WHERE n.nspname = ? AND t.typtype = 'd'
+                    ORDER BY t.oid
+                    """)) {
+                ps.setString(1, ns);
+                try (ResultSet rs = ps.executeQuery()) {
+                    while (rs.next()) {
+                        final var oid = rs.getLong("oid");
+                        if (extMember(oid)) {
+                            continue;
+                        }
+                        final var name = rs.getString("typname");
+                        final var basetype = rs.getString("basetype");
+                        final var notnull = rs.getBoolean("typnotnull");
+                        final var dflt = rs.getString("dflt");
+                        final var collation = rs.getString("coll");
+                        final var qName = qNs + "." + PgIdentifiers.quote(name);
+                        final var id = new ObjectId(ObjectKind.DOMAIN, name);
+                        final var create = new StringBuilder(
+                                "CREATE DOMAIN " + qName + " AS " + basetype);
+                        final var canonical = new StringBuilder(
+                                "basetype=" + basetype + ";notnull=" + notnull);
+                        if (collation != null) {
+                            canonical.append(";collation=").append(collation);
+                            create.append(" COLLATE ").append(collation);
+                        }
+                        if (dflt != null) {
+                            canonical.append(";default=").append(dflt);
+                            create.append(" DEFAULT ").append(dflt);
+                        }
+                        if (notnull) {
+                            create.append(" NOT NULL");
+                        }
+                        for (final var entry : checks.getOrDefault(oid, List.of())) {
+                            final var tab = entry.indexOf('\0');
+                            final var cname = entry.substring(0, tab);
+                            final var def = entry.substring(tab + 1);
+                            canonical.append(";check.").append(cname).append('=').append(def);
+                            create.append(" CONSTRAINT ").append(PgIdentifiers.quote(cname))
+                                    .append(' ').append(def);
+                        }
+                        define(id, canonical.toString(),
+                                Map.of(CREATE_SQL, create.toString(),
+                                        DROP_SQL, "DROP DOMAIN " + qName));
+                        typeByOid.put(oid, id);
+                    }
+                }
+            }
+        }
+
         /** Loads every catalog object a desired script can create in the
          *  namespace that has no managed {@link ObjectKind}, as OTHER, so the
          *  diff reports it UNSUPPORTED instead of ignoring it (5.4). */
         void loadOther(Connection conn) throws SQLException {
-            // user-defined types that stay unsupported: domains, ranges,
-            // multiranges and base types (array types carry typelem != 0 and
-            // are not standalone; enums load as TYPE objects in loadEnums)
+            // user-defined types that stay unsupported: ranges, multiranges
+            // and base types (array types carry typelem != 0 and are not
+            // standalone; enums and domains are managed TYPE/DOMAIN objects)
             try (PreparedStatement ps = conn.prepareStatement("""
                     SELECT t.oid, t.typname, t.typtype
                     FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace
                     WHERE n.nspname = ?
-                      AND (t.typtype IN ('d','r','m')
+                      AND (t.typtype IN ('r','m')
                            OR (t.typtype = 'b' AND t.typelem = 0))
                     ORDER BY t.oid
                     """)) {
@@ -1381,6 +1466,33 @@ public final class PgCatalog {
                             default -> byOid(ref);
                         };
                         dep(from, to);
+                    }
+                }
+            }
+            // domains -> their base type, and domain check constraints ->
+            // the routines, types and relations their expressions use
+            try (PreparedStatement ps = conn.prepareStatement("""
+                    SELECT d.objid AS dom, d.refobjid AS dep
+                    FROM pg_depend d
+                    JOIN pg_type t ON t.oid = d.objid AND t.typtype = 'd'
+                    JOIN pg_namespace n ON n.oid = t.typnamespace AND n.nspname = ?
+                    WHERE d.classid = 'pg_type'::regclass
+                      AND d.refclassid IN ('pg_type'::regclass, 'pg_proc'::regclass)
+                    UNION
+                    SELECT c.contypid, d.refobjid
+                    FROM pg_depend d
+                    JOIN pg_constraint c ON c.oid = d.objid AND c.contypid <> 0
+                    JOIN pg_type t ON t.oid = c.contypid
+                    JOIN pg_namespace n ON n.oid = t.typnamespace AND n.nspname = ?
+                    WHERE d.classid = 'pg_constraint'::regclass
+                      AND d.refclassid IN ('pg_proc'::regclass, 'pg_type'::regclass,
+                                           'pg_class'::regclass)
+                    """)) {
+                ps.setString(1, ns);
+                ps.setString(2, ns);
+                try (ResultSet rs = ps.executeQuery()) {
+                    while (rs.next()) {
+                        depOid(typeByOid.get(rs.getLong("dom")), rs.getLong("dep"));
                     }
                 }
             }

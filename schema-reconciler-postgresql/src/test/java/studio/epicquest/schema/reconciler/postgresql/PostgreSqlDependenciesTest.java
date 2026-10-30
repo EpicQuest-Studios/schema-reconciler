@@ -310,8 +310,8 @@ class PostgreSqlDependenciesTest {
             final var policy = ReconcilePolicy.defaults()
                     .withUnsupported(Decision.REPORT);
             final var report = reconciler(ns, """
-                    CREATE DOMAIN ${namespace}.d AS int;
-                    CREATE TABLE ${namespace}.t (x ${namespace}.d);
+                    CREATE TYPE ${namespace}.span AS RANGE (subtype = int4);
+                    CREATE TABLE ${namespace}.t (x ${namespace}.span);
                     """, policy).reconcile();
             assertEquals(ReconcileOutcome.REPORTED_ONLY, report.outcome());
             assertTrue(report.reported().stream()

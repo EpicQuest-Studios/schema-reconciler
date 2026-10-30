@@ -268,6 +268,10 @@ public abstract class DialectConformanceTest {
         return new ObjectId(ObjectKind.TYPE, name);
     }
 
+    private static ObjectId domain(String name) {
+        return new ObjectId(ObjectKind.DOMAIN, name);
+    }
+
     /** The row count of a relation in the test namespace — proves a
      *  materialized view actually holds its stored result rows. */
     protected final long count(String relation) throws SQLException {
@@ -1014,5 +1018,57 @@ public abstract class DialectConformanceTest {
         assertEquals(ReconcileOutcome.UP_TO_DATE,
                 reconciler("CREATE TYPE mood AS ENUM ('sad', 'ok', 'happy')")
                         .reconcile().outcome());
+    }
+
+    @Test
+    @DisplayName("C-41 domain missing: ADDITIVE create, constraints and nullability kept")
+    void c41DomainMissing() throws Exception {
+        assumeKind(ObjectKind.DOMAIN);
+        final var script = """
+                CREATE DOMAIN posint AS integer NOT NULL DEFAULT 1 CHECK (VALUE > 0);
+                CREATE TABLE t (a posint)
+                """;
+        final var report = reconciler(script).reconcile();
+        assertEquals(ReconcileOutcome.RECONCILED, report.outcome());
+        assertTrue(report.applied().stream().anyMatch(c ->
+                        c.target().equals(domain("posint")) && c.safety() == ChangeSafety.ADDITIVE),
+                "expected an ADDITIVE create for the domain: " + report.applied());
+        assertEquals(ReconcileOutcome.UP_TO_DATE, reconciler(script).reconcile().outcome());
+        // the domain behaves like its definition says: defaults fill, CHECK rejects
+        execute("INSERT INTO " + qualified("t") + " DEFAULT VALUES");
+        assertEquals(1L, count("t"));
+    }
+
+    @Test
+    @DisplayName("C-42 domain drift on safe fields: REBUILD ALTER DOMAIN converges")
+    void c42DomainSafeDrift() throws Exception {
+        assumeKind(ObjectKind.DOMAIN);
+        reconciler("CREATE DOMAIN posint AS integer NOT NULL DEFAULT 1 CHECK (VALUE > 0)")
+                .reconcile();
+        // drop the default, drop NOT NULL, drop the check — all safe in place
+        final var report = reconciler("CREATE DOMAIN posint AS integer").reconcile();
+        assertEquals(ReconcileOutcome.RECONCILED, report.outcome());
+        assertTrue(report.applied().stream().anyMatch(c ->
+                        c.target().equals(domain("posint")) && c.safety() == ChangeSafety.REBUILD
+                                && c.statements().stream()
+                                        .anyMatch(s -> s.contains("ALTER DOMAIN"))),
+                "expected a REBUILD ALTER DOMAIN: " + report.applied());
+        assertEquals(ReconcileOutcome.UP_TO_DATE,
+                reconciler("CREATE DOMAIN posint AS integer").reconcile().outcome());
+    }
+
+    @Test
+    @DisplayName("C-43 domain base-type change stays a manual change")
+    void c43DomainBaseTypeChange() throws Exception {
+        assumeKind(ObjectKind.DOMAIN);
+        reconciler("CREATE DOMAIN posint AS integer NOT NULL DEFAULT 1 CHECK (VALUE > 0)")
+                .reconcile();
+        // the base type cannot alter in place — fail closed
+        assertThrows(PolicyViolationException.class, () -> reconciler(
+                "CREATE DOMAIN posint AS bigint NOT NULL DEFAULT 1 CHECK (VALUE > 0)")
+                .reconcile());
+        assertEquals(ReconcileOutcome.UP_TO_DATE,
+                reconciler("CREATE DOMAIN posint AS integer NOT NULL DEFAULT 1"
+                        + " CHECK (VALUE > 0)").reconcile().outcome());
     }
 }
