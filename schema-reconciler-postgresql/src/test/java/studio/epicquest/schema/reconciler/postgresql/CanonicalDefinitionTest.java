@@ -133,7 +133,13 @@ class CanonicalDefinitionTest {
                         "SELECT pg_get_expr(adbin, adrelid) FROM pg_attrdef"
                                 + " WHERE adrelid = 't'::regclass"
                                 + " AND adnum = (SELECT attnum FROM pg_attribute"
-                                + " WHERE attrelid = 't'::regclass AND attname = 'name')"),
+                                + " WHERE attrelid = 't'::regclass AND attname = 'name')")
+                        + ";storage=" + query(s,
+                        "SELECT attstorage FROM pg_attribute"
+                                + " WHERE attrelid = 't'::regclass AND attname = 'name'")
+                        + ";compression=" + query(s,
+                        "SELECT coalesce(attcompression::text, '') FROM pg_attribute"
+                                + " WHERE attrelid = 't'::regclass AND attname = 'name'"),
                         column.definition().canonical());
             } finally {
                 c.rollback();

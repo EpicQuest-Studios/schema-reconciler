@@ -285,6 +285,7 @@ public final class PgCatalog {
                     SELECT c.relname AS parent, c.oid AS reloid, a.attnum,
                            a.attname, format_type(a.atttypid, a.atttypmod) AS typ,
                            a.attgenerated, a.attcollation, t.typcollation, a.attidentity,
+                           a.attstorage, t.typstorage, a.attcompression,
                            co.collname,
                            (a.attnotnull OR EXISTS (
                                SELECT 1 FROM pg_constraint cn
@@ -329,11 +330,28 @@ public final class PgCatalog {
                         final var collname = rs.getString("collname");
                         final var customCollation = rs.getLong("attcollation") != 0
                                 && rs.getLong("attcollation") != rs.getLong("typcollation");
+                        final var storage = rs.getString("attstorage");
+                        final var compression = nullToEmpty(rs.getString("attcompression"));
 
                         final var canonical = new StringBuilder("type=").append(type)
                                 .append(";notnull=").append(notnull);
                         final var sql = new StringBuilder()
                                 .append(PgIdentifiers.quote(name)).append(' ').append(type);
+                        // storage/compression precede COLLATE in the column-def
+                        // grammar; emitted only when they deviate from the
+                        // type default (like a custom collation)
+                        if (!storage.equals(rs.getString("typstorage"))) {
+                            sql.append(" STORAGE ").append(switch (storage) {
+                                case "e" -> "EXTERNAL";
+                                case "m" -> "MAIN";
+                                case "p" -> "PLAIN";
+                                default -> "EXTENDED";
+                            });
+                        }
+                        if (!compression.isEmpty()) {
+                            sql.append(" COMPRESSION ")
+                                    .append(compression.equals("l") ? "lz4" : "pglz");
+                        }
                         if (customCollation && collname != null) {
                             canonical.append(";collation=").append(collname);
                             sql.append(" COLLATE ").append(PgIdentifiers.quote(collname));
@@ -364,6 +382,8 @@ public final class PgCatalog {
                         if (notnull) {
                             sql.append(" NOT NULL");
                         }
+                        canonical.append(";storage=").append(storage)
+                                .append(";compression=").append(compression);
                         attrs.put(COLUMN_SQL, sql.toString());
                         define(new ObjectId(ObjectKind.COLUMN, name, parent),
                                 canonical.toString(), attrs);

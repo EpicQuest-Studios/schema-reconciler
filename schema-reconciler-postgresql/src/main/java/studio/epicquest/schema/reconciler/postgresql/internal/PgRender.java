@@ -487,6 +487,20 @@ public final class PgRender {
             safe.add(alter + (wantDefault != null
                     ? "SET DEFAULT " + wantDefault : "DROP DEFAULT"));
         }
+        // storage strategy and compression are declarable (column storage
+        // parameters in CREATE TABLE) and re-point only future writes —
+        // in-place safe alterations like SET DEFAULT
+        final var wantStorage = wantFields.get("storage");
+        if (wantStorage != null && !Objects.equals(wantStorage, haveFields.get("storage"))) {
+            safe.add(alter + "SET STORAGE "
+                    + STORAGE_WORDS.getOrDefault(wantStorage, "EXTENDED"));
+        }
+        final var wantCompression = wantFields.get("compression");
+        if (wantCompression != null
+                && !Objects.equals(wantCompression, haveFields.get("compression"))) {
+            safe.add(alter + "SET COMPRESSION "
+                    + COMPRESSION_WORDS.getOrDefault(wantCompression, "default"));
+        }
         final var wantNotnull =
                 Boolean.parseBoolean(wantFields.getOrDefault("notnull", "false"));
         final var haveNotnull =
@@ -610,6 +624,14 @@ public final class PgRender {
         }
         return out;
     }
+
+    /** {@code attstorage} letter to the {@code SET STORAGE} keyword. */
+    private static final Map<String, String> STORAGE_WORDS = Map.of(
+            "p", "PLAIN", "e", "EXTERNAL", "m", "MAIN", "x", "EXTENDED");
+
+    /** {@code attcompression} letter to the {@code SET COMPRESSION} method. */
+    private static final Map<String, String> COMPRESSION_WORDS = Map.of(
+            "p", "pglz", "l", "lz4", "", "default");
 
     private static final Map<String, Integer> INT_TYPES = Map.of(
             "smallint", 1, "integer", 2, "bigint", 3);

@@ -666,6 +666,18 @@ class PostgreSqlInternalsTest {
     }
 
     @Test
+    void driftedColumnStorageAndCompressionAlterInPlace() {
+        final var want = "type=text;notnull=false;storage=e;compression=p";
+        final var d = driftedColumn(want, "type=text;notnull=false;storage=x;compression=");
+        final var change = PgRender.render(d, columnSnap(want), "core").get(0);
+        assertEquals(ChangeSafety.REBUILD, change.safety());
+        assertEquals(List.of(
+                "ALTER TABLE \"core\".\"t\" ALTER COLUMN \"c\" SET STORAGE EXTERNAL",
+                "ALTER TABLE \"core\".\"t\" ALTER COLUMN \"c\" SET COMPRESSION pglz"),
+                change.statements());
+    }
+
+    @Test
     void driftedColumnWideningTypeAltersInPlace() {
         for (final var pair : new String[][] {
                 {"character varying(20)", "character varying(10)"},

@@ -655,6 +655,31 @@ class PostgreSqlConformanceTest extends DialectConformanceTest {
     }
 
     @Test
+    @DisplayName("column storage and compression parameters converge and drift back")
+    void columnStorageParametersConverge() throws Exception {
+        final var declared = "CREATE TABLE t (id int, body text"
+                + " STORAGE EXTERNAL COMPRESSION pglz)";
+        assertEquals(ReconcileOutcome.RECONCILED,
+                reconciler(declared).reconcile().outcome());
+        assertEquals(ReconcileOutcome.UP_TO_DATE,
+                reconciler(declared).reconcile().outcome());
+        // declaring no parameters drifts back to the type defaults
+        assertEquals(ReconcileOutcome.RECONCILED,
+                reconciler("CREATE TABLE t (id int, body text)").reconcile().outcome());
+        assertEquals(ReconcileOutcome.UP_TO_DATE,
+                reconciler("CREATE TABLE t (id int, body text)").reconcile().outcome());
+        try (var c = scratch.getConnection(); var st = c.createStatement();
+                var rs = st.executeQuery("SELECT attstorage, attcompression"
+                        + " FROM pg_attribute WHERE attrelid = '"
+                        + namespace().replace("'", "''")
+                        + ".t'::regclass AND attname = 'body'")) {
+            rs.next();
+            assertEquals("x", rs.getString(1));
+            assertEquals("", rs.getString(2));
+        }
+    }
+
+    @Test
     @DisplayName("an exclusion constraint's backing index is not a separate index")
     void exclusionBackingIndexIsNotSeparate() throws Exception {
         execute("CREATE TABLE " + qualified("t")
