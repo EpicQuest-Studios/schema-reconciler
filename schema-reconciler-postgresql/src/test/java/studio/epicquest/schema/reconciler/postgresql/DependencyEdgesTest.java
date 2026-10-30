@@ -92,6 +92,29 @@ class DependencyEdgesTest {
                 id(ObjectKind.POLICY, "p_sel", "t"), id(ObjectKind.TABLE, "t")),
         new Edge("domain -> base type", TYPES + "CREATE DOMAIN dm AS mood",
                 id(ObjectKind.DOMAIN, "dm"), id(ObjectKind.TYPE, "mood")),
+        // unsupported (OTHER) objects record the same edges so an
+        // unrecreatable dependent blocks a drop or recreate (5.8.3)
+        new Edge("rule -> table", TYPES
+                + "CREATE RULE rl AS ON INSERT TO t DO NOTHING",
+                id(ObjectKind.OTHER, "rule:t.rl"), id(ObjectKind.TABLE, "t")),
+        new Edge("statistics -> table", TYPES
+                + "CREATE STATISTICS st ON id, note FROM t",
+                id(ObjectKind.OTHER, "statistics:t.st"), id(ObjectKind.TABLE, "t")),
+        new Edge("range type -> subtype", TYPES
+                + "CREATE TYPE r AS RANGE (subtype = mood)",
+                id(ObjectKind.OTHER, "type:r"), id(ObjectKind.TYPE, "mood")),
+        new Edge("range cast -> constructor routine", TYPES
+                + "CREATE TYPE r AS RANGE (subtype = mood)",
+                id(ObjectKind.OTHER, "cast:r->r_multirange"),
+                id(ObjectKind.ROUTINE, "r_multirange(r)")),
+        new Edge("range cast -> source type", TYPES
+                + "CREATE TYPE r AS RANGE (subtype = mood)",
+                id(ObjectKind.OTHER, "cast:r->r_multirange"),
+                id(ObjectKind.OTHER, "type:r")),
+        new Edge("multirange -> range type", TYPES
+                + "CREATE TYPE r AS RANGE (subtype = mood)",
+                id(ObjectKind.OTHER, "type:r_multirange"),
+                id(ObjectKind.OTHER, "type:r")),
     };
 
     @Test

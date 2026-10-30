@@ -108,6 +108,10 @@ public final class PgCatalog {
         private final Map<Long, ObjectId> tgByOid = new HashMap<>();
         private final Map<Long, ObjectId> collByOid = new HashMap<>();
         private final Map<Long, ObjectId> langByOid = new HashMap<>();
+        /** Catalog-row oid -> the OTHER object it loaded as, per classid, so
+         *  an unsupported object that depends on a managed one still records
+         *  the edge and blocks an unrecreatable drop (5.8.3). */
+        private final Map<String, Map<Long, ObjectId>> otherByOid = new HashMap<>();
         private final Map<ObjectId, Set<ObjectId>> deps = new HashMap<>();
         /** Catalog oids owned by an extension (pg_depend deptype 'e'). Member
          *  objects cannot be created or dropped standalone, so they never
@@ -133,6 +137,10 @@ public final class PgCatalog {
             if (from != null && to != null && !to.equals(from)) {
                 deps.computeIfAbsent(from, k -> new LinkedHashSet<>()).add(to);
             }
+        }
+
+        private void otherOid(String cls, long oid, ObjectId id) {
+            otherByOid.computeIfAbsent(cls, k -> new HashMap<>()).put(oid, id);
         }
 
         /** Resolves a catalog oid to the snapshot object it names, if it is in this namespace. */
@@ -427,8 +435,8 @@ public final class PgCatalog {
                                 : new ObjectId(kind, name, parent);
                         conByOid.put(rs.getLong("oid"), id);
                         final var conindid = rs.getLong("conindid");
-                        // conindid is the backing index only for pk/unique; on
-                        // an FK it is the referenced index on the other table.
+                        // conindid is the backing index for p/u/x only; on an
+                        // FK it is the referenced index on the other table.
                         if (conindid != 0 && kind != ObjectKind.FOREIGN_KEY
                                 && kind != ObjectKind.CHECK) {
                             conByIndexOid.put(conindid, id);
@@ -1009,6 +1017,7 @@ public final class PgCatalog {
                         final var name = rs.getString("typname");
                         final var id = new ObjectId(ObjectKind.OTHER, "type:" + name);
                         typeByOid.put(rs.getLong("oid"), id);
+                        otherOid("pg_type", rs.getLong("oid"), id);
                         define(id, "typtype=" + rs.getString("typtype"), Map.of());
                     }
                 }
@@ -1076,9 +1085,10 @@ public final class PgCatalog {
                         if (extMember(rs.getLong("oid"))) {
                             continue;
                         }
-                        define(new ObjectId(ObjectKind.OTHER,
-                                        "conversion:" + rs.getString("conname")),
-                                "conversion", Map.of());
+                        final var id = new ObjectId(ObjectKind.OTHER,
+                                "conversion:" + rs.getString("conname"));
+                        otherOid("pg_conversion", rs.getLong("oid"), id);
+                        define(id, "conversion", Map.of());
                     }
                 }
             }
@@ -1097,8 +1107,10 @@ public final class PgCatalog {
                         if (extMember(rs.getLong("oid"))) {
                             continue;
                         }
-                        define(new ObjectId(ObjectKind.OTHER, "rule:" + rs.getString("name")),
-                                "rule", Map.of());
+                        final var id = new ObjectId(ObjectKind.OTHER,
+                                "rule:" + rs.getString("name"));
+                        otherOid("pg_rewrite", rs.getLong("oid"), id);
+                        define(id, "rule", Map.of());
                     }
                 }
             }
@@ -1116,9 +1128,10 @@ public final class PgCatalog {
                         if (extMember(rs.getLong("oid"))) {
                             continue;
                         }
-                        define(new ObjectId(ObjectKind.OTHER,
-                                        "statistics:" + rs.getString("name")),
-                                "statistics", Map.of());
+                        final var id = new ObjectId(ObjectKind.OTHER,
+                                "statistics:" + rs.getString("name"));
+                        otherOid("pg_statistic_ext", rs.getLong("oid"), id);
+                        define(id, "statistics", Map.of());
                     }
                 }
             }
@@ -1144,16 +1157,16 @@ public final class PgCatalog {
             }
             // full-text-search objects
             try (PreparedStatement ps = conn.prepareStatement("""
-                    SELECT 'fts-config:' || g.cfgname AS name, g.oid
+                    SELECT 'fts-config:' || g.cfgname AS name, 'pg_ts_config' AS cls, g.oid
                     FROM pg_ts_config g JOIN pg_namespace n ON n.oid = g.cfgnamespace AND n.nspname = ?
                     UNION ALL
-                    SELECT 'fts-dict:' || g.dictname, g.oid
+                    SELECT 'fts-dict:' || g.dictname, 'pg_ts_dict', g.oid
                     FROM pg_ts_dict g JOIN pg_namespace n ON n.oid = g.dictnamespace AND n.nspname = ?
                     UNION ALL
-                    SELECT 'fts-parser:' || g.prsname, g.oid
+                    SELECT 'fts-parser:' || g.prsname, 'pg_ts_parser', g.oid
                     FROM pg_ts_parser g JOIN pg_namespace n ON n.oid = g.prsnamespace AND n.nspname = ?
                     UNION ALL
-                    SELECT 'fts-template:' || g.tmplname, g.oid
+                    SELECT 'fts-template:' || g.tmplname, 'pg_ts_template', g.oid
                     FROM pg_ts_template g JOIN pg_namespace n ON n.oid = g.tmplnamespace AND n.nspname = ?
                     ORDER BY 1
                     """)) {
@@ -1163,8 +1176,9 @@ public final class PgCatalog {
                         if (extMember(rs.getLong("oid"))) {
                             continue;
                         }
-                        define(new ObjectId(ObjectKind.OTHER, rs.getString("name")),
-                                "text-search", Map.of());
+                        final var id = new ObjectId(ObjectKind.OTHER, rs.getString("name"));
+                        otherOid(rs.getString("cls"), rs.getLong("oid"), id);
+                        define(id, "text-search", Map.of());
                     }
                 }
             }
@@ -1172,13 +1186,14 @@ public final class PgCatalog {
             try (PreparedStatement ps = conn.prepareStatement("""
                     SELECT 'operator:' || g.oprname || '('
                             || COALESCE(g.oprleft::regtype::text, '-') || ','
-                            || COALESCE(g.oprright::regtype::text, '-') || ')' AS name, g.oid
+                            || COALESCE(g.oprright::regtype::text, '-') || ')' AS name,
+                           'pg_operator' AS cls, g.oid
                     FROM pg_operator g JOIN pg_namespace n ON n.oid = g.oprnamespace AND n.nspname = ?
                     UNION ALL
-                    SELECT 'opclass:' || g.opcname, g.oid
+                    SELECT 'opclass:' || g.opcname, 'pg_opclass', g.oid
                     FROM pg_opclass g JOIN pg_namespace n ON n.oid = g.opcnamespace AND n.nspname = ?
                     UNION ALL
-                    SELECT 'opfamily:' || g.opfname, g.oid
+                    SELECT 'opfamily:' || g.opfname, 'pg_opfamily', g.oid
                     FROM pg_opfamily g JOIN pg_namespace n ON n.oid = g.opfnamespace AND n.nspname = ?
                     ORDER BY 1
                     """)) {
@@ -1188,8 +1203,9 @@ public final class PgCatalog {
                         if (extMember(rs.getLong("oid"))) {
                             continue;
                         }
-                        define(new ObjectId(ObjectKind.OTHER, rs.getString("name")),
-                                "operator", Map.of());
+                        final var id = new ObjectId(ObjectKind.OTHER, rs.getString("name"));
+                        otherOid(rs.getString("cls"), rs.getLong("oid"), id);
+                        define(id, "operator", Map.of());
                     }
                 }
             }
@@ -1198,7 +1214,7 @@ public final class PgCatalog {
             try (PreparedStatement ps = conn.prepareStatement("""
                     SELECT 'seclabel:' || o.name
                             || CASE WHEN a.attname IS NULL THEN '' ELSE '.' || a.attname END AS name,
-                            d.objoid
+                            d.objoid, o.cls::text AS cls, d.objsubid, a.attname
                     FROM pg_seclabel d
                     JOIN (""" + NS_OBJECTS + """
                     ) o ON o.cls = d.classoid AND o.obj = d.objoid
@@ -1212,8 +1228,13 @@ public final class PgCatalog {
                         if (extMember(rs.getLong("objoid"))) {
                             continue;
                         }
-                        define(new ObjectId(ObjectKind.OTHER, rs.getString("name")),
-                                "security-label", Map.of());
+                        final var id = new ObjectId(ObjectKind.OTHER,
+                                rs.getString("name"));
+                        define(id, "security-label", Map.of());
+                        // a label dies with its target but cannot be recreated —
+                        // it blocks an unrecreatable drop like any dependent
+                        dep(id, commentTarget(rs.getString("cls"), rs.getLong("objoid"),
+                                rs.getInt("objsubid"), rs.getString("attname")));
                     }
                 }
             }
@@ -1323,8 +1344,10 @@ public final class PgCatalog {
                         if (extMember(rs.getLong("oid"))) {
                             continue;
                         }
-                        define(new ObjectId(ObjectKind.OTHER, rs.getString("name")),
-                                "cast", Map.of());
+                        final var id = new ObjectId(ObjectKind.OTHER,
+                                rs.getString("name"));
+                        otherOid("pg_cast", rs.getLong("oid"), id);
+                        define(id, "cast", Map.of());
                     }
                 }
             }
@@ -1349,8 +1372,10 @@ public final class PgCatalog {
                         if (extMember(rs.getLong("oid"))) {
                             continue;
                         }
-                        define(new ObjectId(ObjectKind.OTHER, rs.getString("name")),
-                                "transform", Map.of());
+                        final var id = new ObjectId(ObjectKind.OTHER,
+                                rs.getString("name"));
+                        otherOid("pg_transform", rs.getLong("oid"), id);
+                        define(id, "transform", Map.of());
                     }
                 }
             }
@@ -1375,6 +1400,7 @@ public final class PgCatalog {
                         final var id = new ObjectId(ObjectKind.OTHER,
                                 rs.getString("name"));
                         langByOid.put(rs.getLong("oid"), id);
+                        otherOid("pg_language", rs.getLong("oid"), id);
                         define(id, "language", Map.of());
                     }
                 }
@@ -1777,6 +1803,43 @@ public final class PgCatalog {
                     }
                 }
             }
+            // unsupported objects -> the managed objects they depend on.
+            // An OTHER object can never be recreated, so a dependent one must
+            // block a drop or recreate of what it uses (5.8.3): a rule or an
+            // exclusion constraint dies with its table, a cast or a range on
+            // our type blocks dropping it, a language blocks its handlers.
+            try (PreparedStatement ps = conn.prepareStatement("""
+                    SELECT d.classid::regclass::text AS cls, d.objid,
+                           d.refclassid::regclass::text AS refcls, d.refobjid AS dep
+                    FROM pg_depend d
+                    WHERE d.classid IN ('pg_type'::regclass,'pg_language'::regclass,
+                                        'pg_rewrite'::regclass,'pg_statistic_ext'::regclass,
+                                        'pg_cast'::regclass,'pg_transform'::regclass,
+                                        'pg_conversion'::regclass,'pg_operator'::regclass,
+                                        'pg_opclass'::regclass,'pg_opfamily'::regclass,
+                                        'pg_ts_config'::regclass,'pg_ts_dict'::regclass,
+                                        'pg_ts_parser'::regclass,'pg_ts_template'::regclass)
+                      AND d.refclassid IN ('pg_class'::regclass,'pg_proc'::regclass,
+                                           'pg_type'::regclass,'pg_collation'::regclass,
+                                           'pg_language'::regclass,'pg_constraint'::regclass)
+                    """)) {
+                try (ResultSet rs = ps.executeQuery()) {
+                    while (rs.next()) {
+                        final var map = otherByOid.get(rs.getString("cls"));
+                        final var from = map == null ? null : map.get(rs.getLong("objid"));
+                        if (from == null) {
+                            continue;
+                        }
+                        final var ref = rs.getLong("dep");
+                        final var to = switch (rs.getString("refcls")) {
+                            case "pg_constraint" -> conByOid.get(ref);
+                            case "pg_collation" -> collByOid.get(ref);
+                            default -> byOid(ref);
+                        };
+                        dep(from, to);
+                    }
+                }
+            }
         }
 
         void loadExternalDependents(Connection conn) throws SQLException {
@@ -1864,9 +1927,77 @@ public final class PgCatalog {
                     WHERE d.classid = 'pg_class'::regclass
                       AND d.refclassid IN ('pg_proc'::regclass, 'pg_type'::regclass)
                       AND rn.nspname <> ?
+                    UNION
+                    -- columns (objsubid > 0) and typed tables (objsubid = 0) in
+                    -- other namespaces typed by or collated with our objects
+                    SELECT DISTINCT d.refobjid, rn.nspname,
+                           rc.relname || CASE WHEN a.attname IS NULL THEN ''
+                                              ELSE '.' || a.attname END
+                    FROM pg_depend d
+                    JOIN pg_class rc ON rc.oid = d.objid
+                    JOIN pg_namespace rn ON rn.oid = rc.relnamespace AND rn.nspname <> ?
+                    LEFT JOIN pg_attribute a ON a.attrelid = d.objid
+                        AND a.attnum = d.objsubid AND a.attnum > 0
+                        AND NOT a.attisdropped
+                    WHERE d.classid = 'pg_class'::regclass AND d.deptype = 'n'
+                      AND d.refclassid IN ('pg_type'::regclass, 'pg_collation'::regclass)
+                    UNION
+                    -- types (domains, ranges, base types) in other namespaces
+                    -- built on ours or calling our routines in defaults
+                    SELECT DISTINCT d.refobjid, tn.nspname, t.typname
+                    FROM pg_depend d
+                    JOIN pg_type t ON t.oid = d.objid
+                    JOIN pg_namespace tn ON tn.oid = t.typnamespace AND tn.nspname <> ?
+                    WHERE d.classid = 'pg_type'::regclass
+                      AND d.refclassid IN ('pg_type'::regclass, 'pg_proc'::regclass,
+                                           'pg_collation'::regclass)
+                    UNION
+                    -- check constraints on other namespaces' domains whose
+                    -- expressions use our objects
+                    SELECT DISTINCT d.refobjid, dn.nspname,
+                           dt.typname || '.' || c.conname
+                    FROM pg_depend d
+                    JOIN pg_constraint c ON c.oid = d.objid AND c.contypid <> 0
+                    JOIN pg_type dt ON dt.oid = c.contypid
+                    JOIN pg_namespace dn ON dn.oid = dt.typnamespace AND dn.nspname <> ?
+                    WHERE d.classid = 'pg_constraint'::regclass
+                      AND d.refclassid IN ('pg_proc'::regclass, 'pg_type'::regclass,
+                                           'pg_class'::regclass)
+                    UNION
+                    -- policies on other namespaces' tables whose expressions
+                    -- use our objects
+                    SELECT DISTINCT d.refobjid, rn.nspname,
+                           rc.relname || '.' || po.polname
+                    FROM pg_depend d
+                    JOIN pg_policy po ON po.oid = d.objid
+                    JOIN pg_class rc ON rc.oid = po.polrelid
+                    JOIN pg_namespace rn ON rn.oid = rc.relnamespace AND rn.nspname <> ?
+                    WHERE d.classid = 'pg_policy'::regclass
+                      AND d.refclassid IN ('pg_proc'::regclass, 'pg_type'::regclass,
+                                           'pg_class'::regclass)
+                    UNION
+                    -- casts not anchored to this namespace (by function or by
+                    -- either type — the loadOther anchor rule) that still use
+                    -- our types or routines
+                    SELECT DISTINCT d.refobjid,
+                           coalesce(pn.nspname, sn.nspname, dtn.nspname, '-'),
+                           'cast(' || ca.castsource::regtype::text || ' AS '
+                                  || ca.casttarget::regtype::text || ')'
+                    FROM pg_depend d
+                    JOIN pg_cast ca ON ca.oid = d.objid
+                    LEFT JOIN pg_proc p ON p.oid = ca.castfunc
+                    LEFT JOIN pg_namespace pn ON pn.oid = p.pronamespace
+                    JOIN pg_type st ON st.oid = ca.castsource
+                    JOIN pg_namespace sn ON sn.oid = st.typnamespace
+                    JOIN pg_type tt ON tt.oid = ca.casttarget
+                    JOIN pg_namespace dtn ON dtn.oid = tt.typnamespace
+                    WHERE d.classid = 'pg_cast'::regclass
+                      AND pn.nspname IS DISTINCT FROM ?
+                      AND sn.nspname IS DISTINCT FROM ?
+                      AND dtn.nspname IS DISTINCT FROM ?
                     """;
             try (PreparedStatement ps = conn.prepareStatement(sql)) {
-                for (var i = 1; i <= 12; i++) {
+                for (var i = 1; i <= 19; i++) {
                     ps.setString(i, ns);
                 }
                 try (ResultSet rs = ps.executeQuery()) {

@@ -235,6 +235,34 @@ class PostgreSqlDependenciesTest {
     }
 
     @Test
+    @DisplayName("an unsupported cast dependent on a recreated routine fails planning (5.8.3)")
+    void otherDependentOnRecreatedRoutine() throws Exception {
+        final var ns = namespace();
+        try {
+            PgTestDatabase.execute(ds, "CREATE TYPE " + dialect.quoteIdentifier(ns)
+                    + ".mood AS ENUM ('a','b')");
+            PgTestDatabase.execute(ds, "CREATE FUNCTION " + dialect.quoteIdentifier(ns)
+                    + ".mk(int) RETURNS " + dialect.quoteIdentifier(ns)
+                    + ".mood LANGUAGE sql IMMUTABLE AS $$SELECT 'a'::"
+                    + dialect.quoteIdentifier(ns) + ".mood$$");
+            PgTestDatabase.execute(ds, "CREATE CAST (int AS "
+                    + dialect.quoteIdentifier(ns) + ".mood) WITH FUNCTION "
+                    + dialect.quoteIdentifier(ns) + ".mk(int)");
+            // a different return type forces a DROP + CREATE, which the
+            // unrecreatable cast must block at plan time (P4)
+            final var r = reconciler(ns, """
+                    CREATE TYPE ${namespace}.mood AS ENUM ('a','b');
+                    CREATE FUNCTION ${namespace}.mk(int) RETURNS int
+                        LANGUAGE sql IMMUTABLE AS $$SELECT 7$$;
+                    """);
+            final var e = assertThrows(PlanningException.class, r::plan);
+            assertTrue(e.getMessage().contains("cast:integer->mood"), e.getMessage());
+        } finally {
+            drop(ns);
+        }
+    }
+
+    @Test
     @DisplayName("every construct a desired script creates is detected, applied or reported (5.4)")
     void unsupportedConstructsDetected() throws Exception {
         final var ns = namespace();
