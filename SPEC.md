@@ -941,9 +941,11 @@ Name scopes (`nameScopes`, 5.8.7). Tables, views, materialized views, sequences 
 |---|---|
 | `TABLE`, `VIEW`, `MATERIALIZED_VIEW`, `SEQUENCE`, `INDEX`, `OTHER` relations | `relation:<name>` |
 | `TYPE`, `DOMAIN`, `OTHER` types (`type:`) | `relation:<name>` (the shared type/relation namespace) |
+| `ROUTINE`, `OTHER` routines (`routine:` aggregates, window functions) | `routine:<name>(<signature>)` |
 | `PRIMARY_KEY`, `UNIQUE` | `relation:<name>`, `constraint:<parent>.<name>` |
 | `FOREIGN_KEY`, `CHECK` | `constraint:<parent>.<name>` |
-| `COLUMN`, `ROUTINE`, `TRIGGER`, `POLICY`, `EXTENSION`, `COMMENT` | none (the `ObjectId` is already the engine's uniqueness key) |
+| `OTHER` constraints (`constraint:` exclusion constraints) | `constraint:<parent>.<name>`, `relation:<name>` (the backing index) |
+| `COLUMN`, `TRIGGER`, `POLICY`, `EXTENSION`, `COMMENT` | none (the `ObjectId` is already the engine's uniqueness key) |
 
 ### A.6 Rendering
 
