@@ -10,7 +10,7 @@ Vendor-neutral, declarative, data-safe schema reconciler for Java (spec: `SPEC.m
 
 ## Build
 
-Java 25, Maven 3.9+. `mvn verify` builds all three JPMS modules and runs every test.
+Java 25, Maven 3.9+. `mvn verify` builds all three modules and runs every test. Core and the PostgreSQL dialect are JPMS-modular; the TCK ships as an automatic module (`Automatic-Module-Name`).
 
 ## Tests
 

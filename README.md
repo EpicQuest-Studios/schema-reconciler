@@ -114,7 +114,7 @@ Environments that cannot grant `CREATE ON DATABASE` point `scratchDataSource` at
 
 ## Build
 
-Requires Java 25 and Maven 3.9+. `mvn verify` builds all three JPMS modules and runs every test.
+Requires Java 25 and Maven 3.9+. `mvn verify` builds all three modules and runs every test. Core and the PostgreSQL dialect are JPMS-modular; the TCK ships as an automatic module.
 
 Core tests run against an in-memory fake database. The PostgreSQL dialect tests need a PostgreSQL 14+ database; without configuration they start a Testcontainers `postgres:18` container, or you can point them at an existing one:
 
