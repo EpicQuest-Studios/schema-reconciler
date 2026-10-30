@@ -408,10 +408,20 @@ public final class PgRender {
                         "drifted " + id));
             }
             case ROUTINE -> {
-                final var wantReturn = want.attributes().get(PgCatalog.RETURN_TYPE);
-                final var haveReturn = returnTypeOf(difference.actual()
-                        .map(d -> d.canonical()).orElse(""));
-                if (wantReturn != null && wantReturn.equals(haveReturn)) {
+                final var haveDef = difference.actual()
+                        .map(d -> d.canonical()).orElse("");
+                final var wantProcedure = "p".equals(
+                        want.attributes().getOrDefault(PgCatalog.PROKIND, "f"));
+                final var haveProcedure = haveDef.startsWith(
+                        "CREATE OR REPLACE PROCEDURE");
+                // a procedure has no RETURNS clause to compare; a function
+                // alters in place only while its return type is unchanged
+                final var inPlace = wantProcedure
+                        ? haveProcedure
+                        : !haveProcedure && Objects.equals(
+                                want.attributes().get(PgCatalog.RETURN_TYPE),
+                                returnTypeOf(haveDef));
+                if (inPlace) {
                     yield List.of(new PlannedChange(0, id, ChangeAction.ALTER,
                             ChangeSafety.REBUILD, List.of(bind(want, PgCatalog.CREATE_SQL, ns)),
                             Optional.of(want.definition()), "drifted " + id));
