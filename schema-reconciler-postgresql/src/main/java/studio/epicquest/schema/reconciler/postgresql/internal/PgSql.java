@@ -43,6 +43,12 @@ public final class PgSql {
                 .replaceAll(Matcher.quoteReplacement("${namespace}."));
     }
 
+    /** One trailing {@code ;}, trimmed — deparsed definitions carry one. */
+    public static String dropTerminator(String text) {
+        final var t = text.stripTrailing();
+        return t.endsWith(";") ? t.substring(0, t.length() - 1).stripTrailing() : t;
+    }
+
     /**
      * Rule 5.3(2): whitespace runs outside string literals, quoted identifiers
      * and dollar-quoted bodies collapse to one space; the result is trimmed.

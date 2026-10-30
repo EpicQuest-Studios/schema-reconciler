@@ -285,7 +285,7 @@ public final class PostgreSqlDialect implements Dialect {
             return List.of();
         }
         return java.util.Arrays.stream(dump.split("\0"))
-                .map(s -> s.endsWith(";") ? s.substring(0, s.length() - 1) : s)
+                .map(PgSql::dropTerminator)
                 .toList();
     }
 

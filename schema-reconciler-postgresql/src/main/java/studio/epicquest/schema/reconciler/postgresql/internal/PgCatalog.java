@@ -1521,10 +1521,13 @@ public final class PgCatalog {
             final var o = objects.get(target);
             final var kind = o.attrs.getOrDefault(PROKIND, "f").equals("p")
                     ? "PROCEDURE" : "FUNCTION";
-            final var paren = target.name().indexOf('(');
-            final var fname = paren > 0 ? target.name().substring(0, paren)
-                    : target.name();
+            // the id name was built as proname + "(" + sigargs + ")" — strip
+            // that exact suffix so a quoted proname containing '(' survives
             final var sigargs = o.attrs.getOrDefault(SIG_ARGS, "");
+            final var suffix = "(" + sigargs + ")";
+            final var fname = target.name().endsWith(suffix)
+                    ? target.name().substring(0, target.name().length() - suffix.length())
+                    : target.name();
             return "COMMENT ON " + kind + " ${namespace}."
                     + PgIdentifiers.quote(fname) + "(" + sigargs + ")";
         }
@@ -1947,7 +1950,12 @@ public final class PgCatalog {
                         yield create == null ? List.<String>of()
                                 : List.of(Boolean.parseBoolean(
                                         o.attrs.getOrDefault(POPULATED, "true"))
-                                        ? create : create + " WITH NO DATA");
+                                        ? create
+                                        // CREATE_SQL embeds pg_get_viewdef's
+                                        // trailing ';' — WITH NO DATA must
+                                        // follow the query, not the ';'
+                                        : PgSql.dropTerminator(create)
+                                                + " WITH NO DATA");
                     }
                     case SEQUENCE -> foldedSequence(id)
                             ? List.<String>of()

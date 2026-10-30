@@ -152,7 +152,8 @@ public final class PgRender {
         final var create = want.attributes().get(PgCatalog.CREATE_SQL);
         final var populated = Boolean.parseBoolean(
                 want.attributes().getOrDefault(PgCatalog.POPULATED, "true"));
-        return List.of(bind(populated ? create : create + " WITH NO DATA", ns));
+        return List.of(bind(populated ? create
+                : PgSql.dropTerminator(create) + " WITH NO DATA", ns));
     }
 
     private static String tablePersistence(SchemaSnapshot desired, ObjectId table) {

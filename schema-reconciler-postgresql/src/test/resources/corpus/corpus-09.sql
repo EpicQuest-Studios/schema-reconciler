@@ -14,5 +14,6 @@ COMMENT ON TABLE fixture.t IS 'governed table';
 COMMENT ON COLUMN fixture.t.id IS 'primary identifier';
 COMMENT ON POLICY p_sel ON fixture.t IS 'select restriction';
 CREATE MATERIALIZED VIEW fixture.mv AS SELECT id, mood, note FROM fixture.t;
+CREATE MATERIALIZED VIEW fixture.mv_empty AS SELECT id FROM fixture.t WITH NO DATA;
 CREATE INDEX mv_mood ON fixture.mv (mood);
 COMMENT ON MATERIALIZED VIEW fixture.mv IS 'denormalised read model';
