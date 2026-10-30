@@ -35,6 +35,10 @@ public final class PostgreSqlDialect implements Dialect {
     private static final String SAVEPOINT = "rcl_scratch";
     private static final String LOCK_KEY_PREFIX = "studio.epicquest.schema.reconciler:";
 
+    /** Creates the dialect — stateless, safe to share. */
+    public PostgreSqlDialect() {
+    }
+
     @Override
     public String id() {
         return "postgresql";
@@ -58,13 +62,15 @@ public final class PostgreSqlDialect implements Dialect {
     @Override
     public void acquireLock(Connection connection, String namespace, Duration timeout)
             throws SQLException {
-        try (Statement s = connection.createStatement()) {
-            // a positive duration below one millisecond must still bound the wait
-            s.execute("SET LOCAL lock_timeout = '" + Math.max(1L, timeout.toMillis()) + "ms'");
+        try (Statement s = connection.createStatement();
+             PreparedStatement lock = connection.prepareStatement(
+                     "SELECT pg_advisory_xact_lock(hashtextextended("
+                             + "'" + LOCK_KEY_PREFIX + "'"
+                             + " || current_database() || ':' || ?, 0))")) {
+            s.execute("SET LOCAL lock_timeout = '" + millisBounded(timeout) + "ms'");
             try {
-                s.execute("SELECT pg_advisory_xact_lock(hashtextextended("
-                        + "'" + LOCK_KEY_PREFIX + "' || current_database() || ':' || "
-                        + "'" + escapeLiteral(namespace) + "', 0))");
+                lock.setString(1, namespace);
+                lock.execute();
             } catch (SQLException e) {
                 if ("55P03".equals(e.getSQLState())) {
                     throw new LockTimeoutException("namespace '" + namespace
@@ -93,8 +99,7 @@ public final class PostgreSqlDialect implements Dialect {
     @Override
     public void statementTimeout(Connection connection, Duration timeout) throws SQLException {
         try (Statement s = connection.createStatement()) {
-            s.execute("SET LOCAL statement_timeout = '"
-                    + Math.max(1L, timeout.toMillis()) + "ms'");
+            s.execute("SET LOCAL statement_timeout = '" + millisBounded(timeout) + "ms'");
         }
     }
 
@@ -131,7 +136,8 @@ public final class PostgreSqlDialect implements Dialect {
                 // transaction — remove the committed schema explicitly (A.3)
                 rollbackQuietly(connection);
                 s.execute("SELECT pg_advisory_unlock_all()");
-                s.execute("DROP SCHEMA " + PgIdentifiers.quote(scratchNamespace) + " CASCADE");
+                s.execute("DROP SCHEMA IF EXISTS " + PgIdentifiers.quote(scratchNamespace)
+                        + " CASCADE");
                 connection.commit();
                 throw new DesiredStateException("the desired script left the transaction: "
                         + "the run's savepoint is gone (" + e.getMessage() + ")", e);
@@ -228,15 +234,16 @@ public final class PostgreSqlDialect implements Dialect {
         return PgRender.nameScopes(id);
     }
 
+    /** A positive duration below one millisecond must still bound the wait. */
+    private static long millisBounded(Duration timeout) {
+        return Math.max(1L, timeout.toMillis());
+    }
+
     private static void rollbackQuietly(Connection connection) {
         try {
             connection.rollback();
         } catch (SQLException ignored) {
             // best effort — the connection is already on its way out
         }
-    }
-
-    private static String escapeLiteral(String value) {
-        return value.replace("'", "''");
     }
 }

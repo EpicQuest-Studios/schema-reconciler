@@ -3,6 +3,7 @@ package studio.epicquest.schema.reconciler.postgresql.internal;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
+import java.util.Set;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -83,9 +84,14 @@ public final class PgSql {
 
     /**
      * Splits a script into top-level statements (separated by {@code ;}) and
-     * extracts each statement's tokens outside string literals, quoted
-     * identifiers, dollar-quoted bodies and comments. Tokens are upper-cased
-     * keywords/punctuation — enough for the statement checks of spec 3.2.
+     * extracts each statement's tokens outside string literals, dollar-quoted
+     * bodies and comments. Tokens are upper-cased keywords/punctuation plus
+     * quoted identifiers verbatim with their quotes — the quotes distinguish
+     * a case-sensitive {@code "Schema".t} reference from a keyword, which the
+     * checks of spec 3.2 need. A {@code BEGIN ATOMIC … END} routine body
+     * (SQL-standard routine syntax) is opaque like a literal: its {@code ;}s
+     * separate body statements, not script statements, and its tokens are
+     * not part of the outer statement.
      */
     public static List<StatementTokens> statements(String script) {
         final var out = new ArrayList<StatementTokens>();
@@ -100,6 +106,16 @@ public final class PgSql {
                 addStatement(out, script, stmtStart, i);
                 i++;
                 stmtStart = i;
+            } else if (isIdentStart(script.charAt(i))) {
+                final var end = wordEnd(script, i);
+                if (word(script, i, end).equals("BEGIN")) {
+                    final var next = nextWord(script, end);
+                    if (next != null && word(script, next[0], next[1]).equals("ATOMIC")) {
+                        i = atomicBodyEnd(script, next[1]);
+                        continue;
+                    }
+                }
+                i = end;
             } else {
                 i++;
             }
@@ -115,7 +131,7 @@ public final class PgSql {
             final var span = nextSpan(script, i);
             if (span != null) {
                 if (span[2] == SPAN_IDENT_QUOTED) {
-                    tokens.add(script.substring(i + 1, span[1] - 1).replace("\"\"", "\""));
+                    tokens.add(script.substring(i, span[1]));
                 }
                 i = span[1];
                 continue;
@@ -127,6 +143,14 @@ public final class PgSql {
                 var j = i + 1;
                 while (j < to && isIdentPart(script.charAt(j))) {
                     j++;
+                }
+                if (script.substring(i, j).equalsIgnoreCase("BEGIN")) {
+                    final var next = nextWord(script, j);
+                    if (next != null && next[1] <= to
+                            && script.substring(next[0], next[1]).equalsIgnoreCase("ATOMIC")) {
+                        i = atomicBodyEnd(script, next[1]);
+                        continue;
+                    }
                 }
                 tokens.add(script.substring(i, j).toUpperCase(Locale.ROOT));
                 i = j;
@@ -142,8 +166,12 @@ public final class PgSql {
         }
     }
 
-    /** The text inside each dollar-quoted body of {@code text} (tags excluded). */
-    public static List<String> dollarBodies(String text) {
+    /**
+     * The text inside each string or dollar-quoted literal of {@code text}
+     * (delimiters excluded, escapes not decoded) — the bodies a {@code DO}
+     * or {@code EXECUTE} statement hands to the inner check.
+     */
+    public static List<String> literalBodies(String text) {
         final var out = new ArrayList<String>();
         var i = 0;
         while (i < text.length()) {
@@ -152,22 +180,180 @@ public final class PgSql {
                 i++;
                 continue;
             }
-            if (span[2] == SPAN_DOLLAR) {
-                final var tag = dollarTag(text, i);
-                final var innerEnd = text.startsWith(tag, span[1] - tag.length())
-                        && span[1] - tag.length() >= i + tag.length()
-                        ? span[1] - tag.length() : span[1];
-                out.add(text.substring(i + tag.length(), innerEnd));
+            if (span[2] == SPAN_STRING || span[2] == SPAN_DOLLAR) {
+                out.add(literalBody(text, span));
             }
             i = span[1];
         }
         return out;
     }
 
+    /** The content (delimiters excluded) of a string or dollar-quoted span. */
+    private static String literalBody(String text, int[] span) {
+        if (span[2] == SPAN_STRING) {
+            // an unterminated span ends at the text length with no closing
+            // quote — only strip a real closing delimiter, never content
+            final var closed = span[1] - 1 > span[0] && text.charAt(span[1] - 1) == '\'';
+            return text.substring(span[0] + 1, closed ? span[1] - 1 : span[1]);
+        }
+        final var tag = dollarTag(text, span[0]);
+        final var innerEnd = text.startsWith(tag, span[1] - tag.length())
+                && span[1] - tag.length() >= span[0] + tag.length()
+                ? span[1] - tag.length() : span[1];
+        return text.substring(span[0] + tag.length(), innerEnd);
+    }
+
     private static final int SPAN_STRING = 1;
     private static final int SPAN_IDENT_QUOTED = 2;
     private static final int SPAN_DOLLAR = 3;
     private static final int SPAN_COMMENT = 4;
+
+    /** Block-closing keywords that may trail an {@code END} ({@code END IF}, {@code END LOOP}, …). */
+    private static final Set<String> END_TRAILERS = Set.of(
+            "IF", "LOOP", "CASE", "WHILE", "FOR", "REPEAT");
+
+    /** The end of the identifier starting at {@code pos}. */
+    private static int wordEnd(String text, int pos) {
+        var i = pos + 1;
+        while (i < text.length() && isIdentPart(text.charAt(i))) {
+            i++;
+        }
+        return i;
+    }
+
+    /** The upper-cased word between {@code from} and {@code to}. */
+    private static String word(String text, int from, int to) {
+        return text.substring(from, to).toUpperCase(Locale.ROOT);
+    }
+
+    /** Whitespace and comments. */
+    private static int skipFiller(String text, int i) {
+        while (i < text.length()) {
+            if (Character.isWhitespace(text.charAt(i))) {
+                i++;
+                continue;
+            }
+            final var span = nextSpan(text, i);
+            if (span != null && span[2] == SPAN_COMMENT) {
+                i = span[1];
+                continue;
+            }
+            break;
+        }
+        return i;
+    }
+
+    /** {@code {start, end}} of the next identifier after {@code from}, or {@code null}. */
+    private static int[] nextWord(String text, int from) {
+        final var i = skipFiller(text, from);
+        return i < text.length() && isIdentStart(text.charAt(i))
+                ? new int[] {i, wordEnd(text, i)} : null;
+    }
+
+    /** The index right after the parenthesized group opening at {@code open}. */
+    private static int skipParen(String text, int open) {
+        var depth = 0;
+        for (var i = open; i < text.length(); i++) {
+            final var span = nextSpan(text, i);
+            if (span != null) {
+                i = span[1] - 1;
+                continue;
+            }
+            if (text.charAt(i) == '(') {
+                depth++;
+            } else if (text.charAt(i) == ')' && --depth == 0) {
+                return i + 1;
+            }
+        }
+        return text.length();
+    }
+
+    /**
+     * Whether the {@code FOR} at {@code from} opens a loop — {@code FOR var
+     * [, var] IN …} — rather than starting a row-lock clause ({@code FOR
+     * UPDATE}), a cursor query ({@code OPEN c FOR SELECT …}) or a cursor
+     * declaration. The operand is a word, comma or parenthesized list and
+     * the loop form ends it with {@code IN}.
+     */
+    private static boolean forIsLoop(String text, int from) {
+        var i = from;
+        for (;;) {
+            i = skipFiller(text, i);
+            if (i >= text.length()) {
+                return false;
+            }
+            final var c = text.charAt(i);
+            if (isIdentStart(c)) {
+                if (word(text, i, wordEnd(text, i)).equals("IN")) {
+                    return true;
+                }
+                i = wordEnd(text, i);
+            } else if (c == '(') {
+                i = skipParen(text, i);
+            } else if (c == ',') {
+                i++;
+            } else {
+                return false;
+            }
+        }
+    }
+
+    /**
+     * The end of the {@code BEGIN ATOMIC} routine body whose {@code ATOMIC}
+     * keyword ended at {@code from}. The body runs to its matching {@code
+     * END}; nested compound blocks and {@code CASE} expressions open and
+     * close inside it, and {@code FOR}/{@code WHILE} headers merge with the
+     * {@code LOOP} that follows them.
+     */
+    private static int atomicBodyEnd(String text, int from) {
+        final var blocks = new ArrayList<String>(2);
+        blocks.add("BEGIN");
+        var i = from;
+        final var n = text.length();
+        while (i < n) {
+            final var span = nextSpan(text, i);
+            if (span != null) {
+                i = span[1];
+                continue;
+            }
+            final var c = text.charAt(i);
+            if (!isIdentStart(c)) {
+                i++;
+                continue;
+            }
+            final var end = wordEnd(text, i);
+            final var w = word(text, i, end);
+            switch (w) {
+                case "BEGIN", "CASE", "IF", "WHILE", "REPEAT" -> blocks.add(w);
+                case "FOR" -> {
+                    if (forIsLoop(text, end)) {
+                        blocks.add("FOR");
+                    }
+                }
+                case "LOOP" -> {
+                    final var top = blocks.get(blocks.size() - 1);
+                    if (!top.equals("FOR") && !top.equals("WHILE")) {
+                        blocks.add("LOOP");
+                    }
+                }
+                case "END" -> {
+                    blocks.remove(blocks.size() - 1);
+                    final var trailer = nextWord(text, end);
+                    if (blocks.isEmpty()) {
+                        return trailer == null ? end : trailer[1];
+                    }
+                    if (trailer != null
+                            && END_TRAILERS.contains(word(text, trailer[0], trailer[1]))) {
+                        i = trailer[1];
+                        continue;
+                    }
+                }
+                default -> { }
+            }
+            i = end;
+        }
+        return n;
+    }
 
     /**
      * If a literal/comment span starts at {@code pos}, returns

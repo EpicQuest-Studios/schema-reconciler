@@ -57,6 +57,21 @@ class ScriptProcessorTest {
     }
 
     @Test
+    void literalTargetScanRespectsQuotedCase() {
+        // "COREX" quoted is a different namespace from corex — unquoted COREX
+        // folds to corex, but quoting makes the name case-sensitive
+        assertEquals("SELECT * FROM \"COREX\".t",
+                process("SELECT * FROM \"COREX\".t").substituted());
+        // a mixed-case target is only reachable quoted — bare references fold
+        // away and can never name it
+        final var p = new ScriptProcessor(
+                "SELECT * FROM app.t", "App", "rcl_scratch_1", dialect);
+        assertEquals("SELECT * FROM app.t", p.substituted());
+        assertThrows(DesiredStateException.class,
+                () -> new ScriptProcessor("SELECT * FROM \"App\".t", "App", "s", dialect));
+    }
+
+    @Test
     void similarNamesAreNotTheTarget() {
         // identifier prefix/suffix: not the namespace token
         assertEquals("SELECT * FROM corex2.t", process("SELECT * FROM corex2.t").substituted());

@@ -42,7 +42,7 @@ import studio.epicquest.schema.reconciler.model.SchemaSnapshot;
 import studio.epicquest.schema.reconciler.spi.Dialect;
 
 /**
- * The dialect conformance suite of spec 9.2 — scenarios C-01 to C-32. A dialect
+ * The dialect conformance suite of spec 9.2 — scenarios C-01 to C-36. A dialect
  * is run by subclassing this class and providing a disposable database plus
  * per-test namespaces via the hooks below. Skips are permitted only for kinds
  * absent from {@code supportedKinds()} or undeclared capabilities, and every
@@ -441,6 +441,7 @@ public abstract class DialectConformanceTest {
 
         final var report = reconciler(script).reconcile();
         assertEquals(ReconcileOutcome.RECONCILED, report.outcome());
+        assertTrue(present(routine("bump", "")));
         assertTrue(present(trigger("users", "users_bump")));
     }
 

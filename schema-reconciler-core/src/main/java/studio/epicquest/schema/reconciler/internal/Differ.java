@@ -3,6 +3,7 @@ package studio.epicquest.schema.reconciler.internal;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
+import studio.epicquest.schema.reconciler.model.Definition;
 import studio.epicquest.schema.reconciler.model.Difference;
 import studio.epicquest.schema.reconciler.model.DifferenceType;
 import studio.epicquest.schema.reconciler.model.ObjectIds;
@@ -57,7 +58,7 @@ final class Differ {
         return "true".equals(object.attributes().get(Dialect.EXTERNAL_DEPENDENT_ATTRIBUTE));
     }
 
-    private static Optional<studio.epicquest.schema.reconciler.model.Definition> definitionOf(SchemaObject o) {
+    private static Optional<Definition> definitionOf(SchemaObject o) {
         return o == null ? Optional.empty() : Optional.of(o.definition());
     }
 

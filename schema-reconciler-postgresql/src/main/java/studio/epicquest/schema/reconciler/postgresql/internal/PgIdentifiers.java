@@ -79,10 +79,15 @@ public final class PgIdentifiers {
         return false;
     }
 
-    /** A scratch namespace name (6.3.1): {@code <target>__rcl_<12 hex>}, truncated to 63 bytes. */
+    /**
+     * A scratch namespace name (6.3.1): {@code <target>__rcl_<12 hex>},
+     * truncated to 63 bytes. The prefix is lower-cased: unquoted references
+     * fold to lowercase, so only a fold-safe scratch name makes the script
+     * check's case-insensitive qualifier comparison sound.
+     */
     public static String scratchName(String targetNamespace, long seed) {
         final var suffix = "__rcl_" + String.format("%012x", seed);
-        var prefix = targetNamespace;
+        var prefix = targetNamespace.toLowerCase(Locale.ROOT);
         final var max = 63 - suffix.length();
         if (prefix.getBytes(StandardCharsets.UTF_8).length > max) {
             // truncate on a UTF-8 boundary

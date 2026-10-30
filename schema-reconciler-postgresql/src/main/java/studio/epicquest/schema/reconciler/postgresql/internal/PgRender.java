@@ -400,7 +400,7 @@ public final class PgRender {
     }
 
     /** Extracts the {@code RETURNS <type>} clause from a normalised function definition. */
-    static String returnTypeOf(String functionDef) {
+    private static String returnTypeOf(String functionDef) {
         final var matcher = Pattern
                 .compile("\\bRETURNS (.+?) LANGUAGE\\b").matcher(functionDef);
         return matcher.find() ? matcher.group(1) : null;

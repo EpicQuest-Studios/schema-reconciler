@@ -1,5 +1,6 @@
 package studio.epicquest.schema.reconciler.internal;
 
+import java.util.Locale;
 import java.util.regex.Pattern;
 import studio.epicquest.schema.reconciler.DesiredStateException;
 import studio.epicquest.schema.reconciler.spi.Dialect;
@@ -63,17 +64,24 @@ public final class ScriptProcessor {
 
     /**
      * Spec 3.2 rule 5: rejects literal references to the target namespace —
-     * bare or in identifier quotes, case-insensitive, immediately followed by
-     * {@code .}, not preceded by an identifier character or {@code .}. The scan
-     * runs on text with the placeholders masked out, so {@code ${namespace}.}
-     * can never trip it even if the target is literally named "namespace".
+     * bare or in identifier quotes, immediately followed by {@code .}, not
+     * preceded by an identifier character or {@code .}. The comparison is the
+     * mirror image of namespace normalisation: the quoted form is exact
+     * ({@code "APP"} is not {@code app}), and the bare form is matched
+     * case-insensitively only when the target is fold-safe — unquoted
+     * references fold to lowercase, so they cannot name a mixed-case target
+     * anyway. The scan runs on text with the placeholders masked out, so
+     * {@code ${namespace}.} can never trip it even if the target is
+     * literally named "namespace".
      */
     private static void checkLiteralTarget(String script, String targetNamespace, Dialect dialect) {
         final var masked = maskPlaceholders(script);
+        var alternatives = Pattern.quote(dialect.quoteIdentifier(targetNamespace));
+        if (targetNamespace.equals(targetNamespace.toLowerCase(Locale.ROOT))) {
+            alternatives += "|(?i:" + Pattern.quote(targetNamespace) + ")";
+        }
         final var pattern = Pattern.compile(
-                "(?<![A-Za-z0-9_$.])(?:" + Pattern.quote(targetNamespace) + "|"
-                        + Pattern.quote(dialect.quoteIdentifier(targetNamespace)) + ")\\.",
-                Pattern.CASE_INSENSITIVE);
+                "(?<![A-Za-z0-9_$.])(?:" + alternatives + ")\\.");
         final var matcher = pattern.matcher(masked);
         if (matcher.find()) {
             throw new DesiredStateException(
@@ -88,9 +96,9 @@ public final class ScriptProcessor {
         var i = 0;
         while (i < masked.length()) {
             int len;
-            if (indexOf(masked, ESCAPED, i) == i) {
+            if (masked.indexOf(ESCAPED, i) == i) {
                 len = ESCAPED.length();
-            } else if (indexOf(masked, TOKEN, i) == i) {
+            } else if (masked.indexOf(TOKEN, i) == i) {
                 len = TOKEN.length();
             } else {
                 i++;
@@ -100,10 +108,6 @@ public final class ScriptProcessor {
             i += len;
         }
         return masked.toString();
-    }
-
-    private static int indexOf(StringBuilder sb, String s, int from) {
-        return sb.indexOf(s, from);
     }
 
     private static String[] identifierQuote(Dialect dialect) {

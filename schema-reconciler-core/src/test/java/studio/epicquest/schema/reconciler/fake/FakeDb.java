@@ -25,6 +25,7 @@ import studio.epicquest.schema.reconciler.model.ObjectId;
 import studio.epicquest.schema.reconciler.model.ObjectIds;
 import studio.epicquest.schema.reconciler.model.ObjectKind;
 import studio.epicquest.schema.reconciler.model.SchemaObject;
+import studio.epicquest.schema.reconciler.spi.Dialect;
 
 /**
  * An in-memory database exposing JDBC proxies, so the whole engine can run in
@@ -113,7 +114,7 @@ public final class FakeDb {
     /** Builds an external-dependent marker object (spec 5.8.3). */
     public static SchemaObject externalDependent(ObjectId id, ObjectId... requires) {
         return new SchemaObject(id, new Definition(""), Set.of(requires),
-                Map.of(studio.epicquest.schema.reconciler.spi.Dialect.EXTERNAL_DEPENDENT_ATTRIBUTE,
+                Map.of(Dialect.EXTERNAL_DEPENDENT_ATTRIBUTE,
                         "true"));
     }
 
@@ -155,8 +156,7 @@ public final class FakeDb {
                 objects.put(id, new SchemaObject(id,
                         new Definition(parsed.def.orElse("")), parsed.requires,
                         parsed.compared
-                                ? Map.of(studio.epicquest.schema.reconciler.spi.Dialect
-                                        .CONTENT_COMPARED_ATTRIBUTE, "true")
+                                ? Map.of(Dialect.CONTENT_COMPARED_ATTRIBUTE, "true")
                                 : Map.of()));
             }
             case "DROP" -> {
@@ -246,7 +246,7 @@ public final class FakeDb {
             }
         }
         if ("true".equals(object.attributes().get(
-                studio.epicquest.schema.reconciler.spi.Dialect.CONTENT_COMPARED_ATTRIBUTE))) {
+                Dialect.CONTENT_COMPARED_ATTRIBUTE))) {
             sql.append(" COMPARED");
         }
         if (!object.definition().canonical().isEmpty()) {

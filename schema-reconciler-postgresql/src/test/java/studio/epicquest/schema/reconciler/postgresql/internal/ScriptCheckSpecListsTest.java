@@ -17,7 +17,12 @@ class ScriptCheckSpecListsTest {
                 "CREATE DATABASE d", "CREATE TABLESPACE ts LOCATION '/x'",
                 "CREATE SUBSCRIPTION s CONNECTION 'x' PUBLICATION p",
                 "BEGIN", "COMMIT", "ROLLBACK", "SAVEPOINT sp", "VACUUM", "CHECKPOINT",
-                "CLUSTER t", "DISCARD ALL", "LOAD 'x'", "REPACK t",
+                "DISCARD ALL", "LOAD 'x'",
+                // REPACK without a table, the USING INDEX-only form, and
+                // CONCURRENTLY cannot run inside a transaction block;
+                // REPACK t is confined like CLUSTER t and stays legal
+                "REPACK", "REPACK (VERBOSE)", "REPACK USING INDEX",
+                "REPACK (CONCURRENTLY) t", "REPACK (VERBOSE, CONCURRENTLY)",
                 "CREATE INDEX CONCURRENTLY i ON t (a)", "REINDEX SCHEMA scr",
                 // no namespace anchor
                 "CREATE PUBLICATION p FOR TABLE t", "ALTER PUBLICATION p ADD TABLE t",
@@ -30,14 +35,132 @@ class ScriptCheckSpecListsTest {
                 "ALTER TABLE t SET SCHEMA other", "GRANT admin_role TO member_role",
                 "REVOKE admin_role FROM member_role",
                 // session and utility statements
-                "LISTEN c", "NOTIFY c", "UNLISTEN c", "SELECT pg_advisory_lock(1)",
+                "SELECT pg_advisory_lock(1)",
                 "WAIT FOR LSN '0/0'", "SET search_path = x", "RESET search_path",
                 // namespace handling belongs to the core
                 "CREATE SCHEMA s", "DROP SCHEMA s",
-                // qualified by another schema
+                // qualified by another schema — in name position, ON/TO targets,
+                // name lists, and database-wide COMMENT/SECURITY LABEL targets
                 "CREATE TABLE other.t (a int)", "DROP TABLE other.t",
                 "CREATE INDEX i ON other.t (a)", "COMMENT ON TABLE other.t IS 'x'",
-                "GRANT SELECT ON other.t TO PUBLIC", "GRANT USAGE ON SCHEMA other TO PUBLIC"}) {
+                "GRANT SELECT ON other.t TO PUBLIC", "GRANT USAGE ON SCHEMA other TO PUBLIC",
+                "CREATE TABLE \"Other\".t (a int)", "CREATE TABLE \"SCR\".t (a int)",
+                "DROP TABLE t1, other.t2", "DROP RULE r ON other.t",
+                "CREATE RULE r AS ON SELECT TO other.t DO INSTEAD NOTHING",
+                "GRANT SELECT ON TABLE a, other.b TO PUBLIC",
+                "GRANT SELECT ON FOREIGN TABLE other.ft TO PUBLIC",
+                "GRANT USAGE ON FOREIGN SERVER s TO PUBLIC",
+                "GRANT USAGE ON SCHEMA scr, other TO PUBLIC",
+                "GRANT SELECT ON ALL TABLES IN SCHEMA scr, other TO r",
+                // the qualifier is an unreserved keyword the modifier scan skips
+                "CREATE TABLE exists.evil (a int)",
+                "CREATE TABLE if.evil (a int)",
+                "CREATE TABLE concurrently.evil (a int)",
+                "CREATE TEXT SEARCH CONFIGURATION other.cfg ()",
+                "CREATE OPERATOR FAMILY other.f USING btree",
+                "SELECT 1 INTO TEMP if.evil",
+                "COMMENT ON DATABASE d IS 'x'", "COMMENT ON SCHEMA other IS 'x'",
+                "COMMENT ON PROCEDURAL LANGUAGE plpgsql IS 'x'",
+                "SECURITY LABEL FOR p ON ROLE r IS 'x'",
+                "SELECT * INTO other.t FROM src", "SELECT INTO other.t FROM src",
+                "WITH x AS (SELECT 1) SELECT * INTO other.t FROM x",
+                "IMPORT FOREIGN SCHEMA r FROM SERVER s INTO other",
+                "ALTER INDEX ALL IN TABLESPACE ts", "ALTER LARGE OBJECT 1 OWNER TO u",
+                "ALTER TABLE t ATTACH PARTITION other.c",
+                "ALTER TABLE t DETACH PARTITION other.c",
+                "ALTER INDEX i ATTACH PARTITION other.pi",
+                // session statements, non-transactional sequence writes,
+                // and DO bodies
+                "DECLARE c CURSOR FOR SELECT 1", "EXECUTE x(1)", "DEALLOCATE x",
+                "COPY t TO STDOUT",
+                // bare CLUSTER re-clusters everything — cannot run in a
+                // transaction block; CLUSTER t is confined and stays legal
+                "CLUSTER", "CLUSTER VERBOSE", "CLUSTER (VERBOSE)",
+                "DISCARD PLANS", "DISCARD ALL", "PREPARE TRANSACTION 'x'",
+                "PREPARE q AS SELECT 1",
+
+                "CREATE VIEW v AS SELECT 1 INTO other.t",
+                "SELECT nextval('other.seq')", "SELECT setval('other.seq', 5)",
+                "SELECT setval('\"other\".\"seq\"', 5)",
+                // statements that evaluate now: ANALYZE really executes the
+                // query; CTAS and matview creation populate from theirs
+                "EXPLAIN ANALYZE SELECT nextval('other.seq')",
+                "EXPLAIN (ANALYZE) SELECT nextval('other.seq')",
+                "CREATE TABLE x AS SELECT nextval('other.seq')",
+                "CREATE MATERIALIZED VIEW mv AS SELECT nextval('other.seq')",
+                // quoting and comment gaps do not evade the sequence-call check
+                "SELECT \"nextval\"('other.seq')",
+                "SELECT pg_catalog.\"nextval\"('other.seq')",
+                "SELECT nextval /*c*/ ('other.seq')",
+                "SELECT setval -- c\n ('other.seq', 5)",
+                // the qualified literal rejects inside any arg expression
+                "SELECT nextval(CAST('other.seq' AS regclass))",
+                "SELECT nextval(to_regclass('other.seq'))",
+                "SELECT nextval(E'other.seq')",
+                "SELECT nextval($$other.seq$$)",
+                "SELECT nextval('other.seq' || '.x')",
+                "SELECT nextval(lower('other.seq'))",
+                "DO 'BEGIN PERFORM nextval(''other.s''); END'",
+                "DO 'BEGIN PERFORM \"setval\" /*c*/ (''other.s'', 1); END'",
+                "DO $$ BEGIN EXECUTE 'DROP TABLE other.t'; END $$",
+                // PL/pgSQL table-creating SELECT INTO forms (INTO + temp/unlogged/table)
+                "DO 'BEGIN SELECT * INTO UNLOGGED TABLE other.t FROM x; END'",
+                "DO 'BEGIN SELECT * INTO TEMP TABLE other.t FROM x; END'",
+                "DO 'BEGIN SELECT * INTO TABLE other.t FROM x; END'",
+                "DO 'BEGIN PERFORM pg_advisory_lock(1); END'",
+                // an unterminated inner literal still yields its full body —
+                // truncating it would let the tail evade the recursive check
+                "DO 'EXECUTE ''COMMIT''",
+                "DO 'EXECUTE ''SELECT nextval(''''o.s'''')'''",
+                // non-transactional or cross-session side effects survive
+                // the scratch rollback or hit other sessions
+                "SELECT pg_terminate_backend(1234)",
+                "SELECT pg_cancel_backend(1234)",
+                "SELECT pg_reload_conf()",
+                "SELECT pg_switch_wal()",
+                "SELECT pg_backup_start('x', true)",
+                "SELECT pg_promote(false, 10)",
+                "SELECT pg_file_write('/tmp/x', 'd', false)",
+                "SELECT pg_file_unlink('/tmp/x')",
+                "SELECT lo_export(12345, '/tmp/x')",
+                "SELECT pg_stat_reset()",
+                "SELECT pg_stat_reset_single_table_counters(123)",
+                "SELECT pg_create_logical_replication_slot('s', 'pgoutput')",
+                "SELECT pg_temporary_replication_slot()",
+                "SELECT pg_drop_replication_slot('s')",
+                "SELECT pg_replication_slot_advance('s', '0/1')",
+                "SELECT pg_logical_slot_get_changes('s', NULL, NULL)",
+                "SELECT pg_replication_origin_session_setup('o')",
+                "SELECT pg_replication_origin_create('o')",
+                "SELECT pg_log_emit(false, 'WARNING', 'x')",
+                "SELECT pg_logical_emit_message(false, 'p', 'm')",
+                "SELECT pg_catalog.\"pg_terminate_backend\"(1234)",
+                "SELECT pg_terminate_backend /* a call anyway */ (1234)",
+                "SELECT * FROM pg_terminate_backend(1234)",
+                "DO 'BEGIN PERFORM pg_terminate_backend(1); END'",
+                "DO 'BEGIN PERFORM pg_file_write(''/tmp/x'', ''d'', false); END'",
+                "SELECT pg_catalog.\"set_config\"('a', '1', false)",
+                "SELECT \"set_config\"('a', '1', false)",
+                "SELECT set_config /*c*/ ('a', '1', false)",
+                "CREATE EXTENSION pgcrypto WITH SCHEMA other",
+                // extensions are global objects: only CREATE (declaring
+                // presence, SCHEMA operand checked) is representable
+                "DROP EXTENSION pgcrypto",
+                "DROP EXTENSION IF EXISTS pgcrypto",
+                "ALTER EXTENSION pgcrypto UPDATE",
+                "ALTER EXTENSION pgcrypto ADD FUNCTION f()",
+                // objects anchored to another namespace's type — the
+                // qualified operand carries the object outside scratch
+
+                "CREATE CAST (other.t AS int) WITHOUT FUNCTION",
+                "DROP CAST (other.t AS int)",
+                "CREATE TRANSFORM FOR other.t LANGUAGE plpgsql (FROM SQL WITH FUNCTION f())",
+                "DROP TRANSFORM FOR other.t LANGUAGE plpgsql",
+                "COMMENT ON CAST (other.t AS int) IS 'x'",
+                "COMMENT ON TRANSFORM FOR other.t LANGUAGE plpgsql IS 'x'",
+                "SECURITY LABEL FOR p ON TRANSFORM FOR other.t LANGUAGE plpgsql IS 'x'",
+                "COMMENT ON EXTENSION pg_trgm IS 'x'",
+                "SECURITY LABEL FOR p ON EXTENSION pg_trgm IS 'x'"}) {
             assertThrows(DesiredStateException.class, () -> PgScriptCheck.check(sql, SCRATCH), sql);
         }
     }
@@ -54,8 +177,122 @@ class ScriptCheckSpecListsTest {
                 "CREATE TEMP TABLE pg_temp.x (a int)",
                 "GRANT USAGE ON SCHEMA scr TO PUBLIC",
                 "COMMENT ON TABLE scr.t IS 'x'",
+                "COMMENT ON TABLE \"scr\".t IS 'x'",
+                "COMMENT ON SCHEMA scr IS 'x'",
+                "CREATE TABLE \"scr\".t (a int)",
+                "DROP TABLE scr.t1, scr.t2",
+                "DROP RULE r ON scr.t",
+                "GRANT SELECT ON TABLE scr.a, scr.b TO PUBLIC",
+                "GRANT SELECT ON FOREIGN TABLE scr.ft TO PUBLIC",
+                "GRANT USAGE ON SCHEMA scr, scr TO PUBLIC",
+                "GRANT SELECT ON ALL TABLES IN SCHEMA scr TO r1, r2",
+                "CREATE TABLE exists (a int)",
+                "CREATE TEXT SEARCH CONFIGURATION cfg ()",
+                "CREATE OPERATOR FAMILY f USING btree",
+                "REINDEX TABLE scr.i",
+                "SELECT * INTO scr.t FROM src",
+                "SELECT * INTO t FROM src",
+                "TRUNCATE scr.t", "TRUNCATE a, b RESTART IDENTITY CASCADE",
+                "LOCK TABLE scr.t IN ACCESS SHARE MODE",
+                "ANALYZE scr.t", "ANALYZE VERBOSE t", "ANALYZE (VERBOSE, SKIP_LOCKED) scr.t",
+                "CLUSTER scr.t", "CLUSTER t", "CLUSTER VERBOSE t USING i",
+                "CREATE TABLE t PARTITION OF other.p",
+                "ALTER TABLE t INHERIT other.p", "ALTER TABLE t OF other.ty",
+                "CREATE TABLE t OF other.ty",
+                "REFRESH MATERIALIZED VIEW mv CONCURRENTLY",
+                "REFRESH MATERIALIZED VIEW mv",
+                "INSERT INTO t SELECT 1", "UPDATE scr.t SET a = 1",
+                "DELETE FROM scr.t WHERE a = 1",
+                "MERGE INTO scr.t USING x ON true WHEN MATCHED THEN UPDATE SET a = 1",
+                "SELECT 1 FROM t FOR UPDATE OF scr.t",
+                "SELECT nextval('seq')", "SELECT nextval('scr.seq')",
+                "SELECT nextval('pg_temp.seq')",
+                "DO 'BEGIN DELETE FROM scr.t; END'",
+                "DO 'BEGIN CALL p(1); END'",
+                // in PL/pgSQL, INTO without a temp/table lead-in is variable
+                // assignment — a qualified target is record.field, not a table
+                "DO 'BEGIN SELECT * INTO rec.field FROM x; END'",
+                "DO 'BEGIN SELECT * INTO STRICT rec FROM x; END'",
+                "DO 'BEGIN SELECT * INTO UNLOGGED TABLE scr.t FROM x; END'",
+                // malformed SQL (unterminated literals) passes the check —
+                // it fails at execution; it must only never crash the scan
+                "DO 'EXECUTE ''''''", "DO 'x'' EXECUTE '''",
+                // deferred code: a function or view body only stores the call
+                "CREATE FUNCTION f() RETURNS bigint LANGUAGE sql AS 'SELECT nextval(''o.s'')'",
+                "CREATE VIEW v AS SELECT nextval('o.s')",
+                "EXPLAIN SELECT nextval('o.s')",
+                "REINDEX INDEX scr.i", "IMPORT FOREIGN SCHEMA r FROM SERVER s INTO scr",
+                "REINDEX (TABLESPACE ts) INDEX i", "REINDEX TABLE t TABLESPACE ts",
+                "ALTER TABLE t SET TABLESPACE ts", "ALTER INDEX i SET TABLESPACE ts",
                 "SELECT set_config('app.x', '1', true)",
-                "SELECT pg_advisory_xact_lock(1)"}) {
+                "SELECT pg_catalog.\"set_config\"('a', '1', true)",
+                // the word alone is not a call — column names, literals and
+                // comments mentioning the functions stay legal
+                "CREATE TABLE t (set_config text)",
+                "SELECT 'set_config'",
+                "SELECT pg_terminate_backend FROM t",
+                "SELECT set_config FROM t",
+                "SELECT pg_advisory_xact_lock(1)",
+                "SELECT pg_advisory_unlock_all()",
+                "SELECT pg_notify('c', 'm')",
+                // transactional, so confined to the scratch connection:
+                // NOTIFY only delivers at commit and a rolled-back
+                // LISTEN/UNLISTEN leaves the channel set unchanged
+                "NOTIFY c", "LISTEN c", "UNLISTEN c",
+                "CREATE RULE r AS ON UPDATE TO t DO ALSO NOTIFY x",
+                // transactional effects are confined to the scratch
+                // connection (3.2 rule 4): foreign-table writes, locks,
+                // reindexing, ANALYZE/CLUSTER/REFRESH/TRUNCATE and CALLs all
+                // roll back; only non-transactional or session effects and
+                // object names qualified outside scratch reject
+                "TRUNCATE other.t", "TRUNCATE a, other.b",
+                "LOCK TABLE other.t", "LOCK a, other.b IN ACCESS EXCLUSIVE MODE",
+                "REFRESH MATERIALIZED VIEW other.mv",
+                "ANALYZE", "ANALYZE VERBOSE", "ANALYZE other.t",
+                "ANALYZE (VERBOSE)", "ANALYZE (VERBOSE) other.t",
+                "CLUSTER other.t USING i", "CLUSTER (VERBOSE) other.t",
+                "REPACK t", "REPACK (VERBOSE) other.t", "REPACK (ANALYZE) t (c1)",
+                "INSERT INTO other.t SELECT 1", "UPDATE other.t SET a = 1",
+                "DELETE FROM other.t", "DELETE FROM ONLY other.t",
+                "MERGE INTO other.t USING t ON true WHEN MATCHED THEN UPDATE SET a = 1",
+                "WITH x AS (DELETE FROM other.t RETURNING *) SELECT 1",
+                "SELECT 1 FROM t FOR UPDATE OF other.t",
+                "CALL other.p(1)",
+                "DO 'BEGIN DELETE FROM other.t; END'",
+                "DO 'BEGIN CALL other.p(1); END'",
+                "DO 'BEGIN EXECUTE ''INSERT INTO other.t SELECT 1''; END'",
+                "REINDEX TABLE exists.i", "REINDEX TABLE other.t",
+                "CREATE RULE r AS ON INSERT TO t DO INSTEAD INSERT INTO other.t2",
+                "CREATE RULE r AS ON INSERT TO t DO INSTEAD (SELECT * INTO other.t2)",
+                "CREATE RULE r AS ON UPDATE TO t DO INSTEAD SELECT nextval('other.s')",
+                "SELECT pg_logical_slot_peek_changes('s', NULL, NULL)",
+                "SELECT pg_sleep(0)",
+                "CALL p(1)", "CALL scr.p(1)",
+                "CREATE RULE r AS ON INSERT TO t DO INSTEAD INSERT INTO t2",
+                "CREATE RULE r AS ON INSERT TO t DO INSTEAD NOTHING",
+                "CREATE RULE r AS ON UPDATE TO scr.t DO ALSO UPDATE t2 SET a = 1",
+                "CREATE PROCEDURE p() LANGUAGE plpgsql AS $$ BEGIN NULL; END $$",
+                "CREATE PROCEDURE p() LANGUAGE plpgsql AS $$ BEGIN -- the commit record\n PERFORM 1; END $$",
+                // routine bodies are opaque to the check (spec §8 rule 5) —
+                // a callable COMMIT procedure is caught by the savepoint
+                // backstop if the script invokes it; BEGIN ATOMIC keeps its
+                // ';'s inside the statement either way
+                "CREATE PROCEDURE p() LANGUAGE SQL BEGIN ATOMIC INSERT INTO scr.t VALUES (1); END",
+                "CREATE FUNCTION f() RETURNS int LANGUAGE SQL BEGIN ATOMIC RETURN 1; END",
+                "CREATE PROCEDURE p() BEGIN ATOMIC FOR r IN SELECT 1 LOOP INSERT INTO scr.t VALUES (1); END LOOP; END",
+                "CREATE PROCEDURE p(x text DEFAULT 'commit;') LANGUAGE sql AS $$ SELECT 1 $$",
+                "CREATE PROCEDURE p() AS $$ BEGIN EXECUTE 'INSERT INTO scr.t VALUES (1)'; END $$",
+                "CREATE PROCEDURE p() LANGUAGE plpgsql AS $$ BEGIN COMMIT; END $$",
+                "CREATE PROCEDURE p() LANGUAGE plpgsql AS $$ BEGIN EXECUTE 'ROLLBACK AND CHAIN'; END $$",
+                "CREATE PROCEDURE p() LANGUAGE plpgsql AS $$ BEGIN EXECUTE 'INSERT INTO other.t'; END $$",
+                "CREATE FUNCTION f() RETURNS int LANGUAGE plpgsql AS $$ BEGIN EXECUTE 'INSERT INTO other.t'; END $$",
+                "CREATE PROCEDURE p() BEGIN ATOMIC COMMIT; END",
+                "CREATE PROCEDURE p() BEGIN ATOMIC EXECUTE 'INSERT INTO other.t'; END",
+                "CREATE CAST (scr.t AS int) WITHOUT FUNCTION",
+                "CREATE CAST (int AS text) WITHOUT FUNCTION",
+                "CREATE TRANSFORM FOR scr.t LANGUAGE plpgsql (FROM SQL WITH FUNCTION f())",
+                "COMMENT ON CAST (scr.t AS int) IS 'x'",
+                "COMMENT ON TRANSFORM FOR scr.t LANGUAGE plpgsql IS 'x'"}) {
             PgScriptCheck.check(sql, SCRATCH);
         }
     }

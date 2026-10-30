@@ -536,7 +536,10 @@ public final class PgCatalog {
                         seqOptions.put(id, "type=" + stype + ";increment=" + inc + ";min=" + min
                                 + ";max=" + max + ";start=" + start + ";cache=" + cache
                                 + ";cycle=" + cycle);
-                        define(id, "", attrs);
+                        // the canonical needs ownership, resolved by the
+                        // second query — attrs accumulate here, define() runs
+                        // (and normalizes them) once below
+                        obj(id).attrs.putAll(attrs);
                     }
                 }
             }
@@ -1280,7 +1283,7 @@ public final class PgCatalog {
                         }
                         final var column = new ObjectId(ObjectKind.COLUMN,
                                 rs.getString("col"), table.name());
-                        var ref = byOid(rs.getLong("dep"));
+                        final var ref = byOid(rs.getLong("dep"));
                         dep(column, ref);
                         depTableForCoveredChild(table, ref);
                     }
@@ -1304,7 +1307,7 @@ public final class PgCatalog {
                 try (ResultSet rs = ps.executeQuery()) {
                     while (rs.next()) {
                         final var from = conByOid.get(rs.getLong("con"));
-                        var ref = rs.getLong("dep");
+                        final var ref = rs.getLong("dep");
                         final var to = switch (rs.getString("refcls")) {
                             case "pg_constraint" -> conByOid.get(ref);
                             case "pg_class" -> {
@@ -1339,7 +1342,7 @@ public final class PgCatalog {
                             continue;
                         }
                         final var depOid = rs.getLong("dep");
-                        var ref = byOid(depOid);
+                        var ref = byOid(depOid); // resolved twice: collByOid is the fallback
                         if (ref == null) {
                             ref = collByOid.get(depOid);
                         }

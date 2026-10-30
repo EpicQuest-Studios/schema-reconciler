@@ -218,19 +218,26 @@ class PostgreSqlInternalsTest {
                 () -> PgScriptCheck.check("SELECT pg_try_advisory_lock_shared(1)"));
         assertThrows(DesiredStateException.class,
                 () -> PgScriptCheck.check("SELECT pg_catalog.pg_advisory_lock(1)"));
+        // REPACK without a table and the CONCURRENTLY form cannot run inside
+        // a transaction block; REPACK t is transactional and confined
         assertThrows(DesiredStateException.class,
-                () -> PgScriptCheck.check("LISTEN chan"));
+                () -> PgScriptCheck.check("REPACK"));
         assertThrows(DesiredStateException.class,
-                () -> PgScriptCheck.check("REPACK t"));
+                () -> PgScriptCheck.check("REPACK USING INDEX"));
         assertThrows(DesiredStateException.class,
                 () -> PgScriptCheck.check("REPACK (CONCURRENTLY) t USING INDEX"));
         assertThrows(DesiredStateException.class,
                 () -> PgScriptCheck.check("WAIT FOR LSN '0/0'"));
         assertThrows(DesiredStateException.class,
                 () -> PgScriptCheck.check("WAIT FOR LSN '1/ABC' WITH (MODE 'standby_replay')"));
-        // transaction-scoped variants and unlock functions take no session lock
+        // transaction-scoped variants and unlock functions take no session
+        // lock; LISTEN/NOTIFY are transactional, so their effect is confined
+        // to the scratch connection (3.2 rule 4)
         PgScriptCheck.check("SELECT pg_advisory_xact_lock(1)");
         PgScriptCheck.check("SELECT pg_advisory_unlock_all()");
+        PgScriptCheck.check("LISTEN chan");
+        PgScriptCheck.check("NOTIFY chan");
+        PgScriptCheck.check("UNLISTEN chan");
     }
 
     @Test

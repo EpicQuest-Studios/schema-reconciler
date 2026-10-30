@@ -26,6 +26,9 @@ replay_pid*
 # Maven
 target/
 
+# Node (tooling, not part of the build)
+node_modules/
+
 # IDE
 .idea/
 .vscode/
