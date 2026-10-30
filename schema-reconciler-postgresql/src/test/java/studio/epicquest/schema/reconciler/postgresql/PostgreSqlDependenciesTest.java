@@ -16,6 +16,7 @@ import studio.epicquest.schema.reconciler.ReconcileOutcome;
 import studio.epicquest.schema.reconciler.ReconcilePolicy;
 import studio.epicquest.schema.reconciler.Decision;
 import studio.epicquest.schema.reconciler.SchemaReconciler;
+import studio.epicquest.schema.reconciler.model.ObjectKind;
 import studio.epicquest.schema.reconciler.spi.Dialect;
 
 /**
@@ -326,6 +327,44 @@ class PostgreSqlDependenciesTest {
             }
         } finally {
             PgTestDatabase.execute(ds, "DROP PUBLICATION IF EXISTS dep_pub");
+            drop(ns);
+        }
+    }
+
+    @Test
+    @DisplayName("partition-inherited constraints and cloned triggers are not standalone objects (5.4)")
+    void partitionInheritedObjectsDoNotLoad() throws Exception {
+        final var ns = namespace();
+        final var q = dialect.quoteIdentifier(ns);
+        try {
+            PgTestDatabase.execute(ds, "CREATE TABLE " + q + ".pt (id int, v text)"
+                    + " PARTITION BY RANGE (id);"
+                    + " CREATE TABLE " + q + ".p1 PARTITION OF " + q + ".pt"
+                    + " FOR VALUES FROM (0) TO (1000);"
+                    + " ALTER TABLE " + q + ".pt ADD PRIMARY KEY (id);"
+                    + " ALTER TABLE " + q + ".pt ADD CONSTRAINT chk CHECK (v IS NOT NULL);"
+                    + " CREATE TRIGGER trg BEFORE INSERT ON " + q + ".pt FOR EACH ROW"
+                    + " EXECUTE FUNCTION suppress_redundant_updates_trigger()");
+            try (var conn = ds.getConnection()) {
+                conn.setAutoCommit(false);
+                final var snapshot = dialect.readSnapshot(conn, ns);
+                // the parent objects load normally — the inherited copies on the
+                // partition must not: they are not standalone objects (cannot be
+                // created or dropped directly) and would only report UNEXPECTED
+                assertTrue(snapshot.objects().keySet().stream()
+                                .anyMatch(id -> "chk".equals(id.name())),
+                        "parent check missing: " + snapshot.objects().keySet());
+                assertTrue(snapshot.objects().keySet().stream()
+                                .anyMatch(id -> "trg".equals(id.name())),
+                        "parent trigger missing: " + snapshot.objects().keySet());
+                final var onPartition = snapshot.objects().keySet().stream()
+                        .filter(id -> id.parent().filter("p1"::equals).isPresent())
+                        .filter(id -> id.kind() != ObjectKind.COLUMN)
+                        .toList();
+                assertTrue(onPartition.isEmpty(),
+                        "inherited objects on the partition must not load: " + onPartition);
+            }
+        } finally {
             drop(ns);
         }
     }

@@ -829,12 +829,12 @@ Where `CREATE ON DATABASE` cannot be granted, a separate `scratchDataSource` (6.
 |---|---|---|
 | `TABLE` | `pg_class` (`relkind` `r`, excluding inheritance children) | `relkind`, `relpersistence`, `reloptions`, `relreplident`, and for replica identity `USING INDEX` the index name; columns are separate objects |
 | `COLUMN` | `pg_attribute`, `pg_attrdef`, `pg_collation` | `format_type(atttypid, atttypmod)`, nullability, `pg_get_expr(adbin, adrelid)` as the default or, when `attgenerated` is set, as the generation expression; collation when it is not the type's default; identity kind and identity sequence options |
-| `PRIMARY_KEY`, `UNIQUE`, `FOREIGN_KEY`, `CHECK` | `pg_constraint` (`contype` `p`, `u`, `f`, `c`) | `pg_get_constraintdef(oid)` |
+| `PRIMARY_KEY`, `UNIQUE`, `FOREIGN_KEY`, `CHECK` | `pg_constraint` (`contype` `p`, `u`, `f`, `c`), excluding inherited copies (`conislocal` `false` — partition-child and classic-inheritance constraints, which only the parent's object owns) | `pg_get_constraintdef(oid)` |
 | `INDEX` | `pg_index` (`relkind` `i`), excluding constraint-backing indexes (`pg_constraint.conindid` on `p`, `u`, `x` constraints) and partition-child indexes | `pg_get_indexdef(indexrelid)` |
 | `VIEW` | `pg_class` (`relkind` `v`) | `pg_get_viewdef(oid, true)` plus column names and types, plus `reloptions` (`check_option`, `security_barrier`, `security_invoker`) in sorted order |
 | `SEQUENCE` | `pg_sequence` | type, start, increment, min, max, cache, cycle; never the current value |
 | `ROUTINE` | `pg_proc` (`prokind` `f`, `p`) | `pg_get_functiondef(oid)`; the identity signature (4.1) is `proname` plus `format_type` over each element of `proargtypes` |
-| `TRIGGER` | `pg_trigger` (`NOT tgisinternal`) | `pg_get_triggerdef(oid, true)` plus the enabled state (`tgenabled`) |
+| `TRIGGER` | `pg_trigger` (`NOT tgisinternal` and `tgparentid` `0` — partition clones are not standalone objects) | `pg_get_triggerdef(oid, true)` plus the enabled state (`tgenabled`) |
 | `MATERIALIZED_VIEW` | `pg_class` (`relkind` `m`) | `pg_get_viewdef(oid, true)` plus column names and types, plus `reloptions`, `relpersistence` and `relispopulated` |
 | `TYPE` | `pg_type` (`typtype` `e` — enums only) | `typtype` plus the labels of `pg_enum` ordered by `enumsortorder` |
 | `DOMAIN` | `pg_type` (`typtype` `d`) | `format_type(typbasetype, typtypmod)`, `typnotnull`, `pg_get_expr(typdefaultbin, 0)`, collation when it differs from the base type's, and the domain's `CHECK` constraints (`pg_constraint` on `contypid`, `contype` `c`, `pg_get_constraintdef`, in constraint-name order) |

@@ -410,6 +410,7 @@ public final class PgCatalog {
                     JOIN pg_namespace n ON n.oid = rel.relnamespace
                     LEFT JOIN pg_class ref ON ref.oid = c.confrelid
                     WHERE n.nspname = ? AND c.contype IN ('p','u','f','c','x')
+                      AND c.conislocal
                     ORDER BY c.oid
                     """)) {
                 ps.setString(1, ns);
@@ -705,7 +706,7 @@ public final class PgCatalog {
                     FROM pg_trigger t
                     JOIN pg_class c ON c.oid = t.tgrelid
                     JOIN pg_namespace n ON n.oid = c.relnamespace
-                    WHERE n.nspname = ? AND NOT t.tgisinternal
+                    WHERE n.nspname = ? AND NOT t.tgisinternal AND t.tgparentid = 0
                     ORDER BY t.oid
                     """)) {
                 ps.setString(1, ns);
