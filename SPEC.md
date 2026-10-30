@@ -838,7 +838,7 @@ Where `CREATE ON DATABASE` cannot be granted, a separate `scratchDataSource` (6.
 | `MATERIALIZED_VIEW` | `pg_class` (`relkind` `m`) | `pg_get_viewdef(oid, true)` plus column names and types, plus `reloptions`, `relpersistence` and `relispopulated` |
 | `TYPE` | `pg_type` (`typtype` `e` — enums only) | `typtype` plus the labels of `pg_enum` ordered by `enumsortorder` |
 | `DOMAIN` | `pg_type` (`typtype` `d`) | `format_type(typbasetype, typtypmod)`, `typnotnull`, `pg_get_expr(typdefaultbin, 0)`, collation when it differs from the base type's, and the domain's `CHECK` constraints (`pg_constraint` on `contypid`, `contype` `c`, `pg_get_constraintdef`, in constraint-name order) |
-| `POLICY` | `pg_policy` | `polcmd`, `polpermissive`, the role list as sorted names (`polroles` oid `0` is `PUBLIC`), `pg_get_expr(polqual, polrelid)`, `pg_get_expr(polwithcheck, polrelid)` |
+| `POLICY` | `pg_policy` | `polcmd`, `polpermissive`, the role list as sorted, individually quoted names (`polroles` oid `0` is `PUBLIC`), `pg_get_expr(polqual, polrelid)`, `pg_get_expr(polwithcheck, polrelid)` |
 | `EXTENSION` | `pg_extension` | presence only — the literal `extension`; the version is never compared (`ALTER EXTENSION UPDATE` is out of scope), and `ObjectId.name` keeps the `extension:<name>` form so the id is stable across the promotion |
 | `COMMENT` | `pg_description` joined to the managed object (`objoid`, `objsubid` `0` for objects, `> 0` for columns) | the comment text; a target with no row has no `COMMENT` object |
 | dependencies | `pg_depend`, `pg_rewrite`, `pg_inherits`, `pg_trigger`, restricted to objects of the namespace being read | populate `dependsOn` |
