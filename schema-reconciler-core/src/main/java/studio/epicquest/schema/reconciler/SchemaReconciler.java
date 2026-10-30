@@ -95,8 +95,8 @@ public final class SchemaReconciler {
             return this;
         }
 
-        public Builder scratchDataSource(DataSource dataSource) {
-            this.scratchDataSource = Objects.requireNonNull(dataSource, "dataSource");
+        public Builder scratchDataSource(DataSource scratchDataSource) {
+            this.scratchDataSource = Objects.requireNonNull(scratchDataSource, "scratchDataSource");
             return this;
         }
 
