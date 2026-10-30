@@ -681,6 +681,17 @@ class PostgreSqlConformanceTest extends DialectConformanceTest {
     }
 
     @Test
+    @DisplayName("a namespace token inside a literal is rejected as never-convergent")
+    void namespaceTokenInsideLiteralIsRejected() {
+        for (final var script : new String[] {
+                "CREATE TABLE t (c text DEFAULT '${namespace}')",
+                "CREATE TABLE t (c text DEFAULT '$${namespace}')",
+                "COMMENT ON TABLE t IS '${namespace}'"}) {
+            assertThrows(DesiredStateException.class, () -> reconciler(script).plan(), script);
+        }
+    }
+
+    @Test
     @DisplayName("malformed scripts are rejected as desired-state errors")
     void malformedScriptsAreDesiredStateErrors() {
         for (final var script : new String[] {"SET", "CREATE", "ALTER", "DROP IF EXISTS"}) {
