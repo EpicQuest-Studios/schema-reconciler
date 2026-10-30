@@ -738,21 +738,37 @@ public final class PgRender {
             case OTHER -> {
                 final var name = id.name();
                 final var colon = name.indexOf(':');
-                yield colon > 0
-                        && RELATION_NAMESPACE_OTHERS.contains(name.substring(0, colon))
-                        ? Set.of("relation:" + name.substring(colon + 1))
-                        : Set.of("relation:" + name);
+                if (colon > 0) {
+                    final var category = name.substring(0, colon);
+                    final var stripped = name.substring(colon + 1);
+                    if (RELATION_NAMESPACE_OTHERS.contains(category)) {
+                        yield Set.of("relation:" + stripped);
+                    }
+                    // an exclusion constraint names a backing index in
+                    // pg_class too — it occupies both namespaces
+                    if (category.equals("constraint")) {
+                        final var bare = stripped.substring(stripped.lastIndexOf('.') + 1);
+                        yield Set.of("constraint:" + stripped, "relation:" + bare);
+                    }
+                    // aggregates and window functions share pg_proc with
+                    // managed routines, keyed by name plus signature
+                    if (category.equals("routine")) {
+                        yield Set.of("routine:" + stripped);
+                    }
+                }
+                yield Set.of("relation:" + name);
             }
             // types and domains share the type namespace, which collides
             // with the relation namespace through composite-type rowtypes
             case TABLE, VIEW, MATERIALIZED_VIEW, SEQUENCE, INDEX, TYPE, DOMAIN ->
                     Set.of("relation:" + id.name());
+            case ROUTINE -> Set.of("routine:" + id.name());
             case PRIMARY_KEY, UNIQUE -> Set.of(
                     "relation:" + id.name(),
                     "constraint:" + id.parent().orElse("") + "." + id.name());
             case FOREIGN_KEY, CHECK ->
                     Set.of("constraint:" + id.parent().orElse("") + "." + id.name());
-            case COLUMN, ROUTINE, TRIGGER, POLICY, EXTENSION, COMMENT -> Set.of();
+            case COLUMN, TRIGGER, POLICY, EXTENSION, COMMENT -> Set.of();
         };
     }
 }

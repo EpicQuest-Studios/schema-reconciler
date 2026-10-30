@@ -387,6 +387,17 @@ class PostgreSqlInternalsTest {
                 PgRender.nameScopes(new ObjectId(ObjectKind.FOREIGN_KEY, "fk", "t")));
         assertTrue(PgRender.nameScopes(new ObjectId(ObjectKind.COLUMN, "c", "t")).isEmpty());
         assertTrue(PgRender.nameScopes(new ObjectId(ObjectKind.TRIGGER, "g", "t")).isEmpty());
+        assertEquals(Set.of("routine:f(integer)"),
+                PgRender.nameScopes(new ObjectId(ObjectKind.ROUTINE, "f(integer)")));
+        // an exclusion constraint names both its pg_constraint row and its
+        // backing pg_class index — a create must collide with either
+        assertEquals(Set.of("constraint:t.ex", "relation:ex"),
+                PgRender.nameScopes(new ObjectId(ObjectKind.OTHER, "constraint:t.ex")));
+        // an unsupported aggregate/window occupies the routine signature space
+        assertEquals(Set.of("routine:f(integer)"),
+                PgRender.nameScopes(new ObjectId(ObjectKind.OTHER, "routine:f(integer)")));
+        assertEquals(Set.of("relation:m"),
+                PgRender.nameScopes(new ObjectId(ObjectKind.OTHER, "type:m")));
     }
 
     @Test

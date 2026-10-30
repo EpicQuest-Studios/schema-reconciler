@@ -62,10 +62,17 @@ final class Dependencies {
     }
 
     private static Map<String, ObjectId> parentables(Map<ObjectId, SchemaObject> objects) {
+        // same-catalog names are unique, so two managed objects never collide
+        // on a resolvable name — but an OTHER's cross-catalog name can, and
+        // the managed object must win
         final var map = new HashMap<String, ObjectId>();
         objects.values().stream()
                 .sorted((a, b) -> ObjectIds.ORDER.compare(a.id(), b.id()))
-                .filter(o -> PARENTABLE.contains(o.id().kind()))
+                .filter(o -> PARENTABLE.contains(o.id().kind())
+                        && o.id().kind() != ObjectKind.OTHER)
+                .forEach(o -> map.putIfAbsent(resolvableName(o.id()), o.id()));
+        objects.values().stream()
+                .filter(o -> o.id().kind() == ObjectKind.OTHER)
                 .forEach(o -> map.putIfAbsent(resolvableName(o.id()), o.id()));
         return map;
     }
