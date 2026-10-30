@@ -46,6 +46,8 @@ public final class PgCatalog {
     public static final String TABLE_OPTIONS = "tableOptions";
     /** The {@code relreplident} letter of a table. */
     public static final String REPLIDENT = "replident";
+    /** Whether a materialized view currently holds its result rows. */
+    public static final String POPULATED = "populated";
 
     public static SchemaSnapshot read(Connection conn, String namespace) throws SQLException {
         try (Statement s = conn.createStatement()) {
@@ -179,6 +181,7 @@ public final class PgCatalog {
             try (PreparedStatement ps = conn.prepareStatement("""
                     SELECT c.oid, c.relname, c.relkind, c.relpersistence,
                            c.reloptions::text AS options, c.relreplident,
+                           c.relrowsecurity, c.relforcerowsecurity,
                            EXISTS (SELECT 1 FROM pg_inherits i WHERE i.inhrelid = c.oid) AS inherited,
                            (SELECT ic.relname FROM pg_index ix JOIN pg_class ic ON ic.oid = ix.indexrelid
                              WHERE ix.indrelid = c.oid AND ix.indisreplident) AS replindex
@@ -208,10 +211,11 @@ public final class PgCatalog {
                                     : new ObjectId(ObjectKind.TABLE, name);
                             case "v" -> new ObjectId(ObjectKind.VIEW, name);
                             case "S" -> new ObjectId(ObjectKind.SEQUENCE, name);
+                            // managed: canonical definition lands in loadViews
+                            case "m" -> new ObjectId(ObjectKind.MATERIALIZED_VIEW, name);
                             // a documented category prefix per relkind (3.3):
                             // tolerating one non-managed relation kind must
-                            // not exempt the others — matviews in particular
-                            case "m" -> new ObjectId(ObjectKind.OTHER, "matview:" + name);
+                            // not exempt the others
                             case "f" -> new ObjectId(ObjectKind.OTHER, "foreign:" + name);
                             case "p" -> new ObjectId(ObjectKind.OTHER, "partition:" + name);
                             case "I" -> new ObjectId(ObjectKind.OTHER, "partindex:" + name);
@@ -226,7 +230,9 @@ public final class PgCatalog {
                             define(id, "relkind=r;relpersistence=" + persistence
                                     + ";options=" + options
                                     + ";replident=" + replident
-                                    + (replindex != null ? ";replindex=" + replindex : ""),
+                                    + (replindex != null ? ";replindex=" + replindex : "")
+                                    + ";rls=" + rs.getBoolean("relrowsecurity")
+                                    + ";forcerls=" + rs.getBoolean("relforcerowsecurity"),
                                     Map.of(TABLE_OPTIONS, String.join(", ", options),
                                             REPLIDENT, replident));
                         } else if (id.kind() == ObjectKind.OTHER) {
@@ -461,14 +467,15 @@ public final class PgCatalog {
 
         void loadViews(Connection conn) throws SQLException {
             try (PreparedStatement ps = conn.prepareStatement("""
-                    SELECT c.oid, c.relname, pg_get_viewdef(c.oid, true) AS def,
+                    SELECT c.oid, c.relname, c.relkind, c.relpersistence, c.relispopulated,
+                           pg_get_viewdef(c.oid, true) AS def,
                            c.reloptions::text AS options,
                            (SELECT string_agg(a.attname || ' ' || format_type(a.atttypid, a.atttypmod),
                                               ', ' ORDER BY a.attnum)
                               FROM pg_attribute a
                              WHERE a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped) AS cols
                     FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
-                    WHERE n.nspname = ? AND c.relkind = 'v'
+                    WHERE n.nspname = ? AND c.relkind IN ('v','m')
                     ORDER BY c.oid
                     """)) {
                 ps.setString(1, ns);
@@ -481,13 +488,30 @@ public final class PgCatalog {
                         final var def = rs.getString("def");
                         final var cols = nullToEmpty(rs.getString("cols"));
                         final var options = reloptions(rs.getString("options"));
-                        final var id = new ObjectId(ObjectKind.VIEW, name);
-                        final var create = "CREATE VIEW " + qNs + "." + PgIdentifiers.quote(name)
-                                + (options.isEmpty() ? "" : " WITH (" + String.join(",", options) + ")")
-                                + " AS " + def;
-                        define(id, "viewdef=" + def + ";cols=" + cols + ";options=" + options,
-                                Map.of(CREATE_SQL, create,
-                                        DROP_SQL, "DROP VIEW " + qNs + "." + PgIdentifiers.quote(name)));
+                        final var qName = qNs + "." + PgIdentifiers.quote(name);
+                        if (rs.getString("relkind").equals("m")) {
+                            final var populated = rs.getBoolean("relispopulated");
+                            final var attrs = new LinkedHashMap<String, String>();
+                            attrs.put(CREATE_SQL, "CREATE "
+                                    + (rs.getString("relpersistence").equals("u") ? "UNLOGGED " : "")
+                                    + "MATERIALIZED VIEW " + qName
+                                    + (options.isEmpty() ? "" : " WITH (" + String.join(",", options) + ")")
+                                    + " AS " + def);
+                            attrs.put(DROP_SQL, "DROP MATERIALIZED VIEW " + qName);
+                            attrs.put(POPULATED, Boolean.toString(populated));
+                            define(new ObjectId(ObjectKind.MATERIALIZED_VIEW, name),
+                                    "viewdef=" + def + ";cols=" + cols + ";options=" + options
+                                            + ";relpersistence=" + rs.getString("relpersistence")
+                                            + ";populated=" + populated,
+                                    attrs);
+                        } else {
+                            final var id = new ObjectId(ObjectKind.VIEW, name);
+                            final var create = "CREATE VIEW " + qName
+                                    + (options.isEmpty() ? "" : " WITH (" + String.join(",", options) + ")")
+                                    + " AS " + def;
+                            define(id, "viewdef=" + def + ";cols=" + cols + ";options=" + options,
+                                    Map.of(CREATE_SQL, create, DROP_SQL, "DROP VIEW " + qName));
+                        }
                     }
                 }
             }
@@ -1184,7 +1208,7 @@ public final class PgCatalog {
                     FROM pg_rewrite r
                     JOIN pg_depend d ON d.classid = 'pg_rewrite'::regclass AND d.objid = r.oid
                         AND d.refclassid = 'pg_class'::regclass
-                    JOIN pg_class v ON v.oid = r.ev_class AND v.relkind = 'v'
+                    JOIN pg_class v ON v.oid = r.ev_class AND v.relkind IN ('v','m')
                     JOIN pg_namespace vn ON vn.oid = v.relnamespace AND vn.nspname = ?
                     JOIN pg_class rc ON rc.oid = d.refobjid
                     JOIN pg_namespace rn ON rn.oid = rc.relnamespace AND rn.nspname = ?
@@ -1205,7 +1229,7 @@ public final class PgCatalog {
                     FROM pg_rewrite r
                     JOIN pg_depend d ON d.classid = 'pg_rewrite'::regclass AND d.objid = r.oid
                         AND d.refclassid IN ('pg_proc'::regclass, 'pg_type'::regclass)
-                    JOIN pg_class v ON v.oid = r.ev_class AND v.relkind = 'v'
+                    JOIN pg_class v ON v.oid = r.ev_class AND v.relkind IN ('v','m')
                     JOIN pg_namespace vn ON vn.oid = v.relnamespace AND vn.nspname = ?
                     WHERE r.rulename = '_RETURN'
                     """)) {

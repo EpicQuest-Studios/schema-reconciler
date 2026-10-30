@@ -16,7 +16,11 @@ public record ObjectId(ObjectKind kind, String name, Optional<String> parent) {
 
     private static final Set<ObjectKind> PARENTED = Set.of(
             ObjectKind.COLUMN, ObjectKind.PRIMARY_KEY, ObjectKind.UNIQUE,
-            ObjectKind.FOREIGN_KEY, ObjectKind.CHECK, ObjectKind.INDEX, ObjectKind.TRIGGER);
+            ObjectKind.FOREIGN_KEY, ObjectKind.CHECK, ObjectKind.INDEX,
+            ObjectKind.TRIGGER, ObjectKind.POLICY);
+
+    /** Kinds whose parent mirrors their target's parent: optional, never a bare parent of its own. */
+    private static final Set<ObjectKind> PARENT_MIRRORED = Set.of(ObjectKind.COMMENT);
 
     public ObjectId {
         Objects.requireNonNull(kind, "kind");
@@ -25,7 +29,8 @@ public record ObjectId(ObjectKind kind, String name, Optional<String> parent) {
         if (name.isEmpty()) {
             throw new IllegalArgumentException("name must not be empty");
         }
-        if (PARENTED.contains(kind) != parent.isPresent()) {
+        if (PARENTED.contains(kind) && parent.isEmpty()
+                || !PARENTED.contains(kind) && !PARENT_MIRRORED.contains(kind) && parent.isPresent()) {
             throw new IllegalArgumentException(
                     "parent is required for " + kind + " and must be empty for other kinds");
         }

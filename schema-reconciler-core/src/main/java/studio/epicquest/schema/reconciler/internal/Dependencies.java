@@ -20,8 +20,8 @@ import studio.epicquest.schema.reconciler.model.SchemaSnapshot;
 final class Dependencies {
 
     private static final Set<ObjectKind> PARENTABLE = Set.of(
-            ObjectKind.TABLE, ObjectKind.VIEW, ObjectKind.SEQUENCE,
-            ObjectKind.INDEX, ObjectKind.OTHER);
+            ObjectKind.TABLE, ObjectKind.VIEW, ObjectKind.MATERIALIZED_VIEW,
+            ObjectKind.SEQUENCE, ObjectKind.INDEX, ObjectKind.OTHER);
 
     private Dependencies() {
     }

@@ -27,18 +27,12 @@ class AppendixCoverageTest {
      *  A third element {@code "super"} marks cases that need a superuser. */
     private static final String[][] CASES = {
         {"CREATE TABLE t (id int, CONSTRAINT t_ex EXCLUDE (id WITH =))", "constraint:"},
-        {"CREATE TYPE mood AS ENUM ('a','b')", "type:"},
-        {"CREATE DOMAIN posint AS int CHECK (VALUE > 0)", "type:"},
         {"CREATE TYPE rng AS RANGE (subtype = int)", "type:"},
         {"CREATE TYPE comp AS (a int, b text)", "composite:"},
-        {"CREATE MATERIALIZED VIEW mv AS SELECT 1 AS a", "matview:"},
         {"CREATE TABLE pt (id int) PARTITION BY RANGE (id)", "partition:"},
         {"CREATE TABLE pt2 (k int) PARTITION BY RANGE (k); CREATE INDEX pix ON pt2 (k)", "partindex:"},
         {"CREATE TABLE parent (id int); CREATE TABLE child () INHERITS (parent)", "inherited:"},
         {"CREATE AGGREGATE mysum (int) (sfunc = int4pl, stype = int, initcond = '0')", "routine:"},
-        {"CREATE TABLE p (id int); ALTER TABLE p ENABLE ROW LEVEL SECURITY;"
-                + " CREATE POLICY pol ON p USING (true)", "policy:"},
-        {"CREATE EXTENSION pg_trgm", "extension:"},
         {"CREATE TABLE r (id int); CREATE RULE rl AS ON INSERT TO r DO ALSO NOTHING", "rule:"},
         {"CREATE TABLE s (a int, b int); CREATE STATISTICS st ON a, b FROM s", "statistics:"},
         {"CREATE COLLATION coll (provider = libc, locale = 'C')", "collation:"},
@@ -47,7 +41,8 @@ class AppendixCoverageTest {
         {"CREATE TEXT SEARCH CONFIGURATION c (copy = simple)", "fts-config:"},
         {"CREATE OPERATOR === (leftarg = int, rightarg = int, function = int4eq)", "operator:"},
         {"CREATE OPERATOR FAMILY fam USING btree", "opfamily:"},
-        {"CREATE TABLE cm (id int); COMMENT ON TABLE cm IS 'x'", "comment:"},
+        {"CREATE COLLATION cc (provider = libc, locale = 'C'); COMMENT ON COLLATION cc IS 'x'",
+                "comment:"},
         {"CREATE TABLE g (id int); GRANT SELECT ON g TO PUBLIC", "privileges:"},
         {"CREATE FOREIGN DATA WRAPPER fdw_cov; CREATE SERVER srv_cov FOREIGN DATA WRAPPER fdw_cov;"
                 + " CREATE FOREIGN TABLE ft (a int) SERVER srv_cov", "foreign:"},

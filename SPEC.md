@@ -138,7 +138,7 @@ Hand-written schema checkers keep their expected state in code (maps of tables, 
 
 ### 1.5 Scope
 
-In scope: tables, columns, primary-key, unique, foreign-key and check constraints, indexes (including partial and expression indexes where the dialect supports them), views, sequences, routines (functions and procedures) and triggers.
+In scope: tables, columns, primary-key, unique, foreign-key and check constraints, indexes (including partial and expression indexes where the dialect supports them), views, materialized views, sequences, routines (functions and procedures), triggers, enum types, domains, policies, extensions and comments.
 
 Non-goals for version 1:
 
@@ -147,7 +147,7 @@ Non-goals for version 1:
 - translating a script from one dialect to another,
 - rename detection (a rename appears as one missing and one unexpected object),
 - down-migrations or rollback scripts,
-- privileges, ownership, comments, row-level security, partitioning, materialized views, user-defined types and extensions. Dialects must report these as `UNSUPPORTED` if a desired script creates them (section 5.4).
+- granted privileges, ownership, security labels, partitioning, foreign tables, composite types, non-enum user types (ranges, multiranges, base types), aggregates and window functions, rules, statistics, collations, conversions, text-search objects, operators, casts, transforms, languages and publications. Dialects must report these as `UNSUPPORTED` if a desired script creates them (section 5.4).
 
 ### 1.6 Platform dependencies
 
@@ -214,10 +214,13 @@ public final class SchemaReconciler {
     /** Applies a plan previously returned by plan(); fails if the target has changed since. */
     public ReconcileReport apply(ReconcilePlan plan) { ... }
 
+    /** Reads the target namespace under the lock and returns an equivalent desired-state script. */
+    public String dump() { ... }
+
     public static final class Builder {
         public Builder dataSource(DataSource dataSource) { ... }          // required
         public Builder namespace(String targetNamespace) { ... }          // required
-        public Builder desiredState(DesiredState desiredState) { ... }    // required
+        public Builder desiredState(DesiredState desiredState) { ... }    // required for plan/reconcile/apply; optional for dump()
         public Builder dialect(Dialect dialect) { ... }                   // optional, see 3.4
         public Builder scratchDataSource(DataSource dataSource) { ... }   // optional, see 6.3
         public Builder policy(ReconcilePolicy policy) { ... }             // default ReconcilePolicy.defaults()
@@ -229,7 +232,9 @@ public final class SchemaReconciler {
 }
 ```
 
-`build()` must fail with `ConfigurationException` if a required property is missing, if `lockTimeout` or `statementTimeout` is zero or negative, or — when no dialect is set — if no `Dialect` provider is discoverable via `ServiceLoader` at all. An empty namespace counts as missing. `build()` must not open a connection: the `supports(DatabaseMetaData)` check of 3.4 needs one, so final dialect selection is deferred to the first use of the reconciler.
+`build()` must fail with `ConfigurationException` if a required property is missing, if `lockTimeout` or `statementTimeout` is zero or negative, or — when no dialect is set — if no `Dialect` provider is discoverable via `ServiceLoader` at all. An empty namespace counts as missing. `desiredState` is required for `plan()`, `reconcile()` and `apply()` but may be omitted when the reconciler is built for `dump()` alone; those methods then fail with `ConfigurationException` naming the missing property. `build()` must not open a connection: the `supports(DatabaseMetaData)` check of 3.4 needs one, so final dialect selection is deferred to the first use of the reconciler.
+
+`dump()` performs steps 1 to 3 of 5.1 — connect, lock, read the actual snapshot — and renders the snapshot as a desired-state script: a deterministic header comment naming the dialect id, the target namespace and the actual fingerprint (never a timestamp), then for each object, in `dependsOn` order, the create-fragment statements the dialect returns from `dumpStatements` (6.1), each terminated by `;`. Objects whose `dumpStatements` is empty are emitted as comment lines — `-- folded: <id>` for an object folded into its parent's create fragment (columns, serial-owned sequences), `-- unsupported: <id>` for `ObjectKind.OTHER` objects and anything else the dialect cannot render — so nothing is silently dropped. Feeding the output back as a desired-state script on an equal database produces an empty plan and a byte-identical second dump.
 
 `plan()` and `planTimed()` perform the planning steps of 5.1 without changing the target; `planTimed()` additionally returns the run's `RunTimings` (3.5). A `ReconcileListener` exception during planning aborts as `PlanningException` (3.6).
 
@@ -278,7 +283,7 @@ public record ReconcilePolicy(
 
 The compact constructor must reject `unsupported == APPLY` and any `unsupportedCategories` value of `APPLY` with `IllegalArgumentException`. The safety classes are defined in section 5.6.
 
-`unsupportedCategories` overrides `unsupported` per *difference category*. The category of an `UNSUPPORTED` difference is, for an `ObjectKind.OTHER` object, the dialect's documented name prefix before `:` (for example `extension`, `policy`, `comment`, `privileges`, `matview`; an `OTHER` name without a prefix is `relation`), and for any other kind the lowercased `ObjectKind` name (for example `table`, `routine`). A policy can therefore tolerate objects it deliberately leaves to other tooling — extensions or grants, for example — while still failing on unsupported constructs that carry reconciliation risk, such as materialized views. Categories are stable identifiers, never free-text matching: a category not present in the map falls back to `unsupported`, which defaults to `FAIL` — unknown or unclassified objects fail closed. The decision for a difference is `unsupportedCategories.getOrDefault(category, unsupported)`. The PostgreSQL prefix list is in A.5.
+`unsupportedCategories` overrides `unsupported` per *difference category*. The category of an `UNSUPPORTED` difference is, for an `ObjectKind.OTHER` object, the dialect's documented name prefix before `:` (for example `privileges`, `comment`, `rule`, `composite`, `partition`; an `OTHER` name without a prefix is `relation`), and for any other kind the lowercased `ObjectKind` name (for example `table`, `routine`). A policy can therefore tolerate objects it deliberately leaves to other tooling — grants or rules, for example — while still failing on unsupported constructs that carry reconciliation risk, such as foreign tables or partitions. Categories are stable identifiers, never free-text matching: a category not present in the map falls back to `unsupported`, which defaults to `FAIL` — unknown or unclassified objects fail closed. The decision for a difference is `unsupportedCategories.getOrDefault(category, unsupported)`. The PostgreSQL prefix list is in A.5.
 
 `additive`, `rebuild` and `destructive` govern *changes* by their `ChangeSafety`. `unsupported` governs *differences*: an `UNSUPPORTED` difference (5.4) never produces a `PlannedChange`, so it is evaluated against `plan.differences()`, not `plan.changes()`. Semantics of each decision:
 
@@ -358,7 +363,8 @@ All model types live in `studio.epicquest.schema.reconciler.model`.
 ```java
 public enum ObjectKind {
     TABLE, COLUMN, PRIMARY_KEY, UNIQUE, FOREIGN_KEY, CHECK,
-    INDEX, VIEW, SEQUENCE, ROUTINE, TRIGGER, OTHER
+    INDEX, VIEW, SEQUENCE, ROUTINE, TRIGGER, OTHER,
+    MATERIALIZED_VIEW, TYPE, DOMAIN, POLICY, EXTENSION, COMMENT
 }
 
 /** Namespace-neutral identity. */
@@ -366,7 +372,7 @@ public record ObjectId(ObjectKind kind, String name, Optional<String> parent) { 
 ```
 
 - `name` is the identifier as stored by the engine (case as the catalog reports it).
-- `parent` is required for `COLUMN`, all constraint kinds, `INDEX` and `TRIGGER` (the owning table or view), and must be empty for other kinds. A present `parent` and `name` must be non-empty strings. The compact constructor enforces these rules with `IllegalArgumentException`.
+- `parent` is required for `COLUMN`, all constraint kinds, `INDEX`, `TRIGGER` and `POLICY` (the owning table or view). For `COMMENT` it mirrors the commented target's `parent`: a comment on a column, index, constraint, trigger or policy carries the parent's name, a comment on a top-level object carries none. It must be empty for other kinds. A present `parent` and `name` must be non-empty strings. The compact constructor enforces these rules with `IllegalArgumentException`.
 - For `ROUTINE`, `name` must include the identity signature, because routines can be overloaded. The signature is the routine name followed by the parenthesised list of its input argument types (`IN`, `INOUT` and `VARIADIC` arguments; never `OUT`), separated by `, `, for example `extract_ts(text)` or `merge_plan(bigint, jsonb)`. Each type is written by the engine's canonical type formatter. Argument names are omitted, because they belong to the canonical definition: renaming a parameter makes the routine `DRIFTED`, not a missing routine plus an unexpected one. A type of the snapshot's own namespace is written unqualified when the dialect binds the search path to that namespace (A.5), as the PostgreSQL profile does; any qualifier that remains is replaced by the `${namespace}.` token of 5.3.
 - `ObjectId` never contains a namespace. Two snapshots of different namespaces are directly comparable.
 
@@ -490,13 +496,15 @@ A dialect must detect every object in the scratch namespace, including kinds it 
 
 Exception: an unexpected `COLUMN` whose parent table is expected is a table-shape conflict. The core must add a `DESTRUCTIVE` change for the owning table with the reason `unexpected column <name>`, so that the default policy fails loudly instead of running against a foreign table shape.
 
+The asymmetry applies to comments too: a `COMMENT` object exists only where a script's `COMMENT ON` produced one in the scratch snapshot, so removing the statement from the desired script never drops the comment — the actual comment is reported `UNEXPECTED` instead. Version 1 has no desired-state spelling of "no comment"; deleting one is an operator decision.
+
 ### 5.6 Safety classes
 
 | Class | Definition | Examples |
 |---|---|---|
 | `ADDITIVE` | Creates something new. Existing objects and data are untouched. | Create missing table, sequence, index, view, routine, trigger; add missing constraint; add nullable column. |
-| `REBUILD` | Drops and recreates an object that holds no data of its own. | Recreate drifted index, view, constraint, routine or trigger. |
-| `DESTRUCTIVE` | Can remove or rewrite stored data, or can fail on existing data. | Drop or retype a column, change a table's column set, alter a sequence's options (this changes future values and can fail against the current value). |
+| `REBUILD` | Drops and recreates an object that holds no data of its own, or rewrites pure metadata in place. | Recreate drifted index, view, constraint, routine or trigger; drop+create a policy; set or change a comment via `COMMENT ON`; domain alterations that cannot touch stored values (`SET`/`DROP DEFAULT`, `DROP NOT NULL`, `DROP CONSTRAINT`). |
+| `DESTRUCTIVE` | Can remove or rewrite stored data, or can fail on existing data. | Drop or retype a column, change a table's column set, alter a sequence's options (this changes future values and can fail against the current value), drop+create a materialized view (its stored result rows are rewritten), a domain `SET NOT NULL` or `ADD CHECK` (validates existing values); manual changes for enum label removal or reorder and domain base-type changes. |
 
 A `MISSING` table and the children its create covers (5.8.4) are created as one `ADDITIVE` change, whatever the nullability of its columns, because no stored data exists yet. So C-01 reconciles under the default policy. Rules 1 and 2 below govern tables present in the actual snapshot:
 
@@ -594,6 +602,16 @@ public interface Dialect {
 
     /** Renders the statements and safety class for one difference, bound to the target namespace. */
     List<PlannedChange> render(Difference difference, SchemaSnapshot desired, String targetNamespace);
+
+    /**
+     * Create-fragment statements for one snapshot object, written with the
+     * {@code ${namespace}} token (3.2) so the emitted script is
+     * namespace-neutral — the building block of {@code dump()} (3.1). An
+     * object that cannot be represented as a create fragment returns an
+     * empty list; the core emits it as a comment line instead of dropping
+     * it silently (P4).
+     */
+    default List<String> dumpStatements(SchemaObject object) { return List.of(); }
 
     /**
      * Quotes an identifier for safe inclusion in SQL. Throws
@@ -719,6 +737,18 @@ Every message raised during a run must name the target namespace and, where appl
 | C-34 | Drifted column: unsafe type change | manual `DESTRUCTIVE` change; default policy throws `PolicyViolationException`; data untouched |
 | C-35 | `unsupportedCategories` reports one category while `unsupported` stays `FAIL` | the tolerated `UNSUPPORTED` difference lands in `report.unsupported()`; a `FAIL`-category one still fails the plan |
 | C-36 | `ReconcileReport.timings()` | every `RunTimings` phase is non-negative; `elapsed` covers their sum |
+| C-37 | Materialized view missing | `MISSING` `MATERIALIZED_VIEW`, `ADDITIVE`, created with data; then `UP_TO_DATE` |
+| C-38 | Materialized view drifted (viewdef changed) | `DESTRUCTIVE` `DROP`+`CREATE`+`REFRESH` under a `destructive=APPLY` policy; recreated to canonical form with data |
+| C-39 | Enum type missing; label appended in order | `MISSING` `TYPE`, `ADDITIVE`; then appending one label renders an `ADDITIVE` `ALTER TYPE ... ADD VALUE` |
+| C-40 | Enum with a removed or reordered label | manual `DESTRUCTIVE`; default policy throws `PolicyViolationException`; type untouched |
+| C-41 | Domain missing | `MISSING` `DOMAIN`, `ADDITIVE`, created; then `UP_TO_DATE` |
+| C-42 | Domain drift limited to safe alterations (default, drop not-null, drop check) | `REBUILD` in-place `ALTER DOMAIN`; converges |
+| C-43 | Domain base-type change | manual `DESTRUCTIVE`; default policy throws `PolicyViolationException` |
+| C-44 | Policy missing; policy drifted | `MISSING` `POLICY`, `ADDITIVE` created; a changed `USING` renders `REBUILD` `DROP`+`CREATE` |
+| C-45 | Extension missing | `MISSING` `EXTENSION`, `ADDITIVE`, created in the target namespace; removed by the scratch rollback |
+| C-46 | Comment missing; comment drifted | `COMMENT` `ALTER` changes (`REBUILD`) converge to the desired text |
+| C-47 | Comment absent from desired, present in target | `UNEXPECTED` `COMMENT`, never dropped |
+| C-48 | Desired script with interlocked new kinds (domain-typed column, materialized-view index, policy and comments on the table) | reconciles in dependency order; second run `UP_TO_DATE` |
 
 ### 9.3 Implementation conformance
 
@@ -796,20 +826,28 @@ The whole script is sent in one `Statement.execute` call. The server parses it, 
 | `SEQUENCE` | `pg_sequence` | type, start, increment, min, max, cache, cycle; never the current value |
 | `ROUTINE` | `pg_proc` (`prokind` `f`, `p`) | `pg_get_functiondef(oid)`; the identity signature (4.1) is `proname` plus `format_type` over each element of `proargtypes` |
 | `TRIGGER` | `pg_trigger` (`NOT tgisinternal`) | `pg_get_triggerdef(oid, true)` plus the enabled state (`tgenabled`) |
+| `MATERIALIZED_VIEW` | `pg_class` (`relkind` `m`) | `pg_get_viewdef(oid, true)` plus column names and types, plus `reloptions`, `relpersistence` and `relispopulated` |
+| `TYPE` | `pg_type` (`typtype` `e` — enums only) | `typtype` plus the labels of `pg_enum` ordered by `enumsortorder` |
+| `DOMAIN` | `pg_type` (`typtype` `d`) | `format_type(typbasetype, typtypmod)`, `typnotnull`, `pg_get_expr(typdefaultbin, 0)`, collation when it differs from the base type's, and the domain's `CHECK` constraints (`pg_constraint` on `contypid`, `contype` `c`, `pg_get_constraintdef`, in constraint-name order) |
+| `POLICY` | `pg_policy` | `polcmd`, `polpermissive`, the role list as sorted names (`polroles` oid `0` is `PUBLIC`), `pg_get_expr(polqual, polrelid)`, `pg_get_expr(polwithcheck, polrelid)` |
+| `EXTENSION` | `pg_extension` | presence only — the literal `extension`; the version is never compared (`ALTER EXTENSION UPDATE` is out of scope), and `ObjectId.name` keeps the `extension:<name>` form so the id is stable across the promotion |
+| `COMMENT` | `pg_description` joined to the managed object (`objoid`, `objsubid` `0` for objects, `> 0` for columns) | the comment text; a target with no row has no `COMMENT` object |
 | dependencies | `pg_depend`, `pg_rewrite`, `pg_inherits`, `pg_trigger`, restricted to objects of the namespace being read | populate `dependsOn` |
 | `OTHER` | see below | detected so that unsupported constructs are reported (5.4) |
 
 `OTHER` detection covers every namespace-scoped catalog object the managed
-kinds do not claim: non-managed relations (`relkind` `m`, `f`, `p`, `c`, `t`,
+kinds do not claim: non-managed relations (`relkind` `f`, `p`, `c`, `t`,
 `I` and `r` tables with an inheritance parent), exclusion constraints
-(`contype` `x`), user-defined types (`pg_type` `e`, `d`, `r`, `m` and base
-types), aggregates and window functions (`pg_proc` `a`, `w`), policies
-(`pg_policy`), extensions (`pg_extension`), non-view rules (`pg_rewrite`),
-statistics (`pg_statistic_ext`), collations (`pg_collation`), conversions
+(`contype` `x`), non-enum user types (`pg_type` `r`, `m` and base types;
+composite types carry `relkind` `c` and collide with the relation
+namespace, so they stay `OTHER` rather than `TYPE`), aggregates and window
+functions (`pg_proc` `a`, `w`), non-view rules (`pg_rewrite`), statistics
+(`pg_statistic_ext`), collations (`pg_collation`), conversions
 (`pg_conversion`), text-search objects (`pg_ts_config`, `pg_ts_dict`,
 `pg_ts_parser`, `pg_ts_template`), operators, operator classes and families
-(`pg_operator`, `pg_opclass`, `pg_opfamily`), comments (`pg_description`),
-security labels (`pg_seclabel`), granted privileges (non-null `relacl`, `proacl`, `typacl`; compared by content: the ACL entries as sorted `grantor>grantee:PRIVILEGE[*]` tokens, with the owner written `<owner>` and `*` marking a grant option, so a target holding the same grants reports no difference), ownership changed away from the connecting role
+(`pg_operator`, `pg_opclass`, `pg_opfamily`), comments on unmanaged or
+otherwise unrepresentable targets (`pg_description`), security labels
+(`pg_seclabel`), granted privileges (non-null `relacl`, `proacl`, `typacl`; compared by content: the ACL entries as sorted `grantor>grantee:PRIVILEGE[*]` tokens, with the owner written `<owner>` and `*` marking a grant option, so a target holding the same grants reports no difference), ownership changed away from the connecting role
 (`relowner`, `proowner`, `typowner`) and publication bindings
 (`pg_publication_rel` for tables, `pg_publication_sequences` for sequences
 on PostgreSQL 19+). Three catalog object kinds have no namespace of their
@@ -820,18 +858,35 @@ whose source type, target type or cast function is in the namespace,
 
 `OTHER` object ids carry a documented category prefix — the substring
 before the first `:` of the `ObjectId` name, used by
-`unsupportedCategories` (3.3): `matview`, `foreign`, `partition`,
+`unsupportedCategories` (3.3): `foreign`, `partition`,
 `partindex`, `composite`, `toast`, `inherited` and `relation` (any other
-non-managed `relkind`), `constraint` (exclusion), `type`, `extension`,
-`policy`, `rule`, `statistics`, `collation`, `conversion`, `fts-config`,
+non-managed `relkind`), `constraint` (exclusion), `type` (non-enum),
+`rule`, `statistics`, `collation`, `conversion`, `fts-config`,
 `fts-dict`, `fts-parser`, `fts-template`, `operator`, `opclass`,
-`opfamily`, `comment`, `seclabel`, `privileges`, `ownership`,
-`publication`, `cast`, `transform`, `language` and `routine` (aggregate
-or window). Extension *member* objects (`pg_depend` `deptype = 'e'`) are
-excluded from the model entirely: they cannot be created or dropped
-standalone, so a member function or type must never surface as a managed
-object or an `UNEXPECTED` one — only the `pg_extension` row itself is
-reported, as `extension:<name>`.
+`opfamily`, `comment` (unmanaged target), `seclabel`, `privileges`,
+`ownership`, `publication`, `cast`, `transform`, `language` and `routine`
+(aggregate or window). Extension *member* objects (`pg_depend`
+`deptype = 'e'`) are excluded from the model entirely: they cannot be
+created or dropped standalone, so a member function or type must never
+surface as a managed object or an `UNEXPECTED` one — only the
+`pg_extension` row itself is reported, as an `EXTENSION` object named
+`extension:<name>`.
+
+A `COMMENT` object's `ObjectId` mirrors its target — same `name`, same
+`parent` — so a comment on table `t` is `COMMENT t`, a comment on column
+`t.c` is `COMMENT c` with parent `t`, and a comment on index `i` on `t`
+is `COMMENT i` with parent `t`. When two commented targets share name and
+parent (a function and its aggregate use the same signature name, a
+constraint and its backing index share a name), the second id gains a
+`(<target kind>)` suffix in name order so both comments surface. `COMMENT`
+objects `dependsOn` their target. A `POLICY` object's `ObjectId` is the
+policy name with `parent` the table, and it carries both the parent edge
+and an explicit `dependsOn` entry for the table. A table's
+`relrowsecurity` flag is part of the `TABLE` canonical definition, so
+enabling row-level security with no policies still reconciles — a `TABLE`
+drift limited to that flag renders an in-place `ALTER TABLE ... ENABLE/DISABLE
+ROW LEVEL SECURITY` (`REBUILD`); any other `TABLE` definition change stays
+manual `DESTRUCTIVE` as before.
 
 Objects that have no namespace anchor at all — databases, tablespaces,
 roles, event triggers, servers, foreign data wrappers, user mappings,
@@ -871,14 +926,15 @@ Sequences that back columns are handled by how they are owned:
 - **Identity columns.** The internal sequence (`pg_depend.deptype` `i`) is not reported as an object. Identity generation (`ALWAYS` or `BY DEFAULT`) and its sequence options are part of the `COLUMN` canonical definition.
 - **Serial-style owned sequences** (`deptype` `a`, `OWNED BY`). These are reported as `SEQUENCE` objects under their catalog names, for example `plans_id_seq`. Their canonical definition includes `OWNED BY <table>.<column>`. Their `dependsOn` records the owning *table*, never the column. The column's `nextval(...)` default already depends on the sequence, so recording the ownership edge against the column would form a cycle (5.8.6). When the owning table is `MISSING`, its create covers its owned sequences (5.8.4) and runs `CREATE SEQUENCE`, `CREATE TABLE`, `ALTER SEQUENCE ... OWNED BY` as one change.
 
-Name scopes (`nameScopes`, 5.8.7). Tables, views, sequences and indexes share one relation namespace per schema. Primary-key and unique constraints also create an index under their own name. Constraint names are unique per table:
+Name scopes (`nameScopes`, 5.8.7). Tables, views, materialized views, sequences and indexes share one relation namespace per schema; types and domains share the same type namespace, which collides with the relation namespace through composite-type rowtypes. Primary-key and unique constraints also create an index under their own name. Constraint names are unique per table:
 
 | Kind | Keys |
 |---|---|
-| `TABLE`, `VIEW`, `SEQUENCE`, `INDEX`, `OTHER` relations | `relation:<name>` |
+| `TABLE`, `VIEW`, `MATERIALIZED_VIEW`, `SEQUENCE`, `INDEX`, `OTHER` relations | `relation:<name>` |
+| `TYPE`, `DOMAIN`, `OTHER` types (`type:`) | `relation:<name>` (the shared type/relation namespace) |
 | `PRIMARY_KEY`, `UNIQUE` | `relation:<name>`, `constraint:<parent>.<name>` |
 | `FOREIGN_KEY`, `CHECK` | `constraint:<parent>.<name>` |
-| `COLUMN`, `ROUTINE`, `TRIGGER` | none (the `ObjectId` is already the engine's uniqueness key) |
+| `COLUMN`, `ROUTINE`, `TRIGGER`, `POLICY`, `EXTENSION`, `COMMENT` | none (the `ObjectId` is already the engine's uniqueness key) |
 
 ### A.6 Rendering
 
@@ -897,6 +953,19 @@ Name scopes (`nameScopes`, 5.8.7). Tables, views, sequences and indexes share on
 | `MISSING` routine | `CREATE`: `pg_get_functiondef` | `ADDITIVE` |
 | `DRIFTED` routine | `ALTER`: `CREATE OR REPLACE` from `pg_get_functiondef`; if the return type changed, a `DROP` change `DROP FUNCTION`/`DROP PROCEDURE` plus a `CREATE` change instead | `REBUILD` |
 | `MISSING` / `DRIFTED` trigger | `CREATE`: `pg_get_triggerdef`, followed by `ALTER TABLE ... ENABLE|DISABLE TRIGGER` for a non-default enabled state; when drifted, preceded by a `DROP` change `DROP TRIGGER` | `ADDITIVE` / `REBUILD` |
+| `MISSING` materialized view | `CREATE MATERIALIZED VIEW` with the desired viewdef, `reloptions` and `relpersistence`, `WITH NO DATA` when the desired object is unpopulated | `ADDITIVE` |
+| `DRIFTED` materialized view | `DROP MATERIALIZED VIEW` + `CREATE MATERIALIZED VIEW` + `REFRESH MATERIALIZED VIEW` (skipped when the desired object is unpopulated); dependent indexes follow via the dependency graph | `DESTRUCTIVE` — the stored result rows are rewritten (5.6) |
+| `MISSING` enum type | `CREATE TYPE <name> AS ENUM (<labels>)` | `ADDITIVE` |
+| `DRIFTED` enum whose desired labels append to the actual ones in order | one `ALTER TYPE ... ADD VALUE` per new label | `ADDITIVE` — pure in-order growth |
+| `DRIFTED` enum with a removed or reordered label | manual change (no statements) | `DESTRUCTIVE` |
+| `MISSING` domain | `CREATE DOMAIN` with base type, collation, `DEFAULT`, `NOT NULL` and `CHECK` constraints | `ADDITIVE` |
+| `DRIFTED` domain | in-place `ALTER DOMAIN` statements decomposed from the canonical difference — `SET`/`DROP DEFAULT`, `DROP NOT NULL`, `DROP CONSTRAINT` go in one `ALTER` change; `SET NOT NULL` and `ADD CONSTRAINT` validate existing values, so each renders as a separate `ALTER` change; a base-type or collation change is a manual change (no statements) | `REBUILD` / `DESTRUCTIVE` |
+| `MISSING` policy | `CREATE POLICY ... ON <table> FOR <cmd> TO <roles>` with `USING` / `WITH CHECK` as desired | `ADDITIVE` |
+| `DRIFTED` policy | `DROP POLICY` + `CREATE POLICY` | `REBUILD` |
+| `DRIFTED` table limited to `relrowsecurity` | `ALTER`: `ALTER TABLE ... ENABLE|DISABLE ROW LEVEL SECURITY` | `REBUILD` |
+| `MISSING` extension | `CREATE EXTENSION IF NOT EXISTS <name> WITH SCHEMA <target>` | `ADDITIVE` |
+| `DRIFTED` extension | unreachable — the canonical definition is presence-only (asserted manual change as a safeguard) | `DESTRUCTIVE` |
+| `MISSING` / `DRIFTED` comment | `ALTER`: `COMMENT ON <kind> <target> IS '<literal>'` (`COMMENT ON MATERIALIZED VIEW` for a materialized-view target) | `REBUILD` — metadata only, no data risk |
 | `DRIFTED` column | in-place `ALTER TABLE ... ALTER COLUMN` statements decomposed from the canonical difference — `SET`/`DROP DEFAULT`, `DROP NOT NULL`, and `TYPE` only for a widening (below); one `ALTER` change | `REBUILD` |
 | `DRIFTED` column that also needs `SET NOT NULL` | the `REBUILD` change above carries only the safe statements; the `SET NOT NULL` renders as a second `ALTER` change on the same column | `DESTRUCTIVE` |
 | `DRIFTED` column with a generated, identity or collation change, or a type change outside the widening list | manual change (no statements) | `DESTRUCTIVE` |
@@ -948,15 +1017,21 @@ Coverage of the PostgreSQL SQL command set by the reference dialect, measured ag
 | `PRIMARY KEY`, `UNIQUE`, `FOREIGN KEY`, `CHECK` | constraint kinds via `pg_constraint` |
 | `CREATE INDEX` | `INDEX` objects (partial, expression, unique — including indexes that back `FOREIGN KEY` references); `CONCURRENTLY` is non-transactional and rejected (3.2) |
 | `CREATE [OR REPLACE] VIEW` | `VIEW` objects incl. `reloptions` (`check_option`, `security_barrier`, `security_invoker`) |
+| `CREATE MATERIALIZED VIEW` / `REFRESH MATERIALIZED VIEW` | `MATERIALIZED_VIEW` objects incl. `reloptions`, `relpersistence`, populated state; its indexes are managed `INDEX` objects |
+| `CREATE TYPE ... AS ENUM` / `ALTER TYPE ... ADD VALUE` | `TYPE` objects; other `typtype` values stay `OTHER` |
+| `CREATE DOMAIN` / `ALTER DOMAIN` | `DOMAIN` objects incl. base type, `NOT NULL`, `DEFAULT`, `CHECK` constraints |
+| `CREATE POLICY` / `ALTER POLICY` / `DROP POLICY`, `ALTER TABLE ... ENABLE|DISABLE ROW LEVEL SECURITY` | `POLICY` objects; `relrowsecurity` is part of the `TABLE` canonical definition |
+| `CREATE EXTENSION` | `EXTENSION` objects, presence-only; member objects stay excluded; `ALTER EXTENSION` is rejected (version upgrades out of scope) |
+| `COMMENT ON` | `COMMENT` objects on managed targets (`TABLE`, `COLUMN`, `VIEW`, `MATERIALIZED_VIEW`, `SEQUENCE`, `INDEX`, constraint kinds, `ROUTINE`, `TRIGGER`, `TYPE`, `DOMAIN`, `POLICY`, `EXTENSION`); on any other target it is detected as `OTHER` — see below |
 | `CREATE SEQUENCE` / `ALTER SEQUENCE` | `SEQUENCE` objects; serial-owned and identity sequences folded per A.5 |
 | `CREATE FUNCTION` / `CREATE PROCEDURE` | `ROUTINE` objects (`prokind` `f`, `p`) |
 | `CREATE TRIGGER` | `TRIGGER` objects incl. `tgenabled` state; constraint triggers are excluded by `tgisinternal` |
-| `COMMENT ON`, `GRANT`/`REVOKE`, `ALTER ... OWNER TO`, `SECURITY LABEL` | attributes are detected — see below |
+| `GRANT`/`REVOKE`, `ALTER ... OWNER TO`, `SECURITY LABEL` | attributes are detected — see below |
 | `CREATE SCHEMA` | rejected: the core owns the namespace (3.2) |
 
 ### Detected but unsupported (`OTHER` → `UNSUPPORTED` per 5.4)
 
-`EXCLUDE` constraints, `CREATE TYPE` (enum/domain/range/multirange/base/composite), `CREATE DOMAIN`, `CREATE MATERIALIZED VIEW`, `CREATE FOREIGN TABLE`, `IMPORT FOREIGN SCHEMA`, partitioned tables and indexes, classic-inheritance children, `CREATE AGGREGATE`, window functions, `CREATE POLICY` (row-level security), `CREATE EXTENSION`, `CREATE RULE`, `CREATE STATISTICS`, `CREATE COLLATION`, `CREATE CONVERSION`, `CREATE TEXT SEARCH CONFIGURATION|DICTIONARY|PARSER|TEMPLATE`, `CREATE OPERATOR`, `CREATE OPERATOR CLASS`, `CREATE OPERATOR FAMILY`, `CREATE CAST` and `CREATE TRANSFORM` when anchored to a namespace object, `COMMENT ON` any catalog object, `SECURITY LABEL`, granted privileges, ownership reassignment, `FOR TABLE` publication bindings and sequence publication bindings (`pg_publication_sequences`, PostgreSQL 19+). Publication bindings are observable on the target only: the script check rejects every `PUBLICATION` statement, so a script cannot create one.
+`EXCLUDE` constraints, `CREATE TYPE` for non-enum types (range/multirange/base/composite — composites stay `OTHER` because their `relkind` `c` rowtype collides with the relation namespace), `CREATE FOREIGN TABLE`, `IMPORT FOREIGN SCHEMA`, partitioned tables and indexes, classic-inheritance children, `CREATE AGGREGATE`, window functions, `CREATE RULE`, `CREATE STATISTICS`, `CREATE COLLATION`, `CREATE CONVERSION`, `CREATE TEXT SEARCH CONFIGURATION|DICTIONARY|PARSER|TEMPLATE`, `CREATE OPERATOR`, `CREATE OPERATOR CLASS`, `CREATE OPERATOR FAMILY`, `CREATE CAST` and `CREATE TRANSFORM` when anchored to a namespace object, `COMMENT ON` an unmanaged target, `SECURITY LABEL`, granted privileges, ownership reassignment, `FOR TABLE` publication bindings and sequence publication bindings (`pg_publication_sequences`, PostgreSQL 19+). Publication bindings are observable on the target only: the script check rejects every `PUBLICATION` statement, so a script cannot create one.
 
 ### Out of scope (cluster-level or statement-only, per 1.5/3.2)
 

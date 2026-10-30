@@ -34,6 +34,7 @@ import studio.epicquest.schema.reconciler.ReconcileReport;
 import studio.epicquest.schema.reconciler.SchemaReconciler;
 import studio.epicquest.schema.reconciler.StalePlanException;
 import studio.epicquest.schema.reconciler.model.ChangeAction;
+import studio.epicquest.schema.reconciler.model.ChangeSafety;
 import studio.epicquest.schema.reconciler.model.DifferenceType;
 import studio.epicquest.schema.reconciler.model.ObjectId;
 import studio.epicquest.schema.reconciler.model.ObjectKind;
@@ -42,7 +43,7 @@ import studio.epicquest.schema.reconciler.model.SchemaSnapshot;
 import studio.epicquest.schema.reconciler.spi.Dialect;
 
 /**
- * The dialect conformance suite of spec 9.2 — scenarios C-01 to C-36. A dialect
+ * The dialect conformance suite of spec 9.2 — scenarios C-01 to C-48. A dialect
  * is run by subclassing this class and providing a disposable database plus
  * per-test namespaces via the hooks below. Skips are permitted only for kinds
  * absent from {@code supportedKinds()} or undeclared capabilities, and every
@@ -257,6 +258,21 @@ public abstract class DialectConformanceTest {
 
     private static ObjectId column(String parent, String name) {
         return new ObjectId(ObjectKind.COLUMN, name, parent);
+    }
+
+    private static ObjectId matview(String name) {
+        return new ObjectId(ObjectKind.MATERIALIZED_VIEW, name);
+    }
+
+    /** The row count of a relation in the test namespace — proves a
+     *  materialized view actually holds its stored result rows. */
+    protected final long count(String relation) throws SQLException {
+        try (Connection c = dataSource().getConnection();
+                final var s = c.createStatement();
+                final var rs = s.executeQuery(
+                        "SELECT count(*) FROM " + qualified(relation))) {
+            return rs.next() ? rs.getLong(1) : -1;
+        }
     }
 
     private static ObjectId routine(String name, String args) {
@@ -904,5 +920,55 @@ public abstract class DialectConformanceTest {
             assertFalse(d.isNegative());
         }
         assertFalse(report.elapsed().isNegative());
+    }
+
+    @Test
+    @DisplayName("C-37 materialized view missing: ADDITIVE create, populated")
+    void c37MaterializedViewMissing() throws Exception {
+        assumeKind(ObjectKind.MATERIALIZED_VIEW);
+        reconciler("CREATE TABLE t (id bigint)").reconcile();
+        execute("INSERT INTO " + qualified("t") + " VALUES (1), (2)");
+        final var script = """
+                CREATE TABLE t (id bigint);
+                CREATE MATERIALIZED VIEW mv AS SELECT id FROM t
+                """;
+        final var report = reconciler(script).reconcile();
+        assertEquals(ReconcileOutcome.RECONCILED, report.outcome());
+        assertTrue(report.applied().stream().anyMatch(c ->
+                        c.target().equals(matview("mv")) && c.safety() == ChangeSafety.ADDITIVE),
+                "expected an ADDITIVE create for the materialized view: " + report.applied());
+        // the view must hold its stored rows, not just exist
+        assertEquals(2L, count("mv"));
+        assertEquals(ReconcileOutcome.UP_TO_DATE, reconciler(script).reconcile().outcome());
+    }
+
+    @Test
+    @DisplayName("C-38 materialized view drifted: DESTRUCTIVE drop+create+refresh")
+    void c38MaterializedViewDrifted() throws Exception {
+        assumeKind(ObjectKind.MATERIALIZED_VIEW);
+        reconciler("""
+                CREATE TABLE t (id bigint);
+                CREATE MATERIALIZED VIEW mv AS SELECT id FROM t
+                """).reconcile();
+        execute("INSERT INTO " + qualified("t") + " VALUES (1), (2)");
+        execute("REFRESH MATERIALIZED VIEW " + qualified("mv"));
+        // a stored-data recreate is DESTRUCTIVE: the default policy refuses it
+        assertThrows(PolicyViolationException.class, () -> reconciler(
+                "CREATE TABLE t (id bigint);"
+                        + " CREATE MATERIALIZED VIEW mv AS SELECT id, id + 1 AS plus FROM t")
+                .reconcile());
+        final var report = reconciler("""
+                CREATE TABLE t (id bigint);
+                CREATE MATERIALIZED VIEW mv AS SELECT id, id + 1 AS plus FROM t
+                """, ReconcilePolicy.defaults().withDestructive(Decision.APPLY)).reconcile();
+        assertEquals(ReconcileOutcome.RECONCILED, report.outcome());
+        assertTrue(report.applied().stream().anyMatch(c ->
+                        c.target().equals(matview("mv")) && c.safety() == ChangeSafety.DESTRUCTIVE),
+                "expected DESTRUCTIVE changes for the materialized view: " + report.applied());
+        assertEquals(2L, count("mv"));
+        assertEquals(ReconcileOutcome.UP_TO_DATE, reconciler("""
+                CREATE TABLE t (id bigint);
+                CREATE MATERIALIZED VIEW mv AS SELECT id, id + 1 AS plus FROM t
+                """, ReconcilePolicy.defaults().withDestructive(Decision.APPLY)).reconcile().outcome());
     }
 }

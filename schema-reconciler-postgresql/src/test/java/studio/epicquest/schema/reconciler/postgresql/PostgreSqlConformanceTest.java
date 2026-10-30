@@ -190,14 +190,14 @@ class PostgreSqlConformanceTest extends DialectConformanceTest {
     @Override
     protected UnsupportedScript unsupportedScript() {
         return new UnsupportedScript(
-                "CREATE MATERIALIZED VIEW m_unsupported AS SELECT 1 AS id;"
-                        + " CREATE VIEW dep_view AS SELECT id FROM m_unsupported",
-                "dep_view");
+                "CREATE TABLE part_parent (id bigint) PARTITION BY RANGE (id);"
+                        + " CREATE VIEW dep_v AS SELECT id FROM part_parent",
+                "dep_v");
     }
 
     @Override
     protected String unsupportedCategory() {
-        return "matview"; // relkind 'm' → OTHER id "matview:<name>" (A.5)
+        return "partition"; // partitioned parents → OTHER id "partition:<name>" (A.5)
     }
 
     @Override
@@ -351,28 +351,28 @@ class PostgreSqlConformanceTest extends DialectConformanceTest {
         final var names = report.unexpected().stream()
                 .map(d -> d.id().name()).sorted().toList();
         assertEquals(List.of("comment:pg_trgm", "comment:t", "extension:pg_trgm",
-                "matview:mv", "policy:t.p_sel"), names);
+                "mv", "policy:t.p_sel"), names);
         assertEquals(ReconcileOutcome.UP_TO_DATE,
                 reconciler("CREATE TABLE t (id bigint, note text)").reconcile().outcome());
     }
 
     @Test
-    @DisplayName("category override tolerates policy/comment but not the matview")
+    @DisplayName("category override tolerates rule/privileges but not statistics")
     void categoryOverrideSplitsUnsupportedKinds() throws Exception {
         final var script = """
-                CREATE TABLE t (id bigint);
-                CREATE POLICY p_sel ON t FOR SELECT USING (true);
-                COMMENT ON TABLE t IS 'managed';
-                CREATE MATERIALIZED VIEW mv AS SELECT id FROM t
+                CREATE TABLE t (id bigint, n int);
+                GRANT SELECT ON t TO PUBLIC;
+                CREATE RULE rl AS ON INSERT TO t DO ALSO NOTHING;
+                CREATE STATISTICS st ON id, n FROM t
                 """;
         final var tolerant = ReconcilePolicy.defaults()
-                .withUnsupportedCategory("policy", Decision.REPORT)
-                .withUnsupportedCategory("comment", Decision.REPORT);
-        // the matview category is not tolerated → still fails closed
+                .withUnsupportedCategory("rule", Decision.REPORT)
+                .withUnsupportedCategory("privileges", Decision.REPORT);
+        // the statistics category is not tolerated → still fails closed
         assertThrows(PolicyViolationException.class,
                 () -> reconciler(script, tolerant).reconcile());
         final var report = reconciler(script, tolerant
-                .withUnsupportedCategory("matview", Decision.REPORT)).reconcile();
+                .withUnsupportedCategory("statistics", Decision.REPORT)).reconcile();
         // tolerated objects are reported as intentionally ignored, not reconciled
         assertEquals(3, report.unsupported().size(), report.unsupported().toString());
         assertTrue(report.unsupported().stream().allMatch(
@@ -382,7 +382,7 @@ class PostgreSqlConformanceTest extends DialectConformanceTest {
                 "the managed change still applies: " + report.applied());
         assertEquals(ReconcileOutcome.UP_TO_DATE,
                 reconciler(script, tolerant
-                        .withUnsupportedCategory("matview", Decision.REPORT))
+                        .withUnsupportedCategory("statistics", Decision.REPORT))
                         .reconcile().outcome());
     }
 
@@ -531,29 +531,27 @@ class PostgreSqlConformanceTest extends DialectConformanceTest {
     }
 
     @Test
-    @DisplayName("tolerated extension and grant report; the matview still fails")
-    void toleratedExtensionAndGrantVsMatview() throws Exception {
-        // environmental kinds (extension, privileges and the extension's own
-        // comment) may be tolerated per category — a materialized view must
-        // still fail closed under the same policy
+    @DisplayName("tolerated rule and grant report; the statistics still fails")
+    void toleratedRuleAndGrantVsStatistics() throws Exception {
+        // rules and privileges may be tolerated per category — an unsupported
+        // construct must still fail closed under the same policy
         final var script = """
-                CREATE TABLE t (id bigint);
-                CREATE EXTENSION pg_trgm;
+                CREATE TABLE t (id bigint, n int);
+                CREATE RULE rl AS ON INSERT TO t DO ALSO NOTHING;
                 GRANT SELECT ON t TO PUBLIC;
-                CREATE MATERIALIZED VIEW mv AS SELECT id FROM t
+                CREATE STATISTICS st ON id, n FROM t
                 """;
         final var tolerant = ReconcilePolicy.defaults()
-                .withUnsupportedCategory("extension", Decision.REPORT)
-                .withUnsupportedCategory("privileges", Decision.REPORT)
-                .withUnsupportedCategory("comment", Decision.REPORT);
+                .withUnsupportedCategory("rule", Decision.REPORT)
+                .withUnsupportedCategory("privileges", Decision.REPORT);
         assertThrows(PolicyViolationException.class,
                 () -> reconciler(script, tolerant).reconcile());
         final var report = reconciler(script, tolerant
-                .withUnsupportedCategory("matview", Decision.REPORT)).reconcile();
+                .withUnsupportedCategory("statistics", Decision.REPORT)).reconcile();
         final var names = report.unsupported().stream()
                 .map(d -> d.id().name()).sorted().toList();
-        assertTrue(names.contains("extension:pg_trgm"), names.toString());
-        assertTrue(names.contains("matview:mv"), names.toString());
+        assertTrue(names.contains("rule:t.rl"), names.toString());
+        assertTrue(names.contains("statistics:t.st"), names.toString());
         assertTrue(names.stream().anyMatch(n -> n.startsWith("privileges:")),
                 "expected a privileges entry: " + names);
         // tolerated objects are intentionally ignored, never applied
@@ -563,7 +561,7 @@ class PostgreSqlConformanceTest extends DialectConformanceTest {
                 .anyMatch(c -> c.target().equals(table("t"))),
                 "the managed change still applies: " + report.applied());
         assertEquals(ReconcileOutcome.UP_TO_DATE, reconciler(script, tolerant
-                .withUnsupportedCategory("matview", Decision.REPORT))
+                .withUnsupportedCategory("statistics", Decision.REPORT))
                 .reconcile().outcome());
     }
 
