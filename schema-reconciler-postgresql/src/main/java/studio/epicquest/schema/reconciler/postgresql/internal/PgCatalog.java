@@ -913,7 +913,7 @@ public final class PgCatalog {
             try (PreparedStatement ps = conn.prepareStatement("""
                     SELECT po.oid, po.polname, po.polrelid, c.relname, po.polcmd,
                            po.polpermissive,
-                           (SELECT string_agg(x, ',' ORDER BY x)
+                           (SELECT array_agg(x ORDER BY x)
                               FROM (SELECT DISTINCT CASE WHEN u = 0 THEN 'PUBLIC'
                                                          ELSE r.rolname END AS x
                                       FROM unnest(po.polroles) u
@@ -934,14 +934,19 @@ public final class PgCatalog {
                         }
                         final var name = rs.getString("polname");
                         final var table = rs.getString("relname");
-                        final var roles = nullToEmpty(rs.getString("roles"));
+                        final var rolesArray = rs.getArray("roles");
+                        final var roles = rolesArray == null ? List.<String>of()
+                                : Arrays.stream((String[]) rolesArray.getArray())
+                                        .map(r -> "PUBLIC".equals(r)
+                                                ? r : PgIdentifiers.quote(r))
+                                        .toList();
                         final var using = rs.getString("using");
                         final var wcheck = rs.getString("wcheck");
                         final var qTable = qNs + "." + PgIdentifiers.quote(table);
                         final var id = new ObjectId(ObjectKind.POLICY, name, table);
                         final var canonical = new StringBuilder("cmd=" + rs.getString("polcmd")
                                 + ";permissive=" + rs.getBoolean("polpermissive")
-                                + ";roles=" + roles);
+                                + ";roles=" + String.join(",", roles));
                         final var create = new StringBuilder("CREATE POLICY "
                                 + PgIdentifiers.quote(name) + " ON " + qTable);
                         if (!rs.getBoolean("polpermissive")) {
@@ -953,7 +958,8 @@ public final class PgCatalog {
                             case "w" -> "UPDATE";
                             case "d" -> "DELETE";
                             default -> "ALL";
-                        }).append(" TO ").append(roles.isEmpty() ? "PUBLIC" : roles);
+                        }).append(" TO ").append(
+                                roles.isEmpty() ? "PUBLIC" : String.join(",", roles));
                         if (using != null) {
                             canonical.append(";using=").append(using);
                             create.append(" USING (").append(using).append(')');
