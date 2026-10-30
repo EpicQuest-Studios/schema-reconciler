@@ -310,6 +310,9 @@ class PostgreSqlInternalsTest {
                 "GRANT SELECT ON ALL TABLES IN SCHEMA other TO r",
                 "COMMENT ON TABLE other.t IS 'x'",
                 "COMMENT ON COLUMN other.t.c IS 'x'",
+                "COMMENT ON FUNCTION other.f(int) IS 'x'",
+                "COMMENT ON OPERATOR other.=(int, int) IS 'x'",
+                "SECURITY LABEL FOR p ON FUNCTION other.f(int) IS 'x'",
                 "GRANT SELECT ON DATABASE d TO r"}) {
             assertThrows(DesiredStateException.class,
                     () -> PgScriptCheck.check(sql, scratch), sql);
@@ -327,6 +330,13 @@ class PostgreSqlInternalsTest {
         PgScriptCheck.check("GRANT SELECT ON TABLE " + scratch + ".t TO r", scratch);
         PgScriptCheck.check("COMMENT ON TABLE " + scratch + ".t IS 'x'", scratch);
         PgScriptCheck.check("COMMENT ON COLUMN t.c IS 'x'", scratch);
+        // a signature's argument types are references, not name positions:
+        // a routine comment may name a foreign-schema argument type
+        PgScriptCheck.check("COMMENT ON FUNCTION f(other.t) IS 'x'", scratch);
+        PgScriptCheck.check("COMMENT ON PROCEDURE p(other.t) IS 'x'", scratch);
+        PgScriptCheck.check("COMMENT ON AGGREGATE a(other.t) IS 'x'", scratch);
+        PgScriptCheck.check("COMMENT ON OPERATOR =(other.t, int) IS 'x'", scratch);
+        PgScriptCheck.check("SECURITY LABEL FOR p ON FUNCTION f(other.t) IS 'x'", scratch);
         // unqualified names resolve inside the scratch search_path
         PgScriptCheck.check("CREATE TABLE t (a int)", scratch);
         // references to other namespaces are not creation positions:

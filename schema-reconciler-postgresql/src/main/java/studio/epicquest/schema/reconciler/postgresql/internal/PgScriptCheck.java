@@ -60,7 +60,8 @@ public final class PgScriptCheck {
             "PG_ROTATE_LOGFILE", "PG_LOG_BACKEND_MEMORY_CONTEXTS",
             "PG_LOG_STANDBY_SNAPSHOT", "PG_LOG_EMIT", "PG_LOGICAL_EMIT_MESSAGE",
             "PG_SWITCH_WAL", "PG_SWITCH_XLOG", "PG_CREATE_RESTORE_POINT",
-            "PG_BACKUP_START", "PG_BACKUP_STOP", "PG_PROMOTE", "PG_CHECKPOINT",
+            "PG_BACKUP_START", "PG_BACKUP_STOP", "PG_START_BACKUP", "PG_STOP_BACKUP",
+            "PG_PROMOTE", "PG_CHECKPOINT",
             "PG_WAL_REPLAY_PAUSE", "PG_WAL_REPLAY_RESUME",
             "PG_SYNC_REPLICATION_SLOTS",
             "PG_FILE_WRITE", "PG_FILE_RENAME", "PG_FILE_UNLINK",
@@ -139,6 +140,18 @@ public final class PgScriptCheck {
     /** Tokens between {@code SELECT ... INTO} and the created table's name. */
     private static final Set<String> SELECT_INTO_MODIFIERS = Set.of(
             "TEMP", "TEMPORARY", "UNLOGGED", "TABLE");
+
+    /**
+     * COMMENT ON / SECURITY LABEL ON kinds whose target carries its argument
+     * types in parentheses — {@code FUNCTION f(t)}, {@code OPERATOR op(t,t)}.
+     * Those are type references, like a cross-schema {@code REFERENCES}: a
+     * qualified {@code other.t} inside the parentheses is a legitimate
+     * foreign type, so only the name before the opening parenthesis anchors
+     * the target. A CAST's operands stay checked: the parenthesized type
+     * pair is the cast's entire name and anchors it.
+     */
+    private static final Set<String> SIGNATURE_TARGET_KINDS = Set.of(
+            "FUNCTION", "PROCEDURE", "ROUTINE", "AGGREGATE", "OPERATOR");
 
     /** CREATE/DROP/ALTER objects with no namespace anchor (spec 5.4). */
     private static final Set<String> DATABASE_WIDE_OBJECTS = Set.of(
@@ -980,11 +993,20 @@ public final class PgScriptCheck {
             return;
         }
         final var column = kind.equals("COLUMN");
-        for (var i = on + 1; i + 2 < is; i++) {
+        var end = is;
+        if (SIGNATURE_TARGET_KINDS.contains(kind)) {
+            for (var i = on + 1; i < is; i++) {
+                if (t.get(i).equals("(")) {
+                    end = i;
+                    break;
+                }
+            }
+        }
+        for (var i = on + 1; i + 2 < end; i++) {
             if (!t.get(i + 1).equals(".")) {
                 continue;
             }
-            if (i + 4 < is && t.get(i + 3).equals(".")) {
+            if (i + 4 < end && t.get(i + 3).equals(".")) {
                 checkQualifierAt(statement, i, scratchNamespace);
                 return;
             }
