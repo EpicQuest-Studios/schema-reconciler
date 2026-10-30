@@ -125,12 +125,13 @@ public final class Engine {
 
     /** Spec 5.1 plan(): steps 1–5, returning the plan without evaluating policy or applying. */
     public ReconcilePlan plan() {
+        requireDesiredState("plan");
         return planTimed().plan();
     }
 
     /** {@link #plan()} with the phase timings of the planning run. */
     public TimedPlan planTimed() {
-        requireDesiredState("plan");
+        requireDesiredState("planTimed");
         final var clock = new PhaseClock();
         try (Session session = open()) {
             var t = clock.now();
