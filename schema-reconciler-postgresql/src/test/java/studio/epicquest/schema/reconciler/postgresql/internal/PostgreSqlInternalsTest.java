@@ -529,6 +529,27 @@ class PostgreSqlInternalsTest {
     }
 
     @Test
+    void driftedSequencePersistenceGetsItsOwnAlterStatement() {
+        final var seq = new ObjectId(ObjectKind.SEQUENCE, "s");
+        final var want = "type=bigint;increment=1;min=1;max=9;start=1;cache=1"
+                + ";cycle=false;relpersistence=u";
+        final var desired = snap(obj(seq, want,
+                Map.of(PgCatalog.OPTIONS_SQL,
+                        "AS bigint INCREMENT BY 1 MINVALUE 1 MAXVALUE 9 START 1 CACHE 1 NO CYCLE",
+                        PgCatalog.CREATE_SQL,
+                        "CREATE UNLOGGED SEQUENCE ${namespace}.\"s\" AS bigint",
+                        PgCatalog.DROP_SQL, "DROP SEQUENCE ${namespace}.\"s\"")));
+        final var d = new Difference(seq, DifferenceType.DRIFTED,
+                Optional.of(new Definition(want)),
+                Optional.of(new Definition(want.replace("relpersistence=u", "relpersistence=p"))));
+        final var statements = PgRender.render(d, desired, "core").get(0).statements();
+        assertTrue(statements.get(0).startsWith("ALTER SEQUENCE \"core\".\"s\" AS bigint"),
+                statements.toString());
+        assertEquals("ALTER SEQUENCE \"core\".\"s\" SET UNLOGGED",
+                statements.get(statements.size() - 1));
+    }
+
+    @Test
     void driftedRoutineSameReturnTypeIsAlter() {
         final var fn = new ObjectId(ObjectKind.ROUTINE, "f()");
         final var desired = snap(obj(fn, "def",

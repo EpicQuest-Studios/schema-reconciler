@@ -832,7 +832,7 @@ Where `CREATE ON DATABASE` cannot be granted, a separate `scratchDataSource` (6.
 | `PRIMARY_KEY`, `UNIQUE`, `FOREIGN_KEY`, `CHECK` | `pg_constraint` (`contype` `p`, `u`, `f`, `c`), excluding inherited copies (`conislocal` `false` — partition-child and classic-inheritance constraints, which only the parent's object owns) | `pg_get_constraintdef(oid)` |
 | `INDEX` | `pg_index` (`relkind` `i`), excluding constraint-backing indexes (`pg_constraint.conindid` on `p`, `u`, `x` constraints) and partition-child indexes | `pg_get_indexdef(indexrelid)` |
 | `VIEW` | `pg_class` (`relkind` `v`) | `pg_get_viewdef(oid, true)` plus column names and types, plus `reloptions` (`check_option`, `security_barrier`, `security_invoker`) in sorted order |
-| `SEQUENCE` | `pg_sequence` | type, start, increment, min, max, cache, cycle; never the current value |
+| `SEQUENCE` | `pg_sequence`, `pg_class.relpersistence` | type, start, increment, min, max, cache, cycle, persistence (`LOGGED`/`UNLOGGED`); never the current value |
 | `ROUTINE` | `pg_proc` (`prokind` `f`, `p`) | `pg_get_functiondef(oid)`; the identity signature (4.1) is `proname` plus `format_type` over each element of `proargtypes` |
 | `TRIGGER` | `pg_trigger` (`NOT tgisinternal` and `tgparentid` `0` — partition clones are not standalone objects) | `pg_get_triggerdef(oid, true)` plus the enabled state (`tgenabled`) |
 | `MATERIALIZED_VIEW` | `pg_class` (`relkind` `m`) | `pg_get_viewdef(oid, true)` plus column names and types, plus `reloptions`, `relpersistence` and `relispopulated` |
@@ -960,8 +960,8 @@ Name scopes (`nameScopes`, 5.8.7). Tables, views, materialized views, sequences 
 | `DRIFTED` constraint | a `DROP` change `ALTER TABLE ... DROP CONSTRAINT`, then a `CREATE` change `ADD CONSTRAINT` | `REBUILD` |
 | `MISSING` / `DRIFTED` index | `CREATE`: the desired `pg_get_indexdef`, followed by `ALTER TABLE ... REPLICA IDENTITY USING INDEX` when it is the table's replica identity; when drifted, preceded by a `DROP` change `DROP INDEX` | `ADDITIVE` / `REBUILD` |
 | `MISSING` / `DRIFTED` view | `CREATE`: `CREATE VIEW ... AS <pg_get_viewdef>`; when drifted, preceded by a `DROP` change `DROP VIEW` | `ADDITIVE` / `REBUILD` |
-| `MISSING` sequence not covered by a table create | `CREATE`: `CREATE SEQUENCE` with the desired options, followed by `ALTER SEQUENCE ... OWNED BY` when it is owned | `ADDITIVE` |
-| `DRIFTED` sequence | `ALTER`: `ALTER SEQUENCE` setting the desired options; the current value is never changed (OI-5) | `DESTRUCTIVE` |
+| `MISSING` sequence not covered by a table create | `CREATE`: `CREATE [UNLOGGED] SEQUENCE` with the desired options, followed by `ALTER SEQUENCE ... OWNED BY` when it is owned | `ADDITIVE` |
+| `DRIFTED` sequence | `ALTER`: `ALTER SEQUENCE` setting the desired options and `ALTER SEQUENCE ... SET LOGGED`/`SET UNLOGGED` when persistence differs; the current value is never changed (OI-5) | `DESTRUCTIVE` |
 | `MISSING` routine | `CREATE`: `pg_get_functiondef` | `ADDITIVE` |
 | `DRIFTED` routine | `ALTER`: `CREATE OR REPLACE` from `pg_get_functiondef`; if the return type changed, a `DROP` change `DROP FUNCTION`/`DROP PROCEDURE` plus a `CREATE` change instead | `REBUILD` |
 | `MISSING` / `DRIFTED` trigger | `CREATE`: `pg_get_triggerdef`, followed by `ALTER TABLE ... ENABLE|DISABLE TRIGGER` for a non-default enabled state; when drifted, preceded by a `DROP` change `DROP TRIGGER` | `ADDITIVE` / `REBUILD` |

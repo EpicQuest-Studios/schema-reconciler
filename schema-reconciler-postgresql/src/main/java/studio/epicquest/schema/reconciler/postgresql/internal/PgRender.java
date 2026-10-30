@@ -403,6 +403,17 @@ public final class PgRender {
                 if (owned != null) {
                     statements.add(bind(owned, ns));
                 }
+                // persistence is not an ALTER SEQUENCE option — it has its own
+                // SET LOGGED/UNLOGGED form (since PostgreSQL 10)
+                final var wantPersist = columnFields(want.definition().canonical())
+                        .getOrDefault("relpersistence", "p");
+                final var havePersist = columnFields(difference.actual()
+                        .map(d -> d.canonical()).orElse(""))
+                        .getOrDefault("relpersistence", "p");
+                if (!wantPersist.equals(havePersist)) {
+                    statements.add(bind("ALTER SEQUENCE " + seqRef(id)
+                            + (wantPersist.equals("u") ? " SET UNLOGGED" : " SET LOGGED"), ns));
+                }
                 yield List.of(new PlannedChange(0, id, ChangeAction.ALTER,
                         ChangeSafety.DESTRUCTIVE, statements, Optional.of(want.definition()),
                         "drifted " + id));

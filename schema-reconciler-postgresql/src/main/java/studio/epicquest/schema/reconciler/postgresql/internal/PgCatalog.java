@@ -556,7 +556,7 @@ public final class PgCatalog {
 
         void loadSequences(Connection conn) throws SQLException {
             try (PreparedStatement ps = conn.prepareStatement("""
-                    SELECT c.oid, c.relname,
+                    SELECT c.oid, c.relname, c.relpersistence,
                            format_type(s.seqtypid, NULL) AS stype,
                            s.seqincrement, s.seqmin, s.seqmax, s.seqstart, s.seqcache, s.seqcycle
                     FROM pg_class c
@@ -589,14 +589,17 @@ public final class PgCatalog {
                                 + " MINVALUE " + min + " MAXVALUE " + max
                                 + " START " + start + " CACHE " + cache
                                 + (cycle ? " CYCLE" : " NO CYCLE");
+                        final var persistence = rs.getString("relpersistence");
                         final var qSeq = qNs + "." + PgIdentifiers.quote(name);
                         final var attrs = new LinkedHashMap<String, String>();
                         attrs.put(OPTIONS_SQL, options);
-                        attrs.put(CREATE_SQL, "CREATE SEQUENCE " + qSeq + " " + options);
+                        attrs.put(CREATE_SQL, "CREATE "
+                                + (persistence.equals("u") ? "UNLOGGED " : "")
+                                + "SEQUENCE " + qSeq + " " + options);
                         attrs.put(DROP_SQL, "DROP SEQUENCE " + qSeq);
                         seqOptions.put(id, "type=" + stype + ";increment=" + inc + ";min=" + min
                                 + ";max=" + max + ";start=" + start + ";cache=" + cache
-                                + ";cycle=" + cycle);
+                                + ";cycle=" + cycle + ";relpersistence=" + persistence);
                         // the canonical needs ownership, resolved by the
                         // second query — attrs accumulate here, define() runs
                         // (and normalizes them) once below
