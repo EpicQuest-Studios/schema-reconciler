@@ -156,8 +156,13 @@ public abstract class DialectConformanceTest {
 
     @AfterEach
     void closeNamespace() throws Exception {
-        assertNoScratchNamespacesLeft();
-        dropNamespace(namespace);
+        try {
+            assertNoScratchNamespacesLeft();
+        } finally {
+            if (namespace != null) {
+                dropNamespace(namespace);
+            }
+        }
     }
 
     protected final String namespace() {
@@ -232,7 +237,8 @@ public abstract class DialectConformanceTest {
     protected final List<String> targetDdl(TrackingDataSource ds) {
         final var out = new ArrayList<String>();
         var scratch = false;
-        for (final var sql : ds.executedSql()) {
+        for (final var executed : ds.statements()) {
+            final var sql = executed.sql();
             if (isScratchBoundary(sql)) {
                 scratch = true;
                 continue;
@@ -305,7 +311,7 @@ public abstract class DialectConformanceTest {
         return new ObjectId(ObjectKind.TRIGGER, name, parent);
     }
 
-    // ---- C-01 … C-32 ---------------------------------------------------------
+    // ---- C-01 … C-48 ---------------------------------------------------------
 
     @Test
     @DisplayName("C-01 empty target reconciles; second run is UP_TO_DATE")

@@ -8,6 +8,7 @@ import java.sql.CallableStatement;
 import java.sql.Connection;
 import java.sql.PreparedStatement;
 import java.sql.SQLException;
+import java.sql.SQLFeatureNotSupportedException;
 import java.sql.Statement;
 import java.util.ArrayList;
 import java.util.List;
@@ -89,7 +90,8 @@ public final class TrackingDataSource implements DataSource {
                         : statement instanceof CallableStatement
                         ? CallableStatement.class : Statement.class},
                 (proxy, method, args) -> {
-                    if (method.getName().startsWith("execute") && args != null
+                    if ((method.getName().startsWith("execute")
+                            || method.getName().equals("addBatch")) && args != null
                             && args.length > 0 && args[0] instanceof String sql) {
                         record(sql, false);
                     }
@@ -118,8 +120,8 @@ public final class TrackingDataSource implements DataSource {
     }
 
     @Override
-    public Logger getParentLogger() {
-        return Logger.getGlobal();
+    public Logger getParentLogger() throws SQLFeatureNotSupportedException {
+        return delegate.getParentLogger();
     }
 
     @Override
