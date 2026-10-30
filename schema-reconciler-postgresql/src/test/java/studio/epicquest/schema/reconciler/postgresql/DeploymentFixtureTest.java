@@ -131,4 +131,23 @@ class DeploymentFixtureTest {
         final var two = reconciler(script).plan().toSql();
         assertEquals(one, two);
     }
+
+    @Test
+    @DisplayName("3.1 dump() round-trips a reconciled namespace")
+    void dumpRoundTrips() throws Exception {
+        PgTestDatabase.ensureUuidv7(dataSource);
+        assertEquals(ReconcileOutcome.RECONCILED,
+                reconciler(migrateFixture()).reconcile().outcome());
+        final var dumper = SchemaReconciler.builder()
+                .dataSource(dataSource).namespace(namespace)
+                .dialect(dialect).build();
+        final var dump = dumper.dump();
+        // the emitted script is a desired-state script: feeding it back on
+        // the same namespace must be a no-op
+        final var self = reconciler(dump).reconcile();
+        assertEquals(ReconcileOutcome.UP_TO_DATE, self.outcome());
+        assertTrue(self.plan().changes().isEmpty());
+        // and the second dump is byte-identical
+        assertEquals(dump, dumper.dump());
+    }
 }

@@ -45,6 +45,15 @@ public final class SchemaReconciler {
         return engine.apply(Objects.requireNonNull(plan, "plan"));
     }
 
+    /**
+     * Reads the target namespace under the namespace lock and renders it as
+     * a namespace-neutral desired-state script — the bootstrap path of spec
+     * 3.1. Requires no {@code desiredState}; the target is never mutated.
+     */
+    public String dump() {
+        return engine.dump();
+    }
+
     public static final class Builder {
 
         private DataSource dataSource;
@@ -70,6 +79,12 @@ public final class SchemaReconciler {
             return this;
         }
 
+        /**
+         * The desired-state script for {@code plan()}, {@code reconcile()}
+         * and {@code apply()}. May be omitted when the reconciler is built
+         * for {@link SchemaReconciler#dump()} alone; the other methods then
+         * fail with {@link ConfigurationException} (spec 3.1).
+         */
         public Builder desiredState(DesiredState desiredState) {
             this.desiredState = Objects.requireNonNull(desiredState, "desiredState");
             return this;
@@ -121,9 +136,6 @@ public final class SchemaReconciler {
             }
             if (targetNamespace == null || targetNamespace.isEmpty()) {
                 throw new ConfigurationException("namespace is required");
-            }
-            if (desiredState == null) {
-                throw new ConfigurationException("desiredState is required");
             }
             if (lockTimeout.isNegative() || lockTimeout.isZero()) {
                 throw new ConfigurationException("lockTimeout must be positive");

@@ -205,4 +205,34 @@ class CorpusFixtureTest {
                             + second.unsupported());
         }
     }
+
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("corpusFiles")
+    @DisplayName("3.1 dump() round-trips the reconciled corpus schema")
+    void corpusDumpRoundTrips(Path file) throws Exception {
+        String raw;
+        try {
+            raw = Files.readString(file);
+        } catch (IOException e) {
+            throw new UncheckedIOException(e);
+        }
+        prepareEnvironment(raw);
+        var script = migrate(raw);
+        if (PgTestDatabase.serverMajor(dataSource) < 15) {
+            script = preFifteenCompat(script);
+        }
+        final var expectUnsupported = raw.contains("GRANT");
+        assertEquals(ReconcileOutcome.RECONCILED,
+                reconciler(script, expectUnsupported).reconcile().outcome());
+
+        final var dumper = SchemaReconciler.builder()
+                .dataSource(dataSource).namespace(namespace).dialect(dialect).build();
+        final var dump = dumper.dump();
+        // the emitted script is a desired-state script — feeding it back on
+        // the same namespace must be a no-op
+        final var self = reconciler(dump, expectUnsupported).reconcile();
+        assertEquals(ReconcileOutcome.UP_TO_DATE, self.outcome(),
+                () -> "dump replay reported changes: " + self.plan().changes());
+        assertEquals(dump, dumper.dump(), "second dump is not byte-identical");
+    }
 }

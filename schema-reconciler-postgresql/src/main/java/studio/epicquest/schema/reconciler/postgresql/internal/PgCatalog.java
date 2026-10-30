@@ -7,6 +7,7 @@ import java.sql.SQLException;
 import java.sql.Statement;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
@@ -14,9 +15,12 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
+import java.util.stream.Collectors;
 import studio.epicquest.schema.reconciler.model.Definition;
 import studio.epicquest.schema.reconciler.model.ObjectId;
+import studio.epicquest.schema.reconciler.model.ObjectIds;
 import studio.epicquest.schema.reconciler.model.ObjectKind;
 import studio.epicquest.schema.reconciler.model.SchemaObject;
 import studio.epicquest.schema.reconciler.model.SchemaSnapshot;
@@ -52,6 +56,13 @@ public final class PgCatalog {
     public static final String REPLIDENT = "replident";
     /** Whether a materialized view currently holds its result rows. */
     public static final String POPULATED = "populated";
+    /**
+     * The object's complete {@code ${namespace}}-token create-fragment script
+     * for {@code dump()} — statements joined by U+0000, which PostgreSQL text
+     * can never contain (6.1). Absent when the object has no fragment of its
+     * own (folded or unrenderable).
+     */
+    public static final String DUMP_SQL = "dumpSql";
 
     public static SchemaSnapshot read(Connection conn, String namespace) throws SQLException {
         try (Statement s = conn.createStatement()) {
@@ -76,6 +87,7 @@ public final class PgCatalog {
         data.loadComments(conn);
         data.loadDependencies(conn);
         data.loadExternalDependents(conn);
+        data.computeDumpSql();
         return data.snapshot();
     }
 
@@ -1907,6 +1919,124 @@ public final class PgCatalog {
         /** A single-quoted SQL literal for a canonical or DDL fragment. */
         private static String sqlLiteral(String value) {
             return "'" + value.replace("'", "''") + "'";
+        }
+
+        /**
+         * 3.1 dump(): fills {@link #DUMP_SQL} — each object's complete
+         * {@code ${namespace}}-token create fragment list, joined by U+0000
+         * (impossible in PostgreSQL text). A table's fragment folds its
+         * serial-owned sequences and columns the way
+         * {@code PgRender.createTableStatements} does; a sequence owned by a
+         * table column of this snapshot and every object without a create
+         * fragment get none — they surface as comment lines in the dump.
+         */
+        void computeDumpSql() {
+            for (final var entry : objects.entrySet()) {
+                final var id = entry.getKey();
+                final var o = entry.getValue();
+                final var statements = switch (id.kind()) {
+                    case TABLE -> tableDumpStatements(id, o);
+                    case MATERIALIZED_VIEW -> {
+                        final var create = o.attrs.get(CREATE_SQL);
+                        yield create == null ? List.<String>of()
+                                : List.of(Boolean.parseBoolean(
+                                        o.attrs.getOrDefault(POPULATED, "true"))
+                                        ? create : create + " WITH NO DATA");
+                    }
+                    case SEQUENCE -> foldedSequence(id)
+                            ? List.<String>of()
+                            : fragments(o, CREATE_SQL, OWNED_SQL);
+                    default -> fragments(o, CREATE_SQL, POST_SQL, OWNED_SQL);
+                };
+                if (!statements.isEmpty()) {
+                    o.attrs.put(DUMP_SQL, String.join("\0", statements));
+                }
+            }
+        }
+
+        /** A sequence folded into its owner table's create fragment (A.5). */
+        private boolean foldedSequence(ObjectId id) {
+            return deps.getOrDefault(id, Set.of()).stream().anyMatch(
+                    dep -> dep.kind() == ObjectKind.TABLE && objects.containsKey(dep));
+        }
+
+        private static List<String> fragments(Obj o, String... keys) {
+            final var out = new ArrayList<String>(keys.length);
+            for (final var key : keys) {
+                final var sql = o.attrs.get(key);
+                if (sql != null) {
+                    out.add(sql);
+                }
+            }
+            return out;
+        }
+
+        /**
+         * The folded CREATE TABLE fragment list of {@code createTableStatements}
+         * in unbound token form: owned sequences first, the CREATE TABLE with
+         * every column, then replica-identity/row-security and OWNED BY alters.
+         */
+        private List<String> tableDumpStatements(ObjectId id, Obj table) {
+            final var foldedSeqs = objects.entrySet().stream()
+                    .filter(e -> e.getKey().kind() == ObjectKind.SEQUENCE
+                            && deps.getOrDefault(e.getKey(), Set.of()).contains(id))
+                    .sorted(Map.Entry.comparingByKey(ObjectIds.ORDER))
+                    .map(Map.Entry::getValue)
+                    .toList();
+            final var columns = objects.entrySet().stream()
+                    .filter(e -> e.getKey().kind() == ObjectKind.COLUMN
+                            && e.getKey().parent().orElse("").equals(id.name()))
+                    .sorted(Comparator.comparingInt(e -> Integer.parseInt(
+                            e.getValue().attrs.getOrDefault(ATTNUM, "0"))))
+                    .toList();
+            final var statements = new ArrayList<String>();
+            foldedSeqs.forEach(seq -> statements.add(seq.attrs.get(CREATE_SQL)));
+            final var canonical = table.def == null ? "" : table.def.canonical();
+            final var create = new StringBuilder("CREATE ")
+                    .append("u".equals(canonicalField(canonical, "relpersistence"))
+                            ? "UNLOGGED " : "")
+                    .append("TABLE ").append(tableRef(id.name())).append(" (\n")
+                    .append(columns.stream()
+                            .map(c -> "    " + c.getValue().attrs.get(COLUMN_SQL))
+                            .collect(Collectors.joining(",\n")))
+                    .append("\n)");
+            final var options = table.attrs.getOrDefault(TABLE_OPTIONS, "");
+            if (!options.isEmpty()) {
+                create.append(" WITH (").append(options).append(')');
+            }
+            statements.add(create.toString());
+            final var replident = switch (table.attrs.getOrDefault(REPLIDENT, "d")) {
+                case "f" -> "FULL";
+                case "n" -> "NOTHING";
+                default -> null;
+            };
+            if (replident != null) {
+                statements.add("ALTER TABLE " + tableRef(id.name())
+                        + " REPLICA IDENTITY " + replident);
+            }
+            if (Boolean.parseBoolean(canonicalField(canonical, "rls"))) {
+                statements.add("ALTER TABLE " + tableRef(id.name())
+                        + " ENABLE ROW LEVEL SECURITY");
+            }
+            if (Boolean.parseBoolean(canonicalField(canonical, "forcerls"))) {
+                statements.add("ALTER TABLE " + tableRef(id.name())
+                        + " FORCE ROW LEVEL SECURITY");
+            }
+            foldedSeqs.stream()
+                    .map(seq -> seq.attrs.get(OWNED_SQL))
+                    .filter(Objects::nonNull)
+                    .forEach(statements::add);
+            return statements;
+        }
+
+        /** A scalar {@code name=value} field of a canonical definition. */
+        private static String canonicalField(String canonical, String name) {
+            for (final var part : canonical.split(";")) {
+                if (part.startsWith(name + "=")) {
+                    return part.substring(name.length() + 1);
+                }
+            }
+            return "";
         }
 
         SchemaSnapshot snapshot() {

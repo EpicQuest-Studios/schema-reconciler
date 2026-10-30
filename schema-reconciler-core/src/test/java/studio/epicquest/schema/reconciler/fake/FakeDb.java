@@ -142,7 +142,13 @@ public final class FakeDb {
 
     private synchronized void apply(Map<ObjectId, SchemaObject> objects, String sql)
             throws SQLException {
-        final var tokens = sql.strip().split("\\s+");
+        final var tokens = sql.lines()
+                .filter(line -> !line.strip().startsWith("--"))
+                .collect(java.util.stream.Collectors.joining("\n"))
+                .strip().split("\\s+");
+        if (tokens.length == 1 && tokens[0].isEmpty()) {
+            return;
+        }
         if (tokens.length < 3) {
             throw new SQLException("syntax error: " + sql);
         }
@@ -219,7 +225,8 @@ public final class FakeDb {
         final var kind = ObjectKind.valueOf(kindToken);
         final var dot = nameToken.lastIndexOf('.');
         final var parented = Set.of(ObjectKind.COLUMN, ObjectKind.PRIMARY_KEY, ObjectKind.UNIQUE,
-                ObjectKind.FOREIGN_KEY, ObjectKind.CHECK, ObjectKind.INDEX, ObjectKind.TRIGGER)
+                ObjectKind.FOREIGN_KEY, ObjectKind.CHECK, ObjectKind.INDEX, ObjectKind.TRIGGER,
+                ObjectKind.POLICY, ObjectKind.COMMENT)
                 .contains(kind);
         if (parented) {
             if (dot < 0) {

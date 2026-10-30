@@ -19,6 +19,7 @@ import studio.epicquest.schema.reconciler.model.ObjectId;
 import studio.epicquest.schema.reconciler.model.ObjectIds;
 import studio.epicquest.schema.reconciler.model.ObjectKind;
 import studio.epicquest.schema.reconciler.model.PlannedChange;
+import studio.epicquest.schema.reconciler.model.SchemaObject;
 import studio.epicquest.schema.reconciler.model.SchemaSnapshot;
 import studio.epicquest.schema.reconciler.spi.Dialect;
 import studio.epicquest.schema.reconciler.spi.DialectCapabilities;
@@ -190,7 +191,8 @@ public final class FakeDialect implements Dialect {
     @Override
     public Set<String> nameScopes(ObjectId id) {
         return switch (id.kind()) {
-            case TABLE, VIEW, SEQUENCE, INDEX, OTHER -> Set.of("relation:" + id.name());
+            case TABLE, VIEW, SEQUENCE, INDEX, OTHER, MATERIALIZED_VIEW, TYPE, DOMAIN ->
+                    Set.of("relation:" + id.name());
             case PRIMARY_KEY, UNIQUE -> Set.of(
                     "constraint:" + id.parent().orElse("") + "." + id.name(),
                     "relation:" + id.name());
@@ -198,7 +200,22 @@ public final class FakeDialect implements Dialect {
             case COLUMN -> Set.of("column:" + id.parent().orElse("") + "." + id.name());
             case TRIGGER -> Set.of("trigger:" + id.parent().orElse("") + "." + id.name());
             case ROUTINE -> Set.of("routine:" + id.name());
+            case POLICY, EXTENSION, COMMENT -> Set.of();
         };
+    }
+
+    /**
+     * The fake language round-trips its own {@code CREATE} text, so every
+     * managed object dumps as a creatable statement; {@code OTHER} objects
+     * and external-dependent markers have no create fragment (spec 6.1).
+     */
+    @Override
+    public List<String> dumpStatements(SchemaObject object) {
+        if (object.id().kind() == ObjectKind.OTHER
+                || object.attributes().containsKey(Dialect.EXTERNAL_DEPENDENT_ATTRIBUTE)) {
+            return List.of();
+        }
+        return List.of(FakeDb.createStatement(object));
     }
 
     private static FakeDb.Handle handle(Connection connection) throws SQLException {

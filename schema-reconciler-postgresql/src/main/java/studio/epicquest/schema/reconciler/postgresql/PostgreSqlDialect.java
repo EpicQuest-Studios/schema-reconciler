@@ -20,6 +20,7 @@ import studio.epicquest.schema.reconciler.model.Difference;
 import studio.epicquest.schema.reconciler.model.ObjectId;
 import studio.epicquest.schema.reconciler.model.ObjectKind;
 import studio.epicquest.schema.reconciler.model.PlannedChange;
+import studio.epicquest.schema.reconciler.model.SchemaObject;
 import studio.epicquest.schema.reconciler.model.SchemaSnapshot;
 import studio.epicquest.schema.reconciler.postgresql.internal.PgCatalog;
 import studio.epicquest.schema.reconciler.postgresql.internal.PgIdentifiers;
@@ -268,6 +269,24 @@ public final class PostgreSqlDialect implements Dialect {
     @Override
     public String quoteIdentifier(String identifier) {
         return PgIdentifiers.quote(identifier);
+    }
+
+    /**
+     * 6.1: the object's complete create-fragment list in {@code ${namespace}}
+     * token form. {@link PgCatalog#DUMP_SQL} joins the statements with a
+     * U+0000 separator — impossible in PostgreSQL text — so the split is
+     * lossless; absent means folded or unrenderable. A trailing semicolon
+     * (pg_get_viewdef leaves one) is dropped: the dump terminator adds it.
+     */
+    @Override
+    public List<String> dumpStatements(SchemaObject object) {
+        final var dump = object.attributes().get(PgCatalog.DUMP_SQL);
+        if (dump == null) {
+            return List.of();
+        }
+        return java.util.Arrays.stream(dump.split("\0"))
+                .map(s -> s.endsWith(";") ? s.substring(0, s.length() - 1) : s)
+                .toList();
     }
 
     @Override

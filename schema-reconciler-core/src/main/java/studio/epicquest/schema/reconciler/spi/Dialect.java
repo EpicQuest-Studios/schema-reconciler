@@ -9,6 +9,7 @@ import java.util.Set;
 import studio.epicquest.schema.reconciler.model.Difference;
 import studio.epicquest.schema.reconciler.model.ObjectId;
 import studio.epicquest.schema.reconciler.model.PlannedChange;
+import studio.epicquest.schema.reconciler.model.SchemaObject;
 import studio.epicquest.schema.reconciler.model.SchemaSnapshot;
 
 /**
@@ -109,6 +110,16 @@ public interface Dialect {
      * the core assigns the final order.
      */
     List<PlannedChange> render(Difference difference, SchemaSnapshot desired, String targetNamespace);
+
+    /**
+     * Create-fragment statements for one snapshot object, written with the
+     * {@code ${namespace}} token (3.2) so the emitted script is
+     * namespace-neutral — the building block of {@code dump()} (3.1). An
+     * object that cannot be represented as a create fragment returns an
+     * empty list; the core emits it as a comment line instead of dropping
+     * it silently.
+     */
+    default List<String> dumpStatements(SchemaObject object) { return List.of(); }
 
     /**
      * Quotes an identifier for safe inclusion in SQL. MUST throw

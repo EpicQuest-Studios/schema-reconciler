@@ -130,6 +130,7 @@ public final class Engine {
 
     /** {@link #plan()} with the phase timings of the planning run. */
     public TimedPlan planTimed() {
+        requireDesiredState("plan");
         final var clock = new PhaseClock();
         try (Session session = open()) {
             var t = clock.now();
@@ -175,6 +176,7 @@ public final class Engine {
 
     /** Spec 5.1 reconcile(): the full sequence. */
     public ReconcileReport reconcile() {
+        requireDesiredState("reconcile");
         final var start = System.nanoTime();
         final var clock = new PhaseClock();
         try (Session session = open()) {
@@ -224,6 +226,7 @@ public final class Engine {
 
     /** Spec 5.1 apply(): the same sequence, driven by a previously issued plan. */
     public ReconcileReport apply(ReconcilePlan plan) {
+        requireDesiredState("apply");
         final var start = System.nanoTime();
         final var clock = new PhaseClock();
         // reject a foreign plan before touching the database: a namespace or
@@ -276,6 +279,25 @@ public final class Engine {
                     Duration.ofNanos(System.nanoTime() - start), clock.snapshot());
         } catch (SchemaReconcilerException e) {
             throw e.withTimings(clock.snapshot());
+        }
+    }
+
+    /**
+     * Spec 3.1 {@code dump()}: steps 1 to 3 of 5.1 — connect, lock, read the
+     * actual snapshot — rendered as a namespace-neutral desired-state script.
+     * Requires no {@code desiredState}; the target is never mutated.
+     */
+    public String dump() {
+        try (Session session = open()) {
+            session.lock();
+            return DumpRenderer.render(session.dialect, namespace, session.readActual());
+        }
+    }
+
+    private void requireDesiredState(String method) {
+        if (desiredState == null) {
+            throw new ConfigurationException(
+                    "desiredState is required for " + method + "()");
         }
     }
 
