@@ -351,7 +351,7 @@ class PostgreSqlConformanceTest extends DialectConformanceTest {
         final var names = report.unexpected().stream()
                 .map(d -> d.id().name()).sorted().toList();
         assertEquals(List.of("comment:pg_trgm", "comment:t", "extension:pg_trgm",
-                "mv", "policy:t.p_sel"), names);
+                "mv", "p_sel"), names);
         assertEquals(ReconcileOutcome.UP_TO_DATE,
                 reconciler("CREATE TABLE t (id bigint, note text)").reconcile().outcome());
     }

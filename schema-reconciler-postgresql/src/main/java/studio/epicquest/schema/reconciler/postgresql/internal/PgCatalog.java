@@ -68,6 +68,7 @@ public final class PgCatalog {
         data.loadTriggers(conn);
         data.loadEnums(conn);
         data.loadDomains(conn);
+        data.loadPolicies(conn);
         data.loadOther(conn);
         data.loadDependencies(conn);
         data.loadExternalDependents(conn);
@@ -87,6 +88,7 @@ public final class PgCatalog {
         /** Backing-index oid → the constraint it backs (pk/unique constraint deps). */
         private final Map<Long, ObjectId> conByIndexOid = new HashMap<>();
         private final Map<Long, ObjectId> typeByOid = new HashMap<>();
+        private final Map<Long, ObjectId> polByOid = new HashMap<>();
         private final Map<Long, ObjectId> collByOid = new HashMap<>();
         private final Map<Long, ObjectId> langByOid = new HashMap<>();
         private final Map<ObjectId, Set<ObjectId>> deps = new HashMap<>();
@@ -881,6 +883,79 @@ public final class PgCatalog {
             }
         }
 
+        /**
+         * Row-level-security policies on our tables: a {@code POLICY} object
+         * parented on its table. The canonical definition is the command,
+         * permissive flag, sorted distinct role list ({@code {0}} renders as
+         * {@code PUBLIC}) and the deparsed {@code USING}/{@code WITH CHECK}
+         * expressions. The parent linkage and an explicit dependency edge tie
+         * the policy to its table; {@code loadDependencies} adds the
+         * expressions' referenced routines and types.
+         */
+        void loadPolicies(Connection conn) throws SQLException {
+            try (PreparedStatement ps = conn.prepareStatement("""
+                    SELECT po.oid, po.polname, po.polrelid, c.relname, po.polcmd,
+                           po.polpermissive,
+                           (SELECT string_agg(x, ',' ORDER BY x)
+                              FROM (SELECT DISTINCT CASE WHEN u = 0 THEN 'PUBLIC'
+                                                         ELSE r.rolname END AS x
+                                      FROM unnest(po.polroles) u
+                                      LEFT JOIN pg_roles r ON r.oid = u) s) AS roles,
+                           pg_get_expr(po.polqual, po.polrelid) AS using,
+                           pg_get_expr(po.polwithcheck, po.polrelid) AS wcheck
+                    FROM pg_policy po
+                    JOIN pg_class c ON c.oid = po.polrelid
+                    JOIN pg_namespace n ON n.oid = c.relnamespace AND n.nspname = ?
+                    ORDER BY po.oid
+                    """)) {
+                ps.setString(1, ns);
+                try (ResultSet rs = ps.executeQuery()) {
+                    while (rs.next()) {
+                        final var oid = rs.getLong("oid");
+                        if (extMember(oid)) {
+                            continue;
+                        }
+                        final var name = rs.getString("polname");
+                        final var table = rs.getString("relname");
+                        final var roles = nullToEmpty(rs.getString("roles"));
+                        final var using = rs.getString("using");
+                        final var wcheck = rs.getString("wcheck");
+                        final var qTable = qNs + "." + PgIdentifiers.quote(table);
+                        final var id = new ObjectId(ObjectKind.POLICY, name, table);
+                        final var canonical = new StringBuilder("cmd=" + rs.getString("polcmd")
+                                + ";permissive=" + rs.getBoolean("polpermissive")
+                                + ";roles=" + roles);
+                        final var create = new StringBuilder("CREATE POLICY "
+                                + PgIdentifiers.quote(name) + " ON " + qTable);
+                        if (!rs.getBoolean("polpermissive")) {
+                            create.append(" AS RESTRICTIVE");
+                        }
+                        create.append(" FOR ").append(switch (rs.getString("polcmd")) {
+                            case "r" -> "SELECT";
+                            case "a" -> "INSERT";
+                            case "w" -> "UPDATE";
+                            case "d" -> "DELETE";
+                            default -> "ALL";
+                        }).append(" TO ").append(roles.isEmpty() ? "PUBLIC" : roles);
+                        if (using != null) {
+                            canonical.append(";using=").append(using);
+                            create.append(" USING (").append(using).append(')');
+                        }
+                        if (wcheck != null) {
+                            canonical.append(";check=").append(wcheck);
+                            create.append(" WITH CHECK (").append(wcheck).append(')');
+                        }
+                        define(id, canonical.toString(),
+                                Map.of(CREATE_SQL, create.toString(),
+                                        DROP_SQL, "DROP POLICY " + PgIdentifiers.quote(name)
+                                                + " ON " + qTable));
+                        polByOid.put(oid, id);
+                        dep(id, relByOid.get(rs.getLong("polrelid")));
+                    }
+                }
+            }
+        }
+
         /** Loads every catalog object a desired script can create in the
          *  namespace that has no managed {@link ObjectKind}, as OTHER, so the
          *  diff reports it UNSUPPORTED instead of ignoring it (5.4). */
@@ -923,26 +998,8 @@ public final class PgCatalog {
                     }
                 }
             }
-            try (PreparedStatement ps = conn.prepareStatement("""
-                    SELECT po.oid, po.polname, c.relname
-                    FROM pg_policy po
-                    JOIN pg_class c ON c.oid = po.polrelid
-                    JOIN pg_namespace n ON n.oid = c.relnamespace AND n.nspname = ?
-                    ORDER BY po.oid
-                    """)) {
-                ps.setString(1, ns);
-                try (ResultSet rs = ps.executeQuery()) {
-                    while (rs.next()) {
-                        if (extMember(rs.getLong("oid"))) {
-                            continue;
-                        }
-                        define(new ObjectId(ObjectKind.OTHER,
-                                        "policy:" + rs.getString("relname") + "."
-                                                + rs.getString("polname")),
-                                "policy", Map.of());
-                    }
-                }
-            }
+            // policies on our tables load as managed POLICY objects in
+            // loadPolicies — nothing to detect here
             // aggregates and window functions (prokind 'a','w') — detected as
             // OTHER; functions and procedures ('f','p') are managed ROUTINEs
             try (PreparedStatement ps = conn.prepareStatement("""
@@ -1493,6 +1550,25 @@ public final class PgCatalog {
                 try (ResultSet rs = ps.executeQuery()) {
                     while (rs.next()) {
                         depOid(typeByOid.get(rs.getLong("dom")), rs.getLong("dep"));
+                    }
+                }
+            }
+            // policies -> the routines, types and relations their
+            // USING / WITH CHECK expressions reference
+            try (PreparedStatement ps = conn.prepareStatement("""
+                    SELECT d.objid AS pol, d.refobjid AS dep
+                    FROM pg_depend d
+                    JOIN pg_policy po ON po.oid = d.objid
+                    JOIN pg_class c ON c.oid = po.polrelid
+                    JOIN pg_namespace n ON n.oid = c.relnamespace AND n.nspname = ?
+                    WHERE d.classid = 'pg_policy'::regclass
+                      AND d.refclassid IN ('pg_proc'::regclass, 'pg_type'::regclass,
+                                           'pg_class'::regclass)
+                    """)) {
+                ps.setString(1, ns);
+                try (ResultSet rs = ps.executeQuery()) {
+                    while (rs.next()) {
+                        depOid(polByOid.get(rs.getLong("pol")), rs.getLong("dep"));
                     }
                 }
             }

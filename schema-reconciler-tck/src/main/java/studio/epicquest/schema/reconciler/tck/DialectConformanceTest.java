@@ -272,6 +272,10 @@ public abstract class DialectConformanceTest {
         return new ObjectId(ObjectKind.DOMAIN, name);
     }
 
+    private static ObjectId policy(String parent, String name) {
+        return new ObjectId(ObjectKind.POLICY, name, parent);
+    }
+
     /** The row count of a relation in the test namespace — proves a
      *  materialized view actually holds its stored result rows. */
     protected final long count(String relation) throws SQLException {
@@ -1070,5 +1074,36 @@ public abstract class DialectConformanceTest {
         assertEquals(ReconcileOutcome.UP_TO_DATE,
                 reconciler("CREATE DOMAIN posint AS integer NOT NULL DEFAULT 1"
                         + " CHECK (VALUE > 0)").reconcile().outcome());
+    }
+
+    @Test
+    @DisplayName("C-44 policy missing: ADDITIVE; a changed USING is a REBUILD drop+create")
+    void c44PolicyMissingAndDrifted() throws Exception {
+        assumeKind(ObjectKind.POLICY);
+        final var script = """
+                CREATE TABLE t (id bigint, owner text);
+                ALTER TABLE t ENABLE ROW LEVEL SECURITY;
+                CREATE POLICY p_sel ON t FOR SELECT USING (owner = current_user)
+                """;
+        final var report = reconciler(script).reconcile();
+        assertEquals(ReconcileOutcome.RECONCILED, report.outcome());
+        assertTrue(report.applied().stream().anyMatch(c ->
+                        c.target().equals(policy("t", "p_sel"))
+                                && c.safety() == ChangeSafety.ADDITIVE),
+                "expected an ADDITIVE create for the policy: " + report.applied());
+        assertEquals(ReconcileOutcome.UP_TO_DATE, reconciler(script).reconcile().outcome());
+        // a changed USING clause recreates the policy in place
+        final var widened = """
+                CREATE TABLE t (id bigint, owner text);
+                ALTER TABLE t ENABLE ROW LEVEL SECURITY;
+                CREATE POLICY p_sel ON t FOR SELECT USING (id > 0)
+                """;
+        final var drifted = reconciler(widened).reconcile();
+        assertEquals(ReconcileOutcome.RECONCILED, drifted.outcome());
+        assertTrue(drifted.applied().stream().anyMatch(c ->
+                        c.target().equals(policy("t", "p_sel"))
+                                && c.safety() == ChangeSafety.REBUILD),
+                "expected a REBUILD recreate for the policy: " + drifted.applied());
+        assertEquals(ReconcileOutcome.UP_TO_DATE, reconciler(widened).reconcile().outcome());
     }
 }
