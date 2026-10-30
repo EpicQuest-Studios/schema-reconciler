@@ -21,7 +21,7 @@ What is missing is an embeddable library where the *desired state is declared on
 
 This repository contains two things:
 
-1. **A specification** ([SPEC.md](SPEC.md)) that defines a vendor-neutral reconciliation contract: a Java API for applications, a `Dialect` SPI implemented once per database product, the reconciliation algorithm shared by all dialects, a 36-scenario conformance suite (TCK) every dialect must pass, and a PostgreSQL profile. The specification exists so the same contract can be implemented for other relational databases — dialects are discovered via `ServiceLoader` and selected per data source.
+1. **A specification** ([SPEC.md](SPEC.md)) that defines a vendor-neutral reconciliation contract: a Java API for applications, a `Dialect` SPI implemented once per database product, the reconciliation algorithm shared by all dialects, a 48-scenario conformance suite (TCK) every dialect must pass, and a PostgreSQL profile. The specification exists so the same contract can be implemented for other relational databases — dialects are discovered via `ServiceLoader` and selected per data source.
 2. **A reference implementation** of that specification: `schema-reconciler-core` (the engine, depending only on Java SE), `schema-reconciler-postgresql` (the PostgreSQL 14+ dialect), and `schema-reconciler-tck` (the conformance suite, reusable by third-party dialects).
 
 ## How it works
@@ -90,6 +90,27 @@ Dry run for review:
 var plan = reconciler.plan();
 Files.writeString(Path.of("schema-plan.sql"), plan.toSql());
 ```
+
+Bootstrap a desired-state script from an existing schema (no `desiredState` needed):
+
+```java
+var dumper = SchemaReconciler.builder()
+        .dataSource(dataSource)
+        .namespace("svc")
+        .build();
+String script = dumper.dump();   // namespace-neutral desired-state script
+```
+
+`dump()` reads the catalog under the namespace lock and renders it as a `${namespace}`-placeholder script in dependency order — feeding it back via `DesiredState.ofScript(script)` converges the same schema with an empty plan. Objects the dialect cannot express as DDL become `-- folded:` / `-- unsupported:` comment lines rather than being silently dropped.
+
+The connecting role can be least-privilege:
+
+```sql
+GRANT USAGE, CREATE ON SCHEMA svc TO app_reconciler;
+GRANT CREATE ON DATABASE appdb TO app_reconciler;  -- scratch replay only; see SPEC.md A.4
+```
+
+Environments that cannot grant `CREATE ON DATABASE` point `scratchDataSource` at a separate scratch database instead.
 
 ## Build
 

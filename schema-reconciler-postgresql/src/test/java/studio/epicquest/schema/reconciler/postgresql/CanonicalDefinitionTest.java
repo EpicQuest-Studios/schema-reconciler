@@ -71,7 +71,8 @@ class CanonicalDefinitionTest {
                         new ObjectId(ObjectKind.DOMAIN, "loctext"));
                 assertEquals("basetype=text;notnull=true;collation=\"C\";default="
                         + query(s, "SELECT pg_get_expr(typdefaultbin, 0)"
-                                + " FROM pg_type WHERE typname = 'loctext'")
+                                + " FROM pg_type WHERE typname = 'loctext'"
+                                + " AND typnamespace = current_schema()::regnamespace")
                         + ";check.loctext_check=" + query(s,
                         "SELECT pg_get_constraintdef(oid) FROM pg_constraint"
                                 + " WHERE contypid = 'loctext'::regtype AND contype = 'c'"),
@@ -81,7 +82,8 @@ class CanonicalDefinitionTest {
                         new ObjectId(ObjectKind.POLICY, "p_sel", "t"));
                 assertEquals("cmd=r;permissive=false;roles=PUBLIC;using="
                         + query(s, "SELECT pg_get_expr(polqual, polrelid)"
-                                + " FROM pg_policy WHERE polname = 'p_sel'"),
+                                + " FROM pg_policy WHERE polname = 'p_sel'"
+                                + " AND polrelid = 't'::regclass"),
                         policy.definition().canonical());
 
                 final var table = snapshot.objects().get(new ObjectId(ObjectKind.TABLE, "t"));
@@ -99,7 +101,8 @@ class CanonicalDefinitionTest {
 
                 final var check = snapshot.objects().get(new ObjectId(ObjectKind.CHECK, "t_chk", "t"));
                 assertEquals(PgSql.normalize(query(s,
-                        "SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conname = 't_chk'"), ns),
+                        "SELECT pg_get_constraintdef(oid) FROM pg_constraint"
+                                + " WHERE conname = 't_chk' AND conrelid = 't'::regclass"), ns),
                         check.definition().canonical());
 
                 final var pk = snapshot.objects().get(new ObjectId(ObjectKind.PRIMARY_KEY, "t_pkey", "t"));

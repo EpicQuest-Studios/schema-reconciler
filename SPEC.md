@@ -814,6 +814,15 @@ With `scratchDataSource` (6.3.2), the same sequence runs on the scratch connecti
 
 The whole script is sent in one `Statement.execute` call. The server parses it, so dollar-quoted bodies need no client-side splitting.
 
+**Least-privilege role.** The connecting role for `plan()`/`reconcile()`/`apply()` needs exactly `USAGE` and `CREATE` on the target schema plus `CREATE` on the database that hosts the scratch namespace:
+
+```sql
+GRANT USAGE, CREATE ON SCHEMA svc TO app_reconciler;
+GRANT CREATE ON DATABASE appdb TO app_reconciler;
+```
+
+Where `CREATE ON DATABASE` cannot be granted, a separate `scratchDataSource` (6.3.2) pointing at a scratch database replaces it; the target role then needs only the schema grants and the scratch role owns the scratch database. `dump()` creates no scratch namespace, so its session runs `checkAccess` with `createNamespace` `false`: a role holding only `USAGE` and `CREATE` on the schema can dump (catalog reads need no extra grants — the `pg_catalog` views used are world-readable).
+
 ### A.5 Catalog sources
 
 | Kind | Source | Canonical definition |

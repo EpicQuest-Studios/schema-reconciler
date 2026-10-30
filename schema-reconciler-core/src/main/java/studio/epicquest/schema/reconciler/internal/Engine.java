@@ -288,7 +288,7 @@ public final class Engine {
      * Requires no {@code desiredState}; the target is never mutated.
      */
     public String dump() {
-        try (Session session = open()) {
+        try (Session session = open(false)) {
             session.lock();
             return DumpRenderer.render(session.dialect, namespace, session.readActual());
         }
@@ -587,7 +587,11 @@ public final class Engine {
     }
 
     private Session open() {
-        return new Session();
+        return open(true);
+    }
+
+    private Session open(boolean needsScratch) {
+        return new Session(needsScratch);
     }
 
     /**
@@ -638,7 +642,7 @@ public final class Engine {
         private boolean restoreAutoCommit;
         private boolean closed;
 
-        Session() {
+        Session(boolean needsScratch) {
             try {
                 conn = dataSource.getConnection();
             } catch (SQLException e) {
@@ -648,7 +652,8 @@ public final class Engine {
             try {
                 this.dialect = resolver.resolve(conn);
                 DialectResolver.quoteOf(dialect, namespace);
-                dialect.checkAccess(conn, namespace, scratchDataSource == null);
+                dialect.checkAccess(conn, namespace,
+                        needsScratch && scratchDataSource == null);
                 if (dialect.capabilities().transactionalDdl() && conn.getAutoCommit()) {
                     conn.setAutoCommit(false);
                     restoreAutoCommit = true;
