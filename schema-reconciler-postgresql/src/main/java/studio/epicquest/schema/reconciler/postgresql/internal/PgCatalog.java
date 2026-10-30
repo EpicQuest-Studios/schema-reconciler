@@ -65,6 +65,7 @@ public final class PgCatalog {
         data.loadSequences(conn);
         data.loadRoutines(conn);
         data.loadTriggers(conn);
+        data.loadEnums(conn);
         data.loadOther(conn);
         data.loadDependencies(conn);
         data.loadExternalDependents(conn);
@@ -757,17 +758,56 @@ public final class PgCatalog {
             }
         }
 
+        /** Enum types: the canonical definition is the ordered label list;
+         *  the {@code typeByOid} entry resolves column and table dependency
+         *  edges to the managed {@link ObjectKind#TYPE} object. */
+        void loadEnums(Connection conn) throws SQLException {
+            try (PreparedStatement ps = conn.prepareStatement("""
+                    SELECT t.oid, t.typname,
+                           (SELECT array_agg(e.enumlabel ORDER BY e.enumsortorder, e.oid)
+                              FROM pg_enum e WHERE e.enumtypid = t.oid) AS labels
+                    FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace
+                    WHERE n.nspname = ? AND t.typtype = 'e'
+                    ORDER BY t.oid
+                    """)) {
+                ps.setString(1, ns);
+                try (ResultSet rs = ps.executeQuery()) {
+                    while (rs.next()) {
+                        final var oid = rs.getLong("oid");
+                        if (extMember(oid)) {
+                            continue;
+                        }
+                        final var name = rs.getString("typname");
+                        final var labels = rs.getArray("labels");
+                        final var csv = labels == null
+                                ? ""
+                                : String.join(",", Arrays.stream(
+                                        (String[]) labels.getArray())
+                                        .map(Data::sqlLiteral).toList());
+                        final var qName = qNs + "." + PgIdentifiers.quote(name);
+                        final var id = new ObjectId(ObjectKind.TYPE, name);
+                        define(id, "typtype=e;labels=" + csv,
+                                Map.of(CREATE_SQL, "CREATE TYPE " + qName + " AS ENUM"
+                                                + (csv.isEmpty() ? "" : " (" + csv + ")"),
+                                        DROP_SQL, "DROP TYPE " + qName));
+                        typeByOid.put(oid, id);
+                    }
+                }
+            }
+        }
+
         /** Loads every catalog object a desired script can create in the
          *  namespace that has no managed {@link ObjectKind}, as OTHER, so the
          *  diff reports it UNSUPPORTED instead of ignoring it (5.4). */
         void loadOther(Connection conn) throws SQLException {
-            // user-defined types: enums, domains, ranges, multiranges and base
-            // types (array types carry typelem != 0 and are not standalone)
+            // user-defined types that stay unsupported: domains, ranges,
+            // multiranges and base types (array types carry typelem != 0 and
+            // are not standalone; enums load as TYPE objects in loadEnums)
             try (PreparedStatement ps = conn.prepareStatement("""
                     SELECT t.oid, t.typname, t.typtype
                     FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace
                     WHERE n.nspname = ?
-                      AND (t.typtype IN ('e','d','r','m')
+                      AND (t.typtype IN ('d','r','m')
                            OR (t.typtype = 'b' AND t.typelem = 0))
                     ORDER BY t.oid
                     """)) {
@@ -1546,6 +1586,11 @@ public final class PgCatalog {
 
         private static String nullToEmpty(String s) {
             return s == null ? "" : s;
+        }
+
+        /** A single-quoted SQL literal for a canonical or DDL fragment. */
+        private static String sqlLiteral(String value) {
+            return "'" + value.replace("'", "''") + "'";
         }
 
         SchemaSnapshot snapshot() {

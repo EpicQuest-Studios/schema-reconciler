@@ -43,9 +43,23 @@ class CanonicalDefinitionTest {
                 s.execute("CREATE FUNCTION trg() RETURNS trigger LANGUAGE plpgsql"
                         + " AS $$ BEGIN RETURN NEW; END $$");
                 s.execute("CREATE TRIGGER tr BEFORE INSERT ON t FOR EACH ROW EXECUTE FUNCTION trg()");
+                s.execute("CREATE TYPE mood AS ENUM ('b', 'a')");
+                s.execute("CREATE MATERIALIZED VIEW mv AS SELECT id FROM t");
 
                 final var snapshot = dialect.readSnapshot(c, schema);
                 final var ns = schema;
+
+                final var matview = snapshot.objects().get(
+                        new ObjectId(ObjectKind.MATERIALIZED_VIEW, "mv"));
+                assertTrue(matview.definition().canonical().startsWith(PgSql.normalize(
+                        "viewdef=" + query(s,
+                                "SELECT pg_get_viewdef('mv'::regclass, true)"), ns)),
+                        matview.definition().canonical());
+                assertTrue(matview.definition().canonical()
+                        .contains(";populated=true"), matview.definition().canonical());
+
+                final var mood = snapshot.objects().get(new ObjectId(ObjectKind.TYPE, "mood"));
+                assertEquals("typtype=e;labels='b','a'", mood.definition().canonical());
 
                 final var index = snapshot.objects().get(new ObjectId(ObjectKind.INDEX, "t_name", "t"));
                 assertEquals(PgSql.normalize(query(s,

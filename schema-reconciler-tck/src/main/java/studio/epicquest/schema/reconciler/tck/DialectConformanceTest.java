@@ -264,6 +264,10 @@ public abstract class DialectConformanceTest {
         return new ObjectId(ObjectKind.MATERIALIZED_VIEW, name);
     }
 
+    private static ObjectId type(String name) {
+        return new ObjectId(ObjectKind.TYPE, name);
+    }
+
     /** The row count of a relation in the test namespace — proves a
      *  materialized view actually holds its stored result rows. */
     protected final long count(String relation) throws SQLException {
@@ -970,5 +974,45 @@ public abstract class DialectConformanceTest {
                 CREATE TABLE t (id bigint);
                 CREATE MATERIALIZED VIEW mv AS SELECT id, id + 1 AS plus FROM t
                 """, ReconcilePolicy.defaults().withDestructive(Decision.APPLY)).reconcile().outcome());
+    }
+
+    @Test
+    @DisplayName("C-39 enum missing: ADDITIVE create; an appended label is ALTER TYPE ADD VALUE")
+    void c39EnumMissingThenAppend() throws Exception {
+        assumeKind(ObjectKind.TYPE);
+        final var script = "CREATE TYPE mood AS ENUM ('sad', 'ok')";
+        final var report = reconciler(script).reconcile();
+        assertEquals(ReconcileOutcome.RECONCILED, report.outcome());
+        assertTrue(report.applied().stream().anyMatch(c ->
+                        c.target().equals(type("mood")) && c.safety() == ChangeSafety.ADDITIVE),
+                "expected an ADDITIVE create for the enum: " + report.applied());
+        assertEquals(ReconcileOutcome.UP_TO_DATE, reconciler(script).reconcile().outcome());
+        // a pure in-order append renders ALTER TYPE ... ADD VALUE
+        final var widened = "CREATE TYPE mood AS ENUM ('sad', 'ok', 'happy')";
+        final var grown = reconciler(widened).reconcile();
+        assertEquals(ReconcileOutcome.RECONCILED, grown.outcome());
+        assertTrue(grown.applied().stream().anyMatch(c ->
+                        c.target().equals(type("mood")) && c.safety() == ChangeSafety.ADDITIVE
+                                && c.statements().stream()
+                                        .anyMatch(s -> s.contains("ADD VALUE"))),
+                "expected an ADDITIVE ADD VALUE change: " + grown.applied());
+        assertEquals(ReconcileOutcome.UP_TO_DATE, reconciler(widened).reconcile().outcome());
+    }
+
+    @Test
+    @DisplayName("C-40 enum removed or reordered labels stay a manual change")
+    void c40EnumLabelRemoved() throws Exception {
+        assumeKind(ObjectKind.TYPE);
+        reconciler("CREATE TYPE mood AS ENUM ('sad', 'ok', 'happy')").reconcile();
+        // a removed label cannot be altered in place — fail closed
+        assertThrows(PolicyViolationException.class, () -> reconciler(
+                "CREATE TYPE mood AS ENUM ('sad', 'ok')").reconcile());
+        // a reordered label set fails the same way
+        assertThrows(PolicyViolationException.class, () -> reconciler(
+                "CREATE TYPE mood AS ENUM ('ok', 'sad', 'happy')").reconcile());
+        // the type is untouched: the original state still verifies UP_TO_DATE
+        assertEquals(ReconcileOutcome.UP_TO_DATE,
+                reconciler("CREATE TYPE mood AS ENUM ('sad', 'ok', 'happy')")
+                        .reconcile().outcome());
     }
 }

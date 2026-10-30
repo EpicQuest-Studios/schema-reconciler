@@ -39,7 +39,7 @@ class DependencyEdgesTest {
         new Edge("view -> routine", TYPES + "CREATE VIEW v AS SELECT fn(id) AS x FROM t",
                 id(ObjectKind.VIEW, "v"), id(ObjectKind.ROUTINE, "fn(integer)")),
         new Edge("view -> type", TYPES + "CREATE VIEW v AS SELECT 'a'::mood AS x",
-                id(ObjectKind.VIEW, "v"), id(ObjectKind.OTHER, "type:mood")),
+                id(ObjectKind.VIEW, "v"), id(ObjectKind.TYPE, "mood")),
         new Edge("routine -> relation", TYPES
                 + "CREATE FUNCTION rr() RETURNS bigint LANGUAGE sql BEGIN ATOMIC SELECT count(*) FROM t; END",
                 id(ObjectKind.ROUTINE, "rr()"), id(ObjectKind.TABLE, "t")),
@@ -48,7 +48,7 @@ class DependencyEdgesTest {
                 id(ObjectKind.ROUTINE, "rp()"), id(ObjectKind.ROUTINE, "fn(integer)")),
         new Edge("routine -> type", TYPES
                 + "CREATE FUNCTION rt(m mood) RETURNS int LANGUAGE sql AS $$ SELECT 1 $$",
-                id(ObjectKind.ROUTINE, "rt(mood)"), id(ObjectKind.OTHER, "type:mood")),
+                id(ObjectKind.ROUTINE, "rt(mood)"), id(ObjectKind.TYPE, "mood")),
         new Edge("index -> routine", TYPES + "CREATE INDEX ix ON t (fn(id))",
                 id(ObjectKind.INDEX, "ix", "t"), id(ObjectKind.ROUTINE, "fn(integer)")),
         new Edge("trigger -> routine", TYPES
@@ -58,7 +58,7 @@ class DependencyEdgesTest {
         new Edge("check constraint -> routine", TYPES + "ALTER TABLE t ADD CONSTRAINT ck CHECK (fn(id) > 0)",
                 id(ObjectKind.CHECK, "ck", "t"), id(ObjectKind.ROUTINE, "fn(integer)")),
         new Edge("check constraint -> type", TYPES + "ALTER TABLE t ADD CONSTRAINT ck CHECK (m <> 'b'::mood)",
-                id(ObjectKind.CHECK, "ck", "t"), id(ObjectKind.OTHER, "type:mood")),
+                id(ObjectKind.CHECK, "ck", "t"), id(ObjectKind.TYPE, "mood")),
         new Edge("foreign key -> class", TYPES + "CREATE TABLE t2 (tid int, CONSTRAINT fk FOREIGN KEY (tid) REFERENCES t (id))",
                 id(ObjectKind.FOREIGN_KEY, "fk", "t2"), id(ObjectKind.TABLE, "t")),
         new Edge("foreign key -> constraint", TYPES + "CREATE TABLE t2 (tid int, CONSTRAINT fk FOREIGN KEY (tid) REFERENCES t (id))",
@@ -69,11 +69,11 @@ class DependencyEdgesTest {
         new Edge("column default -> routine", TYPES + "CREATE TABLE t3 (n int DEFAULT fn(1))",
                 id(ObjectKind.COLUMN, "n", "t3"), id(ObjectKind.ROUTINE, "fn(integer)")),
         new Edge("column default -> type", TYPES + "CREATE TABLE t3 (m2 mood DEFAULT 'a'::mood)",
-                id(ObjectKind.COLUMN, "m2", "t3"), id(ObjectKind.OTHER, "type:mood")),
+                id(ObjectKind.COLUMN, "m2", "t3"), id(ObjectKind.TYPE, "mood")),
         new Edge("column -> type", TYPES,
-                id(ObjectKind.COLUMN, "m", "t"), id(ObjectKind.OTHER, "type:mood")),
+                id(ObjectKind.COLUMN, "m", "t"), id(ObjectKind.TYPE, "mood")),
         new Edge("table -> type", TYPES,
-                id(ObjectKind.TABLE, "t"), id(ObjectKind.OTHER, "type:mood")),
+                id(ObjectKind.TABLE, "t"), id(ObjectKind.TYPE, "mood")),
         new Edge("column -> collation", TYPES
                 + "CREATE COLLATION cl (provider = libc, locale = 'C'); "
                 + "CREATE TABLE t3 (s text COLLATE cl)",

@@ -264,7 +264,7 @@ class PostgreSqlDependenciesTest {
                     .map(d -> d.id().name()).toList();
             for (final var expected : new String[]{
                     "i",                     // inherited table
-                    "type:mood", "type:span", "cast:",
+                    "type:span", "cast:",    // enums are managed TYPE; ranges stay OTHER
                     "statistics:t.st", "comment:t", "rule:t.r1",
                     "constraint:t.ex", "ownership:t", "privileges:i"}) {
                 assertTrue(names.stream().anyMatch(n -> n.contains(expected)),
