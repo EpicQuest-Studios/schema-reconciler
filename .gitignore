@@ -36,3 +36,6 @@ node_modules/
 
 # OS
 .DS_Store
+
+# PostgreSQL documentation PDFs downloaded for compatibility review
+postgresql-*-A4.pdf

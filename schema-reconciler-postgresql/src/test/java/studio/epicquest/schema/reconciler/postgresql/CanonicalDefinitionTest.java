@@ -140,4 +140,36 @@ class CanonicalDefinitionTest {
             }
         }
     }
+
+    @Test
+    void policyRolesAreQuotedIndividually() throws Exception {
+        final var schema = "canonr_" + Long.toHexString(System.nanoTime());
+        final var comma = "a,b_" + schema;
+        final var plain = "ac_" + schema;
+        try (var c = PgTestDatabase.dataSource().getConnection(); var s = c.createStatement()) {
+            c.setAutoCommit(false);
+            try {
+                s.execute("CREATE ROLE " + dialect.quoteIdentifier(comma));
+                s.execute("CREATE ROLE " + dialect.quoteIdentifier(plain));
+                s.execute("CREATE SCHEMA " + dialect.quoteIdentifier(schema));
+                s.execute("SET LOCAL search_path = " + dialect.quoteIdentifier(schema));
+                s.execute("CREATE TABLE t (id bigint)");
+                s.execute("CREATE POLICY p_multi ON t FOR SELECT TO "
+                        + dialect.quoteIdentifier(comma) + ","
+                        + dialect.quoteIdentifier(plain) + " USING (true)");
+
+                final var policy = dialect.readSnapshot(c, schema).objects()
+                        .get(new ObjectId(ObjectKind.POLICY, "p_multi", "t"));
+                assertEquals("cmd=r;permissive=true;roles=" + dialect.quoteIdentifier(comma)
+                        + "," + dialect.quoteIdentifier(plain) + ";using=true",
+                        policy.definition().canonical());
+                assertEquals("CREATE POLICY \"p_multi\" ON ${namespace}.\"t\""
+                        + " FOR SELECT TO " + dialect.quoteIdentifier(comma) + ","
+                        + dialect.quoteIdentifier(plain) + " USING (true)",
+                        policy.attributes().get("createSql"));
+            } finally {
+                c.rollback();
+            }
+        }
+    }
 }
