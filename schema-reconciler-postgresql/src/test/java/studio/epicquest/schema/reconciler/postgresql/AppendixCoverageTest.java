@@ -30,6 +30,9 @@ class AppendixCoverageTest {
         {"CREATE TYPE rng AS RANGE (subtype = int)", "type:"},
         {"CREATE TYPE comp AS (a int, b text)", "composite:"},
         {"CREATE TABLE pt (id int) PARTITION BY RANGE (id)", "partition:"},
+        {"CREATE TABLE ptp (id int) PARTITION BY RANGE (id);"
+                + " CREATE TABLE pch PARTITION OF ptp FOR VALUES FROM (0) TO (100)",
+                "partition:pch"},
         {"CREATE TABLE pt2 (k int) PARTITION BY RANGE (k); CREATE INDEX pix ON pt2 (k)", "partindex:"},
         {"CREATE TABLE parent (id int); CREATE TABLE child () INHERITS (parent)", "inherited:"},
         {"CREATE AGGREGATE mysum (int) (sfunc = int4pl, stype = int, initcond = '0')", "routine:"},

@@ -204,7 +204,9 @@ public final class PgCatalog {
                     SELECT c.oid, c.relname, c.relkind, c.relpersistence,
                            c.reloptions::text AS options, c.relreplident,
                            c.relrowsecurity, c.relforcerowsecurity,
-                           EXISTS (SELECT 1 FROM pg_inherits i WHERE i.inhrelid = c.oid) AS inherited,
+                           (SELECT string_agg(p.relkind, '') FROM pg_inherits i
+                              JOIN pg_class p ON p.oid = i.inhparent
+                             WHERE i.inhrelid = c.oid) AS parentkinds,
                            (SELECT ic.relname FROM pg_index ix JOIN pg_class ic ON ic.oid = ix.indexrelid
                              WHERE ix.indrelid = c.oid AND ix.indisreplident) AS replindex
                     FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
@@ -222,15 +224,19 @@ public final class PgCatalog {
                         final var kind = rs.getString("relkind");
                         final var persistence = rs.getString("relpersistence");
                         final var options = reloptions(rs.getString("options"));
-                        final var inherited = rs.getBoolean("inherited");
+                        final var parentkinds = nullToEmpty(rs.getString("parentkinds"));
+                        final var inherited = !parentkinds.isEmpty();
                         // a plain table whose parents are also plain tables is a
                         // classic-inheritance child; a partition child has a
                         // partitioned ('p') parent. Neither is faithfully
-                        // creatable as a standalone TABLE, so both are OTHER.
+                        // creatable as a standalone TABLE, so both are OTHER —
+                        // but under distinct prefixes, so tolerating classic
+                        // inheritance cannot exempt partition children (3.3).
                         final var id = switch (kind) {
-                            case "r" -> inherited
-                                    ? new ObjectId(ObjectKind.OTHER, "inherited:" + name)
-                                    : new ObjectId(ObjectKind.TABLE, name);
+                            case "r" -> !inherited ? new ObjectId(ObjectKind.TABLE, name)
+                                    : new ObjectId(ObjectKind.OTHER,
+                                            (parentkinds.contains("p")
+                                                    ? "partition:" : "inherited:") + name);
                             case "v" -> new ObjectId(ObjectKind.VIEW, name);
                             case "S" -> new ObjectId(ObjectKind.SEQUENCE, name);
                             // managed: canonical definition lands in loadViews

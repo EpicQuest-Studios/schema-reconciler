@@ -81,7 +81,7 @@ class DependencyEdgesTest {
         new Edge("partition child -> parent", TYPES
                 + "CREATE TABLE pt (k int) PARTITION BY RANGE (k); "
                 + "CREATE TABLE pc PARTITION OF pt FOR VALUES FROM (0) TO (10)",
-                id(ObjectKind.OTHER, "inherited:pc"), id(ObjectKind.OTHER, "partition:pt")),
+                id(ObjectKind.OTHER, "partition:pc"), id(ObjectKind.OTHER, "partition:pt")),
         new Edge("comment -> table", TYPES + "COMMENT ON TABLE t IS 'x'",
                 id(ObjectKind.COMMENT, "t"), id(ObjectKind.TABLE, "t")),
         new Edge("comment -> column", TYPES + "COMMENT ON COLUMN t.note IS 'x'",
