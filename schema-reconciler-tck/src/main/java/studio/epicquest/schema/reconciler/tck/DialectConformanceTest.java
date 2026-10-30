@@ -135,6 +135,16 @@ public abstract class DialectConformanceTest {
         return null;
     }
 
+    /**
+     * A {@code CREATE EXTENSION} statement for an extension the dialect can
+     * install inside the test namespace (C-45), or {@code null} to skip.
+     * The statement must not already be installed database-wide — an
+     * {@code IF NOT EXISTS} clause then no-ops and no object materializes.
+     */
+    protected String extensionDdl() {
+        return null;
+    }
+
     // ---- lifecycle ----------------------------------------------------------
 
     private String namespace;
@@ -1105,5 +1115,22 @@ public abstract class DialectConformanceTest {
                                 && c.safety() == ChangeSafety.REBUILD),
                 "expected a REBUILD recreate for the policy: " + drifted.applied());
         assertEquals(ReconcileOutcome.UP_TO_DATE, reconciler(widened).reconcile().outcome());
+    }
+
+    @Test
+    @DisplayName("C-45 extension missing: ADDITIVE create anchored in the namespace")
+    void c45ExtensionMissing() throws Exception {
+        assumeKind(ObjectKind.EXTENSION);
+        final var ddl = extensionDdl();
+        assumeTrue(ddl != null, "no installable extension for this dialect");
+        final var report = reconciler(ddl).reconcile();
+        assertEquals(ReconcileOutcome.RECONCILED, report.outcome());
+        final var extensions = report.applied().stream()
+                .filter(c -> c.target().kind() == ObjectKind.EXTENSION).toList();
+        assertEquals(1, extensions.size(),
+                "expected exactly one extension change: " + report.applied());
+        assertEquals(ChangeSafety.ADDITIVE, extensions.get(0).safety());
+        assertEquals(ReconcileOutcome.UP_TO_DATE,
+                reconciler(ddl).reconcile().outcome());
     }
 }

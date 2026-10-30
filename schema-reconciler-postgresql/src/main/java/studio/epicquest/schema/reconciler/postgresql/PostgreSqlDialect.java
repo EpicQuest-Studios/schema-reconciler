@@ -9,8 +9,10 @@ import java.sql.Statement;
 import java.time.Duration;
 import java.util.EnumSet;
 import java.util.List;
+import java.util.Locale;
 import java.util.Set;
 import java.util.concurrent.ThreadLocalRandom;
+import java.util.regex.Pattern;
 import studio.epicquest.schema.reconciler.ConfigurationException;
 import studio.epicquest.schema.reconciler.DesiredStateException;
 import studio.epicquest.schema.reconciler.LockTimeoutException;
@@ -23,6 +25,7 @@ import studio.epicquest.schema.reconciler.postgresql.internal.PgCatalog;
 import studio.epicquest.schema.reconciler.postgresql.internal.PgIdentifiers;
 import studio.epicquest.schema.reconciler.postgresql.internal.PgRender;
 import studio.epicquest.schema.reconciler.postgresql.internal.PgScriptCheck;
+import studio.epicquest.schema.reconciler.postgresql.internal.PgSql;
 import studio.epicquest.schema.reconciler.spi.Dialect;
 import studio.epicquest.schema.reconciler.spi.DialectCapabilities;
 
@@ -201,6 +204,49 @@ public final class PostgreSqlDialect implements Dialect {
         PgScriptCheck.check(script, scratchNamespace);
         try (Statement s = connection.createStatement()) {
             s.execute(script);
+        }
+        anchorScriptExtensions(connection, script, scratchNamespace);
+    }
+
+    /**
+     * An extension is a database-wide object anchored to a namespace; a
+     * {@code CREATE EXTENSION IF NOT EXISTS} in the desired script no-ops
+     * when the extension is already installed anywhere, so the scratch
+     * snapshot would never see it. Relocating a relocatable pre-installed
+     * extension into the scratch namespace lets the snapshot report the
+     * anchored {@code EXTENSION} object — the savepoint rollback undoes the
+     * relocation with everything else.
+     */
+    private static final Pattern CREATE_EXTENSION = Pattern
+            .compile("(?i)^\\s*CREATE\\s+EXTENSION\\s+(?:IF\\s+NOT\\s+EXISTS\\s+)?"
+                    + "(\"(?:[^\"]|\"\")*\"|[\\w-]+)");
+
+    private static void anchorScriptExtensions(Connection connection, String script,
+                                               String scratchNamespace) throws SQLException {
+        for (final var statement : PgSql.statements(script)) {
+            final var m = CREATE_EXTENSION.matcher(statement.text());
+            if (!m.find()) {
+                continue;
+            }
+            final var raw = m.group(1);
+            final var name = raw.startsWith("\"")
+                    ? raw.substring(1, raw.length() - 1).replace("\"\"", "\"")
+                    : raw.toLowerCase(Locale.ROOT);
+            try (PreparedStatement ps = connection.prepareStatement(
+                    "SELECT e.extrelocatable FROM pg_extension e"
+                            + " JOIN pg_namespace n ON n.oid = e.extnamespace"
+                            + " WHERE e.extname = ? AND n.nspname <> ?")) {
+                ps.setString(1, name);
+                ps.setString(2, scratchNamespace);
+                try (ResultSet rs = ps.executeQuery()) {
+                    if (rs.next() && rs.getBoolean(1)) {
+                        try (Statement s = connection.createStatement()) {
+                            s.execute("ALTER EXTENSION " + PgIdentifiers.quote(name)
+                                    + " SET SCHEMA " + PgIdentifiers.quote(scratchNamespace));
+                        }
+                    }
+                }
+            }
         }
     }
 

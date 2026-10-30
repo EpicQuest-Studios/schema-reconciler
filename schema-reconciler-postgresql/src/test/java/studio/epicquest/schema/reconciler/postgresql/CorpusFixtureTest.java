@@ -181,10 +181,11 @@ class CorpusFixtureTest {
         if (PgTestDatabase.serverMajor(dataSource) < 15) {
             script = preFifteenCompat(script);
         }
-        // Policy objects are unsupported by design (spec: unsupported constructs
-        // are reported, not applied); a corpus file declaring them must run under
-        // unsupported=REPORT and keeps reporting them on every run.
-        final var expectUnsupported = raw.contains("CREATE POLICY");
+        // privileges:* acl rows are unsupported by design (spec: unsupported
+        // constructs are reported, not applied); a corpus file whose GRANTs
+        // leave unrendered acl drift must run under unsupported=REPORT and
+        // keeps reporting it on every run.
+        final var expectUnsupported = raw.contains("GRANT");
 
         final var first = reconciler(script, expectUnsupported).reconcile();
         assertEquals(ReconcileOutcome.RECONCILED, first.outcome(),

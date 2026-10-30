@@ -728,8 +728,6 @@ public final class PgCatalog {
                 JOIN pg_namespace n ON n.oid = c.relnamespace AND n.nspname = ?
                 UNION ALL SELECT 'pg_namespace', n.oid, 'namespace'
                 FROM pg_namespace n WHERE n.nspname = ?
-                UNION ALL SELECT 'pg_extension', e.oid, e.extname
-                FROM pg_extension e JOIN pg_namespace n ON n.oid = e.extnamespace AND n.nspname = ?
                 UNION ALL SELECT 'pg_policy', p.oid, c.relname || '.' || p.polname
                 FROM pg_policy p JOIN pg_class c ON c.oid = p.polrelid
                 JOIN pg_namespace n ON n.oid = c.relnamespace AND n.nspname = ?
@@ -984,6 +982,11 @@ public final class PgCatalog {
                     }
                 }
             }
+            // extensions anchored to this namespace are managed EXTENSION
+            // objects — presence-only canonical, so a version drift can
+            // never surface as DRIFTED (A.5: ALTER EXTENSION UPDATE is out
+            // of scope). The name keeps the extension: prefix so the id
+            // stays stable across the promotion from OTHER.
             try (PreparedStatement ps = conn.prepareStatement("""
                     SELECT e.oid, e.extname
                     FROM pg_extension e JOIN pg_namespace n ON n.oid = e.extnamespace
@@ -993,8 +996,12 @@ public final class PgCatalog {
                 ps.setString(1, ns);
                 try (ResultSet rs = ps.executeQuery()) {
                     while (rs.next()) {
-                        define(new ObjectId(ObjectKind.OTHER, "extension:" + rs.getString("extname")),
-                                "extension", Map.of());
+                        final var extname = rs.getString("extname");
+                        define(new ObjectId(ObjectKind.EXTENSION, "extension:" + extname),
+                                "extension",
+                                Map.of(CREATE_SQL, "CREATE EXTENSION IF NOT EXISTS "
+                                        + PgIdentifiers.quote(extname)
+                                        + " WITH SCHEMA ${namespace}"));
                     }
                 }
             }
@@ -1155,7 +1162,11 @@ public final class PgCatalog {
                     }
                 }
             }
-            // comments on namespace objects (pg_description)
+            // comments on namespace objects (pg_description). pg_extension is
+            // not in NS_OBJECTS: an extension's shipped description is
+            // database-wide metadata (COMMENT ON EXTENSION is rejected), and
+            // an anchored OTHER here would poison desired state for the
+            // managed EXTENSION object — the extension row itself reports.
             try (PreparedStatement ps = conn.prepareStatement("""
                     SELECT 'comment:' || o.name
                             || CASE WHEN a.attname IS NULL THEN '' ELSE '.' || a.attname END AS name,
@@ -1167,7 +1178,7 @@ public final class PgCatalog {
                             AND a.attrelid = d.objoid AND a.attnum = d.objsubid
                     ORDER BY 1
                     """)) {
-                bindNamespace(ps, 18);
+                bindNamespace(ps, 17);
                 try (ResultSet rs = ps.executeQuery()) {
                     while (rs.next()) {
                         if (extMember(rs.getLong("objoid"))) {
@@ -1190,7 +1201,7 @@ public final class PgCatalog {
                             AND a.attrelid = d.objoid AND a.attnum = d.objsubid
                     ORDER BY 1
                     """)) {
-                bindNamespace(ps, 18);
+                bindNamespace(ps, 17);
                 try (ResultSet rs = ps.executeQuery()) {
                     while (rs.next()) {
                         if (extMember(rs.getLong("objoid"))) {

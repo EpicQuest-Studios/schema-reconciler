@@ -3,6 +3,7 @@ package studio.epicquest.schema.reconciler.postgresql;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 import java.io.PrintWriter;
 import java.lang.reflect.Proxy;
@@ -205,6 +206,24 @@ class PostgreSqlConformanceTest extends DialectConformanceTest {
         return true;
     }
 
+    @Test
+    @DisplayName("a scratch-created extension leaves no pg_extension row behind")
+    void scratchExtensionDoesNotLeak() throws Exception {
+        final var ddl = extensionDdl();
+        assumeTrue(ddl != null, "no free extension on this server");
+        final var report = reconciler(ddl).reconcile();
+        assertEquals(ReconcileOutcome.RECONCILED, report.outcome());
+        try (Connection c = scratch.getConnection();
+                final var s = c.createStatement();
+                final var rs = s.executeQuery(
+                        "SELECT e.extname, n.nspname FROM pg_extension e"
+                                + " JOIN pg_namespace n ON n.oid = e.extnamespace"
+                                + " WHERE n.nspname LIKE '%\\_\\_rcl\\_%' ESCAPE '\\'")) {
+            assertTrue(!rs.next(), "extension anchored to a scratch namespace leaked");
+        }
+        assertCleanSession();
+    }
+
     @Override
     protected String identityColumnDdl() {
         return "bigint GENERATED ALWAYS AS IDENTITY";
@@ -213,6 +232,29 @@ class PostgreSqlConformanceTest extends DialectConformanceTest {
     @Override
     protected String serialColumnDdl() {
         return "bigserial";
+    }
+
+    @Override
+    protected String extensionDdl() {
+        // pick an extension available on this server but not yet installed —
+        // CREATE EXTENSION ... IF NOT EXISTS no-ops on an installed one, so
+        // a pre-installed name would produce no scratch object to detect
+        try (Connection c = scratch.getConnection();
+                final var s = c.createStatement();
+                final var rs = s.executeQuery(
+                        "SELECT a.name FROM pg_available_extensions a"
+                                + " WHERE a.name IN ('btree_gist', 'citext', 'hstore',"
+                                + "                  'pg_trgm', 'unaccent', 'uuid-ossp')"
+                                + " AND NOT EXISTS (SELECT 1 FROM pg_extension e"
+                                + "                 WHERE e.extname = a.name)"
+                                + " ORDER BY a.name LIMIT 1")) {
+            return rs.next()
+                    ? "CREATE EXTENSION IF NOT EXISTS " + dialect.quoteIdentifier(
+                            rs.getString(1)) + " WITH SCHEMA ${namespace}"
+                    : null;
+        } catch (SQLException e) {
+            throw new IllegalStateException(e);
+        }
     }
 
     // ---- PostgreSQL-specific additions -------------------------------------
@@ -343,15 +385,16 @@ class PostgreSqlConformanceTest extends DialectConformanceTest {
                 + qualified("t"));
         final var report = reconciler("CREATE TABLE t (id bigint, note text)").reconcile();
         assertEquals(ReconcileOutcome.RECONCILED, report.outcome());
-        // exactly five environment objects reported — pg_trgm carries its own
-        // description; extension members never surface as managed extras
-        assertEquals(5, report.unexpected().size(), report.unexpected().toString());
+        // exactly four environment objects reported — extension members never
+        // surface as managed extras, and the extension's own description is
+        // database-wide metadata, not a namespace comment object
+        assertEquals(4, report.unexpected().size(), report.unexpected().toString());
         assertTrue(report.unexpected().stream().allMatch(
                 d -> d.type() == DifferenceType.UNEXPECTED));
         final var names = report.unexpected().stream()
                 .map(d -> d.id().name()).sorted().toList();
-        assertEquals(List.of("comment:pg_trgm", "comment:t", "extension:pg_trgm",
-                "mv", "p_sel"), names);
+        assertEquals(List.of("comment:t", "extension:pg_trgm", "mv", "p_sel"),
+                names);
         assertEquals(ReconcileOutcome.UP_TO_DATE,
                 reconciler("CREATE TABLE t (id bigint, note text)").reconcile().outcome());
     }
