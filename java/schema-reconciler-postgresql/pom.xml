@@ -49,11 +49,11 @@
     </dependencies>
 
     <build>
-        <!-- corpus + deployment fixtures live at repo root, shared with the
+        <!-- corpus + deployment fixtures live in java/fixtures, shared with the
              TypeScript port — they land on the test classpath unchanged -->
         <testResources>
             <testResource>
-                <directory>../../fixtures</directory>
+                <directory>../fixtures</directory>
             </testResource>
         </testResources>
         <plugins>

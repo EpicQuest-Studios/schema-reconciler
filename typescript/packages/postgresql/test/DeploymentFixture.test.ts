@@ -11,7 +11,7 @@ import { PgTestDataSource, available, ensureUuidv7, execute }
         from "./PgTestDatabase.ts";
 
 /**
- * Spec A.7: the captured deployment script `fixtures/deployment/schema.sql`
+ * Spec A.7: the captured deployment script `java/fixtures/deployment/schema.sql`
  * is migrated in memory (literal `svc.` qualifier to `${namespace}.`,
  * deployment-only statements removed), reconciled against a real
  * namespace, and asserted to converge, plan deterministically, and dump
@@ -19,7 +19,7 @@ import { PgTestDataSource, available, ensureUuidv7, execute }
  */
 
 const fixtureFile = path.resolve(path.dirname(fileURLToPath(import.meta.url)),
-        "../../../../fixtures/deployment/schema.sql");
+        "../../../../java/fixtures/deployment/schema.sql");
 
 const dbUp = await available();
 const ds = new PgTestDataSource();

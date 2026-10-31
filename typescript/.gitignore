@@ -1,0 +1,13 @@
+# Log file
+*.log
+
+# Node
+node_modules/
+
+# IDE
+.idea/
+.vscode/
+*.iml
+
+# OS
+.DS_Store

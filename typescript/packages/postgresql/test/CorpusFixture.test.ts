@@ -11,7 +11,7 @@ import { PgTestDataSource, available, ensureUuidv7, execute, serverMajor }
 
 /**
  * End-to-end coverage over the obfuscated real-world schema corpus in
- * `fixtures/corpus/corpus-*.sql`. Each file is a captured deployment
+ * `java/fixtures/corpus/corpus-*.sql`. Each file is a captured deployment
  * script: the A.7 migration steps are applied in memory (literal schema
  * qualifier to `${namespace}`; deployment-only statements removed), then
  * the script is reconciled against a real namespace and asserted to
@@ -22,7 +22,7 @@ const ROLE_REF = /\bTO (w\d{3})\b/g;
 const EXTENSION = /CREATE EXTENSION IF NOT EXISTS (\w+)/g;
 
 const corpusDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)),
-        "../../../../fixtures/corpus");
+        "../../../../java/fixtures/corpus");
 const corpusFiles = readdirSync(corpusDir)
         .filter(f => /^corpus-\d+\.sql$/.test(f)).sort();
 
