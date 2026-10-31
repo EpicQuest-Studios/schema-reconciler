@@ -15,7 +15,7 @@ This document is the working specification of the schema-reconciler project: the
 
 ## Document conventions
 
-- Sections 1–11 and Appendix A define required behaviour. The preface, examples and rationale embedded in them, and Appendices B and C are background and establish no requirements.
+- Sections 1–11 and Appendices A and D define required behaviour. The preface, examples and rationale embedded in them, and Appendices B and C are background and establish no requirements.
 - Requirements are stated in plain words: **must** is binding, **should** is a recommendation an implementation may deviate from for good reason, **may** marks a permitted option.
 - Text in `monospace` is program text. Type and member signatures shown in Java blocks are the API surface; the prose beneath each block defines its contract.
 
@@ -77,6 +77,7 @@ This document is the working specification of the schema-reconciler project: the
   - [A.7 Migration path for an existing deployment script](#a7-migration-path-for-an-existing-deployment-script)
 - [Appendix B. Example](#appendix-b-example)
 - [Appendix C. PostgreSQL 14–19 feature coverage and test corpus](#appendix-c-postgresql-1419-feature-coverage-and-test-corpus)
+- [Appendix D. TypeScript binding](#appendix-d-typescript-binding)
   - [Reconciled constructs (managed kinds)](#reconciled-constructs-managed-kinds)
   - [Detected but unsupported (`OTHER` → `UNSUPPORTED` per 5.4)](#detected-but-unsupported-other--unsupported-per-54)
   - [Out of scope (cluster-level or statement-only, per 1.5/3.2)](#out-of-scope-cluster-level-or-statement-only-per-1532)
@@ -1140,3 +1141,30 @@ A second rejected group is everything whose catalog effect the snapshot cannot r
 | `fixtures/corpus/corpus-01.sql` … `corpus-09.sql` | nine anonymized production schemas (all identifiers obfuscated, comments stripped, schema name normalised to `fixture`). corpus-01 exercises extensions (`vector`, `pg_trgm`), generated columns, composite foreign keys over bare unique indexes, triggers and routines; corpus-07 exercises RLS policies, `GRANT`s, `security_invoker` views and a `DO` block reading `pg_catalog`; all exercise `CREATE OR REPLACE` views, expression/partial indexes and dollar-quoted bodies | `CorpusFixtureTest` — auto-discovers every `corpus-*.sql`, reconciles + idempotent re-run; policy-bearing files run under `unsupported=REPORT` |
 
 Dollar-quoted PL/pgSQL bodies in the corpus contain semicolons, so client-side statement splitting is invalid — reinforcing P1. The corpus files are a compatibility corpus, not a migration source of truth.
+
+## Appendix D. TypeScript binding
+
+The TypeScript implementation (`@schema-reconciler/core`, `@schema-reconciler/postgresql`, `@schema-reconciler/tck` — npm workspaces mirroring `schema-reconciler-core`, `schema-reconciler-postgresql`, `schema-reconciler-tck`) binds this specification with the following mechanical mapping. Everything sections 1–11 and Appendix A require applies unchanged; only the API *surface* is transformed, never the behaviour.
+
+### D.1 Asynchrony
+
+Every Java SPI/API method that performs I/O — `SqlConnection` operations, `Dialect` catalog and script methods, `Dialect.resolve`, `plan()`, `planTimed()`, `reconcile()`, `apply()`, `dump()` — returns `Promise` in TypeScript and is awaited at the same point the Java code blocks. Phase order, exception types and listener callbacks are unchanged. `Dialect.supports`, `render`, `quoteIdentifier`, `capabilities`, `nameScopes`, `coveredChildren` and `dumpStatements` stay synchronous, matching their Java signatures. `ReconcileListener` callbacks may return `void` or `Promise<void>` and are always awaited.
+
+### D.2 Platform types
+
+- `javax.sql.DataSource`/`java.sql.Connection` → the SPI's own `SqlDataSource`/`SqlConnection` interfaces (one dedicated session per connection — a `pg.PoolClient`, not a pool handle). `setAutoCommit(false)` maps to explicit `BEGIN`; `commit`/`rollback` end it.
+- `java.util.Optional<T>` → `T | undefined`; `List<T>` → `readonly T[]`; `Set<T>` → `ReadonlySet<T>` or `ObjectSet`; `Map<K,V>` → `ReadonlyMap<K,V>` or `ObjectMap` (value-keyed by `ObjectId`, as Java records key `HashMap` by value).
+- Records → classes with `readonly` fields, defensive copies and `Object.freeze`; enums → `const` object + union type in the same declaration order (ordinal semantics, 5.2, are preserved); `java.time.Duration` → `Duration` with `ofMillis`/`ofSeconds`/`ofNanos`/`ZERO`, stored as fractional milliseconds.
+- `IllegalArgumentException` → `IllegalArgumentError`; null-argument checks → `TypeError`; `System.Logger` warnings → `console.warn`.
+
+### D.3 API deltas
+
+- `DesiredState.ofResource(ClassLoader, name)` has no analog — Node has no classpath; `ofPath`/`ofScript` cover the contract.
+- Dialect discovery is the explicit `registerDialect`/`registeredDialects` registry plus the `dialect` builder option, replacing `ServiceLoader`; `DialectResolver` selection semantics (explicit first, then single-supports match, identical error shapes) are unchanged.
+- Plan metadata retention uses a `WeakMap` keyed by the plan object — the same identity-keyed, GC-purged semantics the Java `WeakHashMap` + `IdentityKey` wrapper provides.
+- `ReconcileListener.NONE` is replaced by the builder's default `{}` listener.
+- `int8` catalog values may arrive as strings (the `pg` driver's precision-safe default); identity and sequence option reads use exact-string semantics so rendered SQL keeps the full value.
+
+### D.4 Conformance
+
+The TCK package exposes `dialectConformanceSuite(spec)` — the same C-01…C-67 scenario ids the Java `DialectConformanceTest` declares, verified 1:1 against the table in 9.2 — executed under `node:test`. The fixture files, `PgScriptCheck` spec-lists, the fuzz templates and this document's pseudocode are shared verbatim. TypeScript sources are erasable-syntax-only (no `enum`, `namespace` or parameter properties) so tests run directly under Node's native type stripping; `tsc --noEmit` performs typechecking.
