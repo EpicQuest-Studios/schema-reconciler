@@ -2,8 +2,8 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { ChangeAction, ChangeSafety, Definition, Difference,
         DifferenceType, ObjectId, ObjectKind, SchemaObject,
-        SchemaSnapshot } from "@schema-reconciler/core";
-import { ObjectMap, ObjectSet } from "@schema-reconciler/core";
+        SchemaSnapshot } from "@epicquest-studios/schema-reconciler-core";
+import { ObjectMap, ObjectSet } from "@epicquest-studios/schema-reconciler-core";
 import * as PgCatalog from "../../src/internal/PgCatalog.ts";
 import * as PgIdentifiers from "../../src/internal/PgIdentifiers.ts";
 import * as PgRender from "../../src/internal/PgRender.ts";

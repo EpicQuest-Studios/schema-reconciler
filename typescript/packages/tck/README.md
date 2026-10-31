@@ -1,4 +1,4 @@
-# @schema-reconciler/tck
+# @epicquest-studios/schema-reconciler-tck
 
 Dialect conformance suite for the schema reconciler — scenarios
 C-01…C-67 of SPEC.md 9.2 as a reusable `node:test` suite. Third-party
@@ -6,7 +6,7 @@ dialects prove conformance by running it against a live database.
 
 ```ts
 // in a *.test.ts file picked up by `node --test`
-import { dialectConformanceSuite } from "@schema-reconciler/tck";
+import { dialectConformanceSuite } from "@epicquest-studios/schema-reconciler-tck";
 import { MyDialect } from "./MyDialect.ts";
 
 dialectConformanceSuite({
@@ -29,7 +29,7 @@ dialectConformanceSuite({
 every other hook is optional — omitting it skips the scenario that
 needs it (the only permitted deviation, SPEC.md 9.1). See
 `ConformanceHooks` in `src/DialectConformanceTest.ts` for the full
-contract and `@schema-reconciler/postgresql`'s own test suite for the
+contract and `@epicquest-studios/schema-reconciler-postgresql`'s own test suite for the
 reference wiring.
 
-Requires Node ≥ 22.18. Depends only on `@schema-reconciler/core`.
+Requires Node ≥ 22.18. Depends only on `@epicquest-studios/schema-reconciler-core`.

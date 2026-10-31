@@ -1,13 +1,13 @@
-# @schema-reconciler/postgresql
+# @epicquest-studios/schema-reconciler-postgresql
 
 PostgreSQL 14+ dialect for the schema reconciler — TypeScript binding
 of [SPEC.md](../../../SPEC.md) (Appendix D, PostgreSQL profile).
 
 ```ts
 import { SchemaReconciler, DesiredState }
-        from "@schema-reconciler/core";
+        from "@epicquest-studios/schema-reconciler-core";
 import { PostgreSqlDialect }
-        from "@schema-reconciler/postgresql";
+        from "@epicquest-studios/schema-reconciler-postgresql";
 
 const reconciler = SchemaReconciler.builder()
         .dataSource(dataSource)
@@ -20,14 +20,14 @@ await reconciler.reconcile();
 ```
 
 The dialect is driver-agnostic: it works against the `SqlDataSource`
-abstraction from `@schema-reconciler/core`. A `pg` adapter is a few
+abstraction from `@epicquest-studios/schema-reconciler-core`. A `pg` adapter is a few
 lines — connections must be dedicated sessions (one client each, no
 pool sharing mid-run):
 
 ```ts
 import pg from "pg";
 import type { SqlConnection, SqlDataSource, DatabaseMetadata }
-        from "@schema-reconciler/core";
+        from "@epicquest-studios/schema-reconciler-core";
 
 class PgConnection implements SqlConnection {
     constructor(private readonly client: pg.Client) {}
@@ -81,5 +81,5 @@ GRANT USAGE, CREATE ON SCHEMA svc TO app_reconciler;
 GRANT CREATE ON DATABASE appdb TO app_reconciler;
 ```
 
-Requires Node ≥ 22.18. Depends only on `@schema-reconciler/core`;
+Requires Node ≥ 22.18. Depends only on `@epicquest-studios/schema-reconciler-core`;
 `pg` is a peer concern of the application's adapter.

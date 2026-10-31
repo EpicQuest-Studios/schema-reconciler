@@ -1,4 +1,4 @@
-# @schema-reconciler/core
+# @epicquest-studios/schema-reconciler-core
 
 Vendor-neutral, declarative, data-safe schema reconciliation — API, SPI
 and engine. TypeScript binding of [SPEC.md](../../../SPEC.md)
@@ -11,13 +11,13 @@ scratch namespace, so the library never parses vendor SQL itself.
 
 ```ts
 import { SchemaReconciler, DesiredState }
-        from "@schema-reconciler/core";
+        from "@epicquest-studios/schema-reconciler-core";
 
 const reconciler = SchemaReconciler.builder()
         .dataSource(dataSource)          // SqlDataSource — see below
         .namespace("svc")
         .desiredState(DesiredState.ofPath("db/schema.sql"))
-        .dialect(dialect)                // e.g. @schema-reconciler/postgresql
+        .dialect(dialect)                // e.g. @epicquest-studios/schema-reconciler-postgresql
         .build();
 
 const report = await reconciler.reconcile();
@@ -26,7 +26,7 @@ const report = await reconciler.reconcile();
 All engine operations are `Promise`-returning. `SqlDataSource` /
 `SqlConnection` are the async analogs of `javax.sql.DataSource` /
 `java.sql.Connection` — a dialect package typically documents a ready
-adapter for its driver (see `@schema-reconciler/postgresql` for `pg`).
+adapter for its driver (see `@epicquest-studios/schema-reconciler-postgresql` for `pg`).
 
 - `plan()` / `planTimed()` — inspect the deterministic change plan
 - `reconcile()` — plan + apply + verify under the configured
@@ -37,7 +37,7 @@ adapter for its driver (see `@schema-reconciler/postgresql` for `pg`).
   for automatic dialect selection
 
 Dialect authors implement the `Dialect` SPI and validate against
-`@schema-reconciler/tck` (scenarios C-01…C-67).
+`@epicquest-studios/schema-reconciler-tck` (scenarios C-01…C-67).
 
 Requires Node ≥ 22.18 (packages ship TypeScript sources; Node strips
 the types at load). Zero runtime dependencies.

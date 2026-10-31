@@ -5,7 +5,7 @@ Vendor-neutral, declarative, data-safe schema reconciler (spec: `SPEC.md`) with 
 ## Layout
 
 - `java/` — Maven aggregator: `schema-reconciler-core` (API `studio.epicquest.schema.reconciler`, model records, `Dialect` SPI, engine internals in `internal`, not exported), `schema-reconciler-postgresql` (PostgreSQL 14+ reference dialect, internals in `.internal`), `schema-reconciler-tck` (`DialectConformanceTest`, C-01…C-67, automatic module).
-- `typescript/` — npm workspaces mirroring the same three packages as `@schema-reconciler/{core,postgresql,tck}` under the TypeScript binding of SPEC.md. `pg` is a test-only devDep — runtime deps are zero.
+- `typescript/` — npm workspaces mirroring the same three packages as `@epicquest-studios/schema-reconciler-{core,postgresql,tck}` under the TypeScript binding of SPEC.md. `pg` is a test-only devDep — runtime deps are zero. Packages publish to GitHub Packages (`npm.pkg.github.com`; the scope must match the GitHub owner).
 - `java/fixtures/` — shared `corpus/corpus-*.sql` + `deployment/schema.sql` read by both test suites.
 - `SPEC.md` — the single contract; Java- and TypeScript-specific API surface lives in its binding sections.
 

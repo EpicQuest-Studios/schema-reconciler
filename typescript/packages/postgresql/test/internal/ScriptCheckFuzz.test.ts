@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { DesiredStateException } from "@schema-reconciler/core";
+import { DesiredStateException } from "@epicquest-studios/schema-reconciler-core";
 import * as PgScriptCheck from "../../src/internal/PgScriptCheck.ts";
 
 /**

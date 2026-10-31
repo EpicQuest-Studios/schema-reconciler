@@ -1144,7 +1144,7 @@ Dollar-quoted PL/pgSQL bodies in the corpus contain semicolons, so client-side s
 
 ## Appendix D. TypeScript binding
 
-The TypeScript implementation (`@schema-reconciler/core`, `@schema-reconciler/postgresql`, `@schema-reconciler/tck` — npm workspaces mirroring `schema-reconciler-core`, `schema-reconciler-postgresql`, `schema-reconciler-tck`) binds this specification with the following mechanical mapping. Everything sections 1–11 and Appendix A require applies unchanged; only the API *surface* is transformed, never the behaviour.
+The TypeScript implementation (`@epicquest-studios/schema-reconciler-core`, `@epicquest-studios/schema-reconciler-postgresql`, `@epicquest-studios/schema-reconciler-tck` — npm workspaces mirroring `schema-reconciler-core`, `schema-reconciler-postgresql`, `schema-reconciler-tck`) binds this specification with the following mechanical mapping. Everything sections 1–11 and Appendix A require applies unchanged; only the API *surface* is transformed, never the behaviour.
 
 ### D.1 Asynchrony
 

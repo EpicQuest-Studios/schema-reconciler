@@ -8,28 +8,57 @@ schema reconciliation is and how the engine works.
 
 | Package | Contents |
 |---|---|
-| `@schema-reconciler/core` | API, SPI, core algorithm (Promise-based; see SPEC.md Appendix D) |
-| `@schema-reconciler/postgresql` | PostgreSQL dialect |
-| `@schema-reconciler/tck` | Dialect conformance suite (`node:test`) |
+| `@epicquest-studios/schema-reconciler-core` | API, SPI, core algorithm (Promise-based; see SPEC.md Appendix D) |
+| `@epicquest-studios/schema-reconciler-postgresql` | PostgreSQL dialect |
+| `@epicquest-studios/schema-reconciler-tck` | Dialect conformance suite (`node:test`) |
 
 Zero runtime dependencies. Packages ship `.ts` sources and run on
 Node's native type stripping — **Node ≥ 22.18** required.
 
 ## Getting started
 
+Packages publish to **GitHub Packages** (`npm.pkg.github.com`) under
+the `EpicQuest-Studios` org — the scope must match the GitHub owner,
+hence `@epicquest-studios/*`. Point your project at that registry and
+authenticate (GitHub Packages requires a token even for public
+packages):
+
+```ini
+# .npmrc (in the consuming project)
+@epicquest-studios:registry=https://npm.pkg.github.com
+//npm.pkg.github.com/:_authToken=${GITHUB_TOKEN}
+```
+
+Any token with `read:packages` works — a personal access token, or
+`GITHUB_TOKEN` inside Actions.
+
 ```bash
-npm install @schema-reconciler/postgresql   # brings @schema-reconciler/core transitively
+npm install @epicquest-studios/schema-reconciler-postgresql   # brings -core transitively
 ```
 
 Implementing a dialect for another database? Depend on
-`@schema-reconciler/core`, and use `@schema-reconciler/tck` to run the
+`@epicquest-studios/schema-reconciler-core`, and use
+`@epicquest-studios/schema-reconciler-tck` to run the
 conformance suite against it.
+
+### Publishing
+
+Each package's `publishConfig.registry` already targets
+`npm.pkg.github.com`. From a package directory:
+
+```bash
+npm publish            # needs a PAT with write:packages in ~/.npmrc
+```
+
+or in CI with `NODE_AUTH_TOKEN`/`_authToken` wired to `GITHUB_TOKEN`
+(`permissions: packages: write`). GitHub Packages binds each published
+version to the repository it was pushed from.
 
 ## Usage
 
 ```ts
-import { SchemaReconciler, DesiredState } from "@schema-reconciler/core";
-import { PostgreSqlDialect } from "@schema-reconciler/postgresql";
+import { SchemaReconciler, DesiredState } from "@epicquest-studios/schema-reconciler-core";
+import { PostgreSqlDialect } from "@epicquest-studios/schema-reconciler-postgresql";
 
 const reconciler = SchemaReconciler.builder()
         .dataSource(dataSource)             // your SqlDataSource adapter
@@ -90,7 +119,7 @@ const scoped = SchemaReconciler.builder()
 ## Connecting a driver
 
 The API is driver-agnostic: it works against the `SqlDataSource` /
-`SqlConnection` abstraction from `@schema-reconciler/core`, with the
+`SqlConnection` abstraction from `@epicquest-studios/schema-reconciler-core`, with the
 same transaction semantics JDBC exposes (`setAutoCommit` modeled as
 explicit `BEGIN`/`COMMIT`). A complete `pg` adapter is a few lines —
 see [packages/postgresql/README.md](packages/postgresql/README.md).

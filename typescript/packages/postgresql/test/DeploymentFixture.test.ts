@@ -4,8 +4,8 @@ import { readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { DesiredState, ObjectId, ObjectKind, ReconcileOutcome,
-        SchemaReconciler } from "@schema-reconciler/core";
-import type { SchemaSnapshot } from "@schema-reconciler/core";
+        SchemaReconciler } from "@epicquest-studios/schema-reconciler-core";
+import type { SchemaSnapshot } from "@epicquest-studios/schema-reconciler-core";
 import { PostgreSqlDialect } from "../src/PostgreSqlDialect.ts";
 import { PgTestDataSource, available, ensureUuidv7, execute }
         from "./PgTestDatabase.ts";

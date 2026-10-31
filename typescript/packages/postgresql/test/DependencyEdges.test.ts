@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { ObjectId, ObjectKind } from "@schema-reconciler/core";
+import { ObjectId, ObjectKind } from "@epicquest-studios/schema-reconciler-core";
 import { PostgreSqlDialect } from "../src/PostgreSqlDialect.ts";
 import { PgTestDataSource, available } from "./PgTestDatabase.ts";
 

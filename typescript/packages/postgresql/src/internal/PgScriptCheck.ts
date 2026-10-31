@@ -1,4 +1,4 @@
-import { DesiredStateException } from "@schema-reconciler/core";
+import { DesiredStateException } from "@epicquest-studios/schema-reconciler-core";
 import * as PgSql from "./PgSql.ts";
 import * as PgIdentifiers from "./PgIdentifiers.ts";
 

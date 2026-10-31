@@ -1,5 +1,5 @@
 import type { DatabaseMetadata, SqlConnection, SqlDataSource }
-        from "@schema-reconciler/core";
+        from "@epicquest-studios/schema-reconciler-core";
 
 /** One recorded statement. */
 export interface ExecutedSql {

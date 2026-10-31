@@ -2,9 +2,9 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { Decision, DesiredState, ObjectKind, PlanningException,
         ReconcileOutcome, ReconcilePolicy, SchemaReconciler }
-        from "@schema-reconciler/core";
+        from "@epicquest-studios/schema-reconciler-core";
 import type { ReconcilePolicy as Policy, ReconcileReport }
-        from "@schema-reconciler/core";
+        from "@epicquest-studios/schema-reconciler-core";
 import { PostgreSqlDialect } from "../src/PostgreSqlDialect.ts";
 import { PgTestDataSource, available, execute, serverMajor }
         from "./PgTestDatabase.ts";

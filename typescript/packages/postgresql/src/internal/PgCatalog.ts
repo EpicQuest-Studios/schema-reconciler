@@ -1,9 +1,9 @@
-import { Dialect } from "@schema-reconciler/core";
-import { Definition } from "@schema-reconciler/core";
-import { ObjectId, ObjectIds, ObjectKind } from "@schema-reconciler/core";
-import { ObjectMap, ObjectSet } from "@schema-reconciler/core";
-import { SchemaObject, SchemaSnapshot } from "@schema-reconciler/core";
-import type { SqlConnection } from "@schema-reconciler/core";
+import { Dialect } from "@epicquest-studios/schema-reconciler-core";
+import { Definition } from "@epicquest-studios/schema-reconciler-core";
+import { ObjectId, ObjectIds, ObjectKind } from "@epicquest-studios/schema-reconciler-core";
+import { ObjectMap, ObjectSet } from "@epicquest-studios/schema-reconciler-core";
+import { SchemaObject, SchemaSnapshot } from "@epicquest-studios/schema-reconciler-core";
+import type { SqlConnection } from "@epicquest-studios/schema-reconciler-core";
 import * as PgIdentifiers from "./PgIdentifiers.ts";
 import * as PgSql from "./PgSql.ts";
 

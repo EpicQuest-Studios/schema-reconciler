@@ -1,6 +1,6 @@
 import pg from "pg";
 import type { DatabaseMetadata, SqlConnection, SqlDataSource }
-        from "@schema-reconciler/core";
+        from "@epicquest-studios/schema-reconciler-core";
 
 /**
  * Supplies the disposable database for PostgreSQL dialect tests. Set

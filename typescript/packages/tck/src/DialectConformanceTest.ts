@@ -7,9 +7,9 @@ import {
         LockTimeoutException, ObjectId, ObjectKind, PlanningException,
         PolicyViolationException, ReconcileOutcome, ReconcilePlan,
         ReconcilePolicy, SchemaReconciler, StalePlanException }
-        from "@schema-reconciler/core";
+        from "@epicquest-studios/schema-reconciler-core";
 import type { Dialect, PlannedChange, SchemaSnapshot, SqlDataSource }
-        from "@schema-reconciler/core";
+        from "@epicquest-studios/schema-reconciler-core";
 import { TrackingDataSource } from "./TrackingDataSource.ts";
 
 /**

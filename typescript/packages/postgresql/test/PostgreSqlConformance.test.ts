@@ -4,9 +4,9 @@ import { ApplyException, ConfigurationException, Decision, DesiredState,
         DesiredStateException, DifferenceType, Duration, ObjectId, ObjectKind,
         PlanningException, PolicyViolationException, ReconcileOutcome,
         ReconcilePolicy, SchemaReconciler, SchemaReconcilerException }
-        from "@schema-reconciler/core";
-import type { SqlConnection, SqlDataSource } from "@schema-reconciler/core";
-import { dialectConformanceSuite } from "@schema-reconciler/tck";
+        from "@epicquest-studios/schema-reconciler-core";
+import type { SqlConnection, SqlDataSource } from "@epicquest-studios/schema-reconciler-core";
+import { dialectConformanceSuite } from "@epicquest-studios/schema-reconciler-tck";
 import { PostgreSqlDialect } from "../src/PostgreSqlDialect.ts";
 import { PgTestConnection, PgTestDataSource, available, execute, serverMajor }
         from "./PgTestDatabase.ts";

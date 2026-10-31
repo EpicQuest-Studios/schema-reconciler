@@ -1,4 +1,4 @@
-import { IllegalArgumentError } from "@schema-reconciler/core";
+import { IllegalArgumentError } from "@epicquest-studios/schema-reconciler-core";
 
 /** Identifier quoting and the constant-default classification of spec A.6. */
 

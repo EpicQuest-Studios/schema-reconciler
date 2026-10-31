@@ -1,8 +1,8 @@
-import { PlanningException } from "@schema-reconciler/core";
-import { ChangeAction, ChangeSafety, Definition } from "@schema-reconciler/core";
-import type { Difference, ObjectId } from "@schema-reconciler/core";
-import { ObjectIds, ObjectKind, PlannedChange } from "@schema-reconciler/core";
-import type { SchemaObject, SchemaSnapshot } from "@schema-reconciler/core";
+import { PlanningException } from "@epicquest-studios/schema-reconciler-core";
+import { ChangeAction, ChangeSafety, Definition } from "@epicquest-studios/schema-reconciler-core";
+import type { Difference, ObjectId } from "@epicquest-studios/schema-reconciler-core";
+import { ObjectIds, ObjectKind, PlannedChange } from "@epicquest-studios/schema-reconciler-core";
+import type { SchemaObject, SchemaSnapshot } from "@epicquest-studios/schema-reconciler-core";
 import * as PgCatalog from "./PgCatalog.ts";
 import * as PgIdentifiers from "./PgIdentifiers.ts";
 import * as PgSql from "./PgSql.ts";

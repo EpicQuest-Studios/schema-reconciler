@@ -1,4 +1,4 @@
-import { IllegalArgumentError } from "@schema-reconciler/core";
+import { IllegalArgumentError } from "@epicquest-studios/schema-reconciler-core";
 
 /**
  * PostgreSQL-aware SQL text handling: the normalisation of spec 5.3 and the

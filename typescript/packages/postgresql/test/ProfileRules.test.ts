@@ -3,7 +3,7 @@ import { readFile } from "node:fs/promises";
 import { describe, it } from "node:test";
 import { ConfigurationException, DesiredState, DesiredStateException,
         ReconcileOutcome, SchemaReconciler }
-        from "@schema-reconciler/core";
+        from "@epicquest-studios/schema-reconciler-core";
 import { PostgreSqlDialect } from "../src/PostgreSqlDialect.ts";
 import { PgTestDataSource, available, execute }
         from "./PgTestDatabase.ts";

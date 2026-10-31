@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { ChangeAction, ChangeSafety, DesiredState, SchemaReconciler }
-        from "@schema-reconciler/core";
-import type { PlannedChange } from "@schema-reconciler/core";
+        from "@epicquest-studios/schema-reconciler-core";
+import type { PlannedChange } from "@epicquest-studios/schema-reconciler-core";
 import { PostgreSqlDialect } from "../src/PostgreSqlDialect.ts";
 import { PgTestDataSource, available, execute } from "./PgTestDatabase.ts";
 
