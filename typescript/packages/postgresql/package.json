@@ -19,5 +19,9 @@
     "scripts": {
         "test": "node --test",
         "typecheck": "tsc --noEmit -p tsconfig.json"
+    },
+    "devDependencies": {
+        "@types/pg": "^8.23.1",
+        "pg": "^8.16.3"
     }
 }
