@@ -1,0 +1,72 @@
+{
+  "name": "@epicquest-studios/schema-reconciler-postgresql",
+  "dist-tags": {
+    "latest": "0.9.0"
+  },
+  "versions": {
+    "0.9.0": {
+      "name": "@epicquest-studios/schema-reconciler-postgresql",
+      "version": "0.9.0",
+      "description": "PostgreSQL 14+ reference dialect for the schema reconciler (TypeScript binding of SPEC.md).",
+      "license": "Apache-2.0",
+      "type": "module",
+      "exports": {
+        ".": {
+          "types": "./dist/index.d.ts",
+          "default": "./dist/index.js"
+        }
+      },
+      "files": [
+        "dist"
+      ],
+      "publishConfig": {
+        "registry": "https://epicquest-studios.github.io/schema-reconciler/npm"
+      },
+      "engines": {
+        "node": ">=22.18"
+      },
+      "dependencies": {
+        "@epicquest-studios/schema-reconciler-core": "0.9.0"
+      },
+      "scripts": {
+        "build": "tsc -p tsconfig.build.json",
+        "test": "node --test",
+        "typecheck": "tsc --noEmit -p tsconfig.json"
+      },
+      "devDependencies": {
+        "@epicquest-studios/schema-reconciler-tck": "0.9.0",
+        "@types/pg": "^8.23.1",
+        "pg": "^8.16.3"
+      },
+      "repository": {
+        "type": "git",
+        "url": "https://github.com/EpicQuest-Studios/schema-reconciler",
+        "directory": "typescript/packages/postgresql"
+      },
+      "bugs": "https://github.com/EpicQuest-Studios/schema-reconciler/issues",
+      "keywords": [
+        "schema",
+        "migration",
+        "reconciler",
+        "declarative",
+        "ddl",
+        "database",
+        "postgresql",
+        "postgres"
+      ],
+      "homepage": "https://github.com/EpicQuest-Studios/schema-reconciler#readme",
+      "sideEffects": false,
+      "dist": {
+        "tarball": "https://epicquest-studios.github.io/schema-reconciler/npm/tarballs/schema-reconciler-postgresql-0.9.0.tgz",
+        "integrity": "sha512-pLxzJ5YSBcEszEcIYkpqBW0k6TBwpT7565tRxnOCzFLWghRAAPjNAxp8vXVnD7IAhN+wzlcnkwlm4rvBrYzgfA==",
+        "shasum": "3050205f6643d9f4744597514693f5cb9e42c06b",
+        "unpackedSize": 333464
+      }
+    }
+  },
+  "time": {
+    "created": "2026-10-31T18:30:49.997Z",
+    "modified": "2026-10-31T18:30:49.997Z",
+    "0.9.0": "2026-10-31T18:30:49.997Z"
+  }
+}

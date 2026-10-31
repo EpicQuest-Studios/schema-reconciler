@@ -1,0 +1,67 @@
+{
+  "name": "@epicquest-studios/schema-reconciler-tck",
+  "dist-tags": {
+    "latest": "0.9.0"
+  },
+  "versions": {
+    "0.9.0": {
+      "name": "@epicquest-studios/schema-reconciler-tck",
+      "version": "0.9.0",
+      "description": "Dialect conformance suite (C-01…C-67) that every schema-reconciler dialect must pass — TypeScript binding.",
+      "license": "Apache-2.0",
+      "type": "module",
+      "exports": {
+        ".": {
+          "types": "./dist/index.d.ts",
+          "default": "./dist/index.js"
+        }
+      },
+      "files": [
+        "dist"
+      ],
+      "publishConfig": {
+        "registry": "https://epicquest-studios.github.io/schema-reconciler/npm"
+      },
+      "engines": {
+        "node": ">=22.18"
+      },
+      "dependencies": {
+        "@epicquest-studios/schema-reconciler-core": "0.9.0"
+      },
+      "scripts": {
+        "build": "tsc -p tsconfig.build.json",
+        "test": "node --test",
+        "typecheck": "tsc --noEmit -p tsconfig.json"
+      },
+      "repository": {
+        "type": "git",
+        "url": "https://github.com/EpicQuest-Studios/schema-reconciler",
+        "directory": "typescript/packages/tck"
+      },
+      "bugs": "https://github.com/EpicQuest-Studios/schema-reconciler/issues",
+      "keywords": [
+        "schema",
+        "migration",
+        "reconciler",
+        "declarative",
+        "ddl",
+        "database",
+        "tck",
+        "conformance"
+      ],
+      "homepage": "https://github.com/EpicQuest-Studios/schema-reconciler#readme",
+      "sideEffects": false,
+      "dist": {
+        "tarball": "https://epicquest-studios.github.io/schema-reconciler/npm/tarballs/schema-reconciler-tck-0.9.0.tgz",
+        "integrity": "sha512-N7ScMcjpiDXK1ZA0u+XrOiZfC+HeV5r/T7HbloAFAMH7fwT15XCLlsXdIsIX8mrYwxyzR/Swk9hlAgfZfEPPsg==",
+        "shasum": "136f76fe275e41aa8fd9efb9b13d1509fe4d270d",
+        "unpackedSize": 100904
+      }
+    }
+  },
+  "time": {
+    "created": "2026-10-31T18:30:50.838Z",
+    "modified": "2026-10-31T18:30:50.838Z",
+    "0.9.0": "2026-10-31T18:30:50.838Z"
+  }
+}

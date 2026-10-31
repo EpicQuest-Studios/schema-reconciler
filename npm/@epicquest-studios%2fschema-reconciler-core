@@ -1,0 +1,63 @@
+{
+  "name": "@epicquest-studios/schema-reconciler-core",
+  "dist-tags": {
+    "latest": "0.9.0"
+  },
+  "versions": {
+    "0.9.0": {
+      "name": "@epicquest-studios/schema-reconciler-core",
+      "version": "0.9.0",
+      "description": "Vendor-neutral, declarative, data-safe schema reconciliation — API, SPI and engine (TypeScript binding of SPEC.md).",
+      "license": "Apache-2.0",
+      "type": "module",
+      "exports": {
+        ".": {
+          "types": "./dist/index.d.ts",
+          "default": "./dist/index.js"
+        }
+      },
+      "files": [
+        "dist"
+      ],
+      "publishConfig": {
+        "registry": "https://epicquest-studios.github.io/schema-reconciler/npm"
+      },
+      "engines": {
+        "node": ">=22.18"
+      },
+      "scripts": {
+        "build": "tsc -p tsconfig.build.json",
+        "test": "node --test",
+        "typecheck": "tsc --noEmit -p tsconfig.json"
+      },
+      "repository": {
+        "type": "git",
+        "url": "https://github.com/EpicQuest-Studios/schema-reconciler",
+        "directory": "typescript/packages/core"
+      },
+      "bugs": "https://github.com/EpicQuest-Studios/schema-reconciler/issues",
+      "keywords": [
+        "schema",
+        "migration",
+        "reconciler",
+        "declarative",
+        "ddl",
+        "database",
+        "engine"
+      ],
+      "homepage": "https://github.com/EpicQuest-Studios/schema-reconciler#readme",
+      "sideEffects": false,
+      "dist": {
+        "tarball": "https://epicquest-studios.github.io/schema-reconciler/npm/tarballs/schema-reconciler-core-0.9.0.tgz",
+        "integrity": "sha512-Y23sXmAkcSPmn1/bbDziPZ5U6SfshqDXrV3uqqoLIE0e32klGK4GPtUjtWAMR74oOodD7RjmMA5Cc2PWr3EsVQ==",
+        "shasum": "f99391bf48b19fd716a8748590fac1361d9201ac",
+        "unpackedSize": 184449
+      }
+    }
+  },
+  "time": {
+    "created": "2026-10-31T18:30:48.602Z",
+    "modified": "2026-10-31T18:30:48.602Z",
+    "0.9.0": "2026-10-31T18:30:48.602Z"
+  }
+}
