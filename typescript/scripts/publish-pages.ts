@@ -5,8 +5,8 @@
  *   GET <registry>/<url-encoded name> -> packument JSON (versions map)
  *   GET <dist.tarball>                -> the .tgz
  *
- * so GitHub Pages can host a full registry with no credentials on
- * either side — the same mechanism the Maven repository already uses.
+ * so GitHub Pages can host a full registry anonymously — the same
+ * mechanism the Maven repository already uses.
  *
  * Layout it writes into the gh-pages checkout:
  *

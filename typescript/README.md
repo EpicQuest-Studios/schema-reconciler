@@ -20,8 +20,7 @@ dev-only; **Node ≥ 22.18** is required for working in this repo).
 ## Getting started
 
 Packages publish to a **static npm registry on GitHub Pages** — the
-same mechanism as the Maven repository, so installs are anonymous HTTPS
-with no token for anyone. Point your project at it:
+same mechanism as the Maven repository. Point your project at it:
 
 ```ini
 # .npmrc (in the consuming project)

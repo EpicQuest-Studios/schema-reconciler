@@ -14,7 +14,6 @@
         "dist"
     ],
     "publishConfig": {
-        "access": "public",
         "registry": "https://epicquest-studios.github.io/schema-reconciler/npm"
     },
     "engines": {

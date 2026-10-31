@@ -37,7 +37,7 @@ Java 25, Maven 3.9+. `mvn -f java/pom.xml verify` builds all three modules and r
 
 ## Releases
 
-Artifacts are published as a Maven repository on the `gh-pages` branch (GitHub Pages) — anonymous HTTPS access, no credentials for consumers.
+Artifacts are published as a Maven repository on the `gh-pages` branch (GitHub Pages), served anonymously over HTTPS.
 
 - Publish: `mvn -f java/pom.xml -DskipTests deploy -DaltDeploymentRepository=pages::default::file:///<checkout-of-gh-pages>/maven`, then commit + push `gh-pages`.
 - Delete a version or artifact: `git rm` it on `gh-pages` and push — removal takes effect immediately.

@@ -40,7 +40,7 @@ repositories { maven { url = 'https://epicquest-studios.github.io/schema-reconci
 implementation 'studio.epicquest.schema:schema-reconciler-postgresql:0.9.0'
 ```
 
-Implementing a dialect for another database? Depend on `-core`, and use `-tck` (test scope) to run the conformance suite against it. No credentials are needed — the repository is served anonymously over HTTPS.
+Implementing a dialect for another database? Depend on `-core`, and use `-tck` (test scope) to run the conformance suite against it. The repository is served anonymously over HTTPS.
 
 ## Usage
 
@@ -134,7 +134,7 @@ docker run -d --name reconciler-tck -e POSTGRES_USER=rcl \
 
 ## Releases
 
-Artifacts are published as a Maven repository on the `gh-pages` branch (GitHub Pages) — anonymous HTTPS access, no credentials for consumers.
+Artifacts are published as a Maven repository on the `gh-pages` branch (GitHub Pages), served anonymously over HTTPS.
 
 - Publish: `mvn -DskipTests deploy -DaltDeploymentRepository=pages::default::file:///<checkout-of-gh-pages>/maven`, then commit + push `gh-pages`.
 - Delete a version or artifact: `git rm` it on `gh-pages` and push — removal takes effect immediately.
