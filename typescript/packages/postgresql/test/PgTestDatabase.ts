@@ -17,13 +17,16 @@ import type { DatabaseMetadata, SqlConnection, SqlDataSource }
 const LOCAL_URL = "postgresql://rcl:rcl@localhost:55999/rcl";
 
 function config(url: string, user?: string, password?: string): pg.ClientConfig {
-    const c: pg.ClientConfig = { connectionString: url.startsWith("postgres")
-            ? url : "postgresql://" + url };
-    if (user !== undefined) {
-        c.user = user;
-        c.password = password;
-    }
-    return c;
+    // decompose the URI into explicit fields — with a connectionString that
+    // embeds credentials, pg ignores the user/password fields outright
+    const u = new URL(url.startsWith("postgres") ? url : "postgresql://" + url);
+    return {
+        host: u.hostname,
+        port: u.port === "" ? 5432 : Number(u.port),
+        database: decodeURIComponent(u.pathname.slice(1)),
+        user: user ?? decodeURIComponent(u.username),
+        password: password ?? decodeURIComponent(u.password),
+    };
 }
 
 /** A `SqlConnection` over one `pg.Client`. */
