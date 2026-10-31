@@ -31,6 +31,7 @@ import studio.epicquest.schema.reconciler.spi.Dialect;
 class DeploymentFixtureTest {
 
     private static final AtomicLong SEQUENCE = new AtomicLong();
+    private static final long RUN_ID = System.nanoTime();
 
     private final DataSource dataSource = PgTestDatabase.dataSource();
     private final Dialect dialect = new PostgreSqlDialect();
@@ -38,7 +39,8 @@ class DeploymentFixtureTest {
 
     @BeforeEach
     void createNs() throws Exception {
-        namespace = "svc_e2e_" + SEQUENCE.incrementAndGet();
+        namespace = "svc_e2e_" + Long.toHexString(RUN_ID)
+                + "_" + SEQUENCE.incrementAndGet();
         execute("CREATE SCHEMA " + dialect.quoteIdentifier(namespace));
     }
 

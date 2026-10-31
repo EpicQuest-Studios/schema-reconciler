@@ -25,6 +25,7 @@ const dbUp = await available();
 const ds = new PgTestDataSource();
 const dialect = new PostgreSqlDialect();
 
+const RUN_ID = process.hrtime.bigint().toString(16);
 let sequence = 0;
 let namespace = "";
 
@@ -64,7 +65,7 @@ describe("DeploymentFixtureTest", {
     skip: !dbUp ? "no PostgreSQL test database" : false,
 }, () => {
     beforeEach(async () => {
-        namespace = "svc_e2e_" + (++sequence);
+        namespace = "svc_e2e_" + RUN_ID + "_" + (++sequence);
         await execute(ds, "CREATE SCHEMA " + dialect.quoteIdentifier(namespace));
     });
 

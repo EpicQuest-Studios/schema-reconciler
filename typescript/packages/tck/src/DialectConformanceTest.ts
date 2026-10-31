@@ -8,8 +8,8 @@ import {
         PolicyViolationException, ReconcileOutcome, ReconcilePlan,
         ReconcilePolicy, SchemaReconciler, StalePlanException }
         from "@schema-reconciler/core";
-import type { Dialect, PlannedChange, ReconcileReport, SchemaSnapshot,
-        SqlDataSource } from "@schema-reconciler/core";
+import type { Dialect, PlannedChange, SchemaSnapshot, SqlDataSource }
+        from "@schema-reconciler/core";
 import { TrackingDataSource } from "./TrackingDataSource.ts";
 
 /**

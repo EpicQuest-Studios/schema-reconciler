@@ -240,7 +240,7 @@ const NARROW_KINDS = new Set([
     ObjectKind.FOREIGN_KEY, ObjectKind.CHECK, ObjectKind.TRIGGER]);
 
 test("unsupportedKindIsSeparatePolicyDecision", async () => {
-    const { db, dialect } = fixture();
+    const { db } = fixture();
     const narrow = new FakeDialect(db, NARROW_KINDS);
     const script = "CREATE ROUTINE f DEF f_v1";
     const report = ReconcilePolicy.defaults().withUnsupported(Decision.REPORT);
@@ -264,7 +264,7 @@ test("unsupportedKindIsSeparatePolicyDecision", async () => {
 });
 
 test("unsupportedDependencyDemotesDependents", async () => {
-    const { db, dialect } = fixture();
+    const { db } = fixture();
     const narrow = new FakeDialect(db, new Set([ObjectKind.TABLE, ObjectKind.VIEW]));
     const script = "CREATE ROUTINE f DEF f_v1; CREATE VIEW v REQUIRES ROUTINE:f DEF v_v1";
     const policy = ReconcilePolicy.defaults().withUnsupported(Decision.REPORT);
@@ -359,7 +359,7 @@ test("applyRunsIssuedPlan", async () => {
 
 test("badScriptFailsAndLeavesNoScratch", async () => {
     const { db, dialect } = fixture();
-    const e = await assert.rejects(() => reconciler(db, dialect, "CREATE TABLE t DEF t_v1; BOGUS").reconcile(),
+    await assert.rejects(() => reconciler(db, dialect, "CREATE TABLE t DEF t_v1; BOGUS").reconcile(),
             DesiredStateException);
     assert.equal(db.lockHeld(NS), false);
     const leaked = db.statementLog()
@@ -496,7 +496,7 @@ test("exceptionHierarchy", () => {
 
 /** Spec 5.4: a content-compared object of an unsupported kind that the target already holds is no difference. */
 test("contentComparedUnsupportedObjectEqualInTargetIsNoDifference", async () => {
-    const { db, dialect } = fixture();
+    const { db } = fixture();
     const narrow = new FakeDialect(db, NARROW_KINDS);
     const id = new ObjectId(ObjectKind.ROUTINE, "f");
     const compared = new Map([[Dialect.CONTENT_COMPARED_ATTRIBUTE, "true"]]);
@@ -524,7 +524,7 @@ test("contentComparedUnsupportedObjectEqualInTargetIsNoDifference", async () => 
 });
 
 test("contentComparedUnsupportedObjectMissingInTargetIsStillReported", async () => {
-    const { db, dialect } = fixture();
+    const { db } = fixture();
     const narrow = new FakeDialect(db, NARROW_KINDS);
     const result = await SchemaReconciler.builder()
             .dataSource(db.dataSource()).namespace(NS)

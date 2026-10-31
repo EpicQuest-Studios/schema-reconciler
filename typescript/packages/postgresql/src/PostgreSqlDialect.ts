@@ -4,7 +4,7 @@ import { LockTimeoutException } from "@schema-reconciler/core";
 import type { Difference, ObjectId, PlannedChange } from "@schema-reconciler/core";
 import { ObjectKind } from "@schema-reconciler/core";
 import type { SchemaObject, SchemaSnapshot } from "@schema-reconciler/core";
-import type { DatabaseMetadata, Dialect, DialectCapabilities as Caps } from "@schema-reconciler/core";
+import type { DatabaseMetadata, Dialect } from "@schema-reconciler/core";
 import { DialectCapabilities } from "@schema-reconciler/core";
 import type { Duration, SqlConnection } from "@schema-reconciler/core";
 import * as PgCatalog from "./internal/PgCatalog.ts";

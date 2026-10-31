@@ -456,7 +456,7 @@ function checkDdl(statement: PgSql.StatementTokens, first: string,
         checkFtsAlter(statement, scratchNamespace);
     }
     if (first === "ALTER" && object === "OPERATOR") {
-        checkOperatorAlter(statement, scratchNamespace);
+        checkOperatorAlter(statement);
     }
     if (first === "ALTER" && adjacent(t, "OWNER", "TO")
             && !OWNER_MODELED.has(object)) {
@@ -1173,8 +1173,7 @@ function checkFtsAlter(statement: PgSql.StatementTokens,
  * every other form (`RENAME`, `OWNER TO`,
  * `SET SCHEMA`, plain-operator alters) rejects.
  */
-function checkOperatorAlter(statement: PgSql.StatementTokens,
-                            scratchNamespace: string | undefined): void {
+function checkOperatorAlter(statement: PgSql.StatementTokens): void {
     const t = statement.tokens;
     const name = nameIndex(t);
     const kind = name > 1 ? t[name - 1]! : "";

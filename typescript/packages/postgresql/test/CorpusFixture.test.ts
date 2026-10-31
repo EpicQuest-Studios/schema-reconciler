@@ -30,6 +30,7 @@ const dbUp = await available();
 const ds = new PgTestDataSource();
 const dialect = new PostgreSqlDialect();
 
+const RUN_ID = process.hrtime.bigint().toString(16);
 let sequence = 0;
 let namespace = "";
 
@@ -114,7 +115,7 @@ describe("CorpusFixtureTest", {
     skip: !dbUp ? "no PostgreSQL test database" : false,
 }, () => {
     beforeEach(async () => {
-        namespace = "corpus_" + (++sequence);
+        namespace = "corpus_" + RUN_ID + "_" + (++sequence);
         await execute(ds, "CREATE SCHEMA " + dialect.quoteIdentifier(namespace));
     });
 

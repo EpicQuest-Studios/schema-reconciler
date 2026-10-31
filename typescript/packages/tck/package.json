@@ -1,7 +1,7 @@
 {
     "name": "@schema-reconciler/tck",
     "version": "0.9.0",
-    "description": "Dialect conformance suite (C-01…C-60) that every schema-reconciler dialect must pass — TypeScript binding.",
+    "description": "Dialect conformance suite (C-01…C-67) that every schema-reconciler dialect must pass — TypeScript binding.",
     "license": "Apache-2.0",
     "type": "module",
     "exports": {
@@ -10,6 +10,9 @@
     "files": [
         "src"
     ],
+    "publishConfig": {
+        "access": "public"
+    },
     "engines": {
         "node": ">=22.18"
     },

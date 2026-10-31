@@ -474,7 +474,7 @@ public final class PgScriptCheck {
             checkFtsAlter(statement, scratchNamespace);
         }
         if (first.equals("ALTER") && object.equals("OPERATOR")) {
-            checkOperatorAlter(statement, scratchNamespace);
+            checkOperatorAlter(statement);
         }
         if (first.equals("ALTER") && adjacent(t, "OWNER", "TO")
                 && !OWNER_MODELED.contains(object)) {
@@ -1186,8 +1186,7 @@ public final class PgScriptCheck {
      * every other form ({@code RENAME}, {@code OWNER TO},
      * {@code SET SCHEMA}, plain-operator alters) rejects.
      */
-    private static void checkOperatorAlter(PgSql.StatementTokens statement,
-                                           String scratchNamespace) {
+    private static void checkOperatorAlter(PgSql.StatementTokens statement) {
         final var t = statement.tokens();
         final var name = nameIndex(t);
         final var kind = name > 1 ? t.get(name - 1) : "";

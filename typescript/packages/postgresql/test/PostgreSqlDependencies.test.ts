@@ -144,7 +144,7 @@ CREATE TABLE \${namespace}.b (a_tenant int NOT NULL, a_id int NOT NULL,
     it("an external view dependent on a recreated routine fails planning"
             + " (5.8.3)", async () => {
         const ns = await namespace();
-        const view = "ext_v_" + (++sequence).toString(16);
+        const view = "ext_v_" + RUN_ID + "_" + (++sequence).toString(16);
         try {
             await execute(ds, "CREATE FUNCTION " + dialect.quoteIdentifier(ns)
                     + ".f_ret(int) RETURNS int LANGUAGE sql IMMUTABLE"
@@ -168,7 +168,7 @@ CREATE TABLE \${namespace}.b (a_tenant int NOT NULL, a_id int NOT NULL,
     it("an external check constraint on a recreated routine fails planning"
             + " (5.8.3)", async () => {
         const ns = await namespace();
-        const table = "ext_t_" + (++sequence).toString(16);
+        const table = "ext_t_" + RUN_ID + "_" + (++sequence).toString(16);
         try {
             await execute(ds, "CREATE FUNCTION " + dialect.quoteIdentifier(ns)
                     + ".ok(int) RETURNS boolean LANGUAGE sql IMMUTABLE"
@@ -188,8 +188,8 @@ CREATE TABLE \${namespace}.b (a_tenant int NOT NULL, a_id int NOT NULL,
     it("an external trigger dependent on a recreated routine fails planning"
             + " (5.8.3)", async () => {
         const ns = await namespace();
-        const table = "ext_t_" + (++sequence).toString(16);
-        const trigger = "trg_" + (++sequence).toString(16);
+        const table = "ext_t_" + RUN_ID + "_" + (++sequence).toString(16);
+        const trigger = "trg_" + RUN_ID + "_" + (++sequence).toString(16);
         try {
             await execute(ds, "CREATE TABLE public." + table + " (x int)");
             await execute(ds, "CREATE FUNCTION " + dialect.quoteIdentifier(ns)
@@ -213,7 +213,7 @@ CREATE TABLE \${namespace}.b (a_tenant int NOT NULL, a_id int NOT NULL,
     it("an external dictionary dependent on our template blocks its drop"
             + " (5.8.3)", async () => {
         const ns = await namespace();
-        const dict = "ext_d_" + (++sequence).toString(16);
+        const dict = "ext_d_" + RUN_ID + "_" + (++sequence).toString(16);
         try {
             await execute(ds, "CREATE TEXT SEARCH TEMPLATE "
                     + dialect.quoteIdentifier(ns)

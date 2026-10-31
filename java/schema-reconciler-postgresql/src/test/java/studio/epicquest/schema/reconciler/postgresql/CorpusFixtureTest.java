@@ -43,6 +43,7 @@ import studio.epicquest.schema.reconciler.spi.Dialect;
 class CorpusFixtureTest {
 
     private static final AtomicLong SEQUENCE = new AtomicLong();
+    private static final long RUN_ID = System.nanoTime();
     private static final Pattern ROLE_REF = Pattern.compile("\\bTO (w\\d{3})\\b");
     private static final Pattern EXTENSION = Pattern.compile(
             "CREATE EXTENSION IF NOT EXISTS (\\w+)");
@@ -53,7 +54,8 @@ class CorpusFixtureTest {
 
     @BeforeEach
     void createNs() throws Exception {
-        namespace = "corpus_" + SEQUENCE.incrementAndGet();
+        namespace = "corpus_" + Long.toHexString(RUN_ID)
+                + "_" + SEQUENCE.incrementAndGet();
         execute("CREATE SCHEMA " + dialect.quoteIdentifier(namespace));
     }
 

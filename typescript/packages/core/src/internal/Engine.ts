@@ -192,7 +192,7 @@ export class Engine {
             const evaluation =
                     new PolicyEvaluator(session.dialect, this.policy)
                             .evaluate(built.plan, actual, desired);
-            const outcome = await this.applyAndVerify(session, built.plan, evaluation, desired,
+            const outcome = await this.applyAndVerify(session, built.plan, evaluation,
                     built.coveredByParent, clock);
             await session.commit();
             const unexpected = this.unexpected(built.plan);
@@ -259,7 +259,7 @@ export class Engine {
                     : PlanBuilder.coverageOf(
                             session.dialect, this.namespace, plan.differences, desired,
                             plan.changes);
-            const outcome = await this.applyAndVerify(session, plan, evaluation, desired,
+            const outcome = await this.applyAndVerify(session, plan, evaluation,
                     covered, clock);
             await session.commit();
             const unexpected = this.unexpected(plan);
@@ -303,7 +303,6 @@ export class Engine {
 
     private async applyAndVerify(session: Session, plan: ReconcilePlan,
                                  evaluation: Evaluation,
-                                 desired: SchemaSnapshot,
                                  coveredByParent: ObjectMap<ObjectMap<Definition>>,
                                  clock: PhaseClock): Promise<RunOutcome> {
         const applied: PlannedChange[] = [];

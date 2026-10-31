@@ -23,7 +23,7 @@ export const COLUMN_SQL = "columnSql";
 export const ATTNUM = "attnum";
 export const NOTNULL = "notnull";
 export const DEFAULT = "default";
-export const SIG_ARGS = "sigargs";
+const SIG_ARGS = "sigargs";
 /** `f` function or `p` procedure — ALTER ... OWNER TO applies to both. */
 export const PROKIND = "prokind";
 export const RETURN_TYPE = "returnType";

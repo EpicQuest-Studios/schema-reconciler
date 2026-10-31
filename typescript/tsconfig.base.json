@@ -8,12 +8,11 @@
         "strict": true,
         "noUncheckedIndexedAccess": true,
         "exactOptionalPropertyTypes": true,
+        "noUnusedLocals": true,
+        "noUnusedParameters": true,
         "erasableSyntaxOnly": true,
         "verbatimModuleSyntax": true,
         "rewriteRelativeImportExtensions": true,
-        "declaration": true,
-        "declarationMap": true,
-        "sourceMap": true,
         "skipLibCheck": true,
         "forceConsistentCasingInFileNames": true
     }

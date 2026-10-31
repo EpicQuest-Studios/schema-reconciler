@@ -215,7 +215,7 @@ public final class Engine {
             PolicyEvaluator.Evaluation evaluation =
                     new PolicyEvaluator(session.dialect, policy)
                             .evaluate(built.plan(), actual, desired);
-            final var outcome = applyAndVerify(session, built.plan(), evaluation, desired,
+            final var outcome = applyAndVerify(session, built.plan(), evaluation,
                     built.coveredByParent(), clock);
             session.commit();
             final var unexpected = unexpected(built.plan());
@@ -276,7 +276,7 @@ public final class Engine {
                             .orElseGet(() -> PlanBuilder.coverageOf(
                                     session.dialect, namespace, plan.differences(),
                                     plan.changes(), desired));
-            final var outcome = applyAndVerify(session, plan, evaluation, desired, covered, clock);
+            final var outcome = applyAndVerify(session, plan, evaluation, covered, clock);
             session.commit();
             final var unexpected = unexpected(plan);
             final var unsupported = unsupported(plan);
@@ -335,7 +335,6 @@ public final class Engine {
 
     private RunOutcome applyAndVerify(Session session, ReconcilePlan plan,
                                       PolicyEvaluator.Evaluation evaluation,
-                                      SchemaSnapshot desired,
                                       Map<ObjectId, Map<ObjectId, Definition>> coveredByParent,
                                       PhaseClock clock) {
         final var applied = new ArrayList<PlannedChange>();

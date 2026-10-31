@@ -248,10 +248,10 @@ function literalBody(text: string, span: [number, number, number]): string {
     return text.substring(span[0] + tag.length, innerEnd);
 }
 
-export const SPAN_STRING = 1;
-export const SPAN_IDENT_QUOTED = 2;
-export const SPAN_DOLLAR = 3;
-export const SPAN_COMMENT = 4;
+const SPAN_STRING = 1;
+const SPAN_IDENT_QUOTED = 2;
+const SPAN_DOLLAR = 3;
+const SPAN_COMMENT = 4;
 
 /** Block-closing keywords that may trail an `END` (`END IF`, `END LOOP`, …). */
 const END_TRAILERS = new Set([
@@ -412,7 +412,7 @@ function atomicBodyEnd(text: string, from: number): number {
  * If a literal/comment span starts at `pos`, returns
  * `[start, end, kind]`; otherwise `null`.
  */
-export function nextSpan(text: string, pos: number): [number, number, number] | null {
+function nextSpan(text: string, pos: number): [number, number, number] | null {
     const c = text.charAt(pos);
     const n = text.length;
     if (c === "'") {

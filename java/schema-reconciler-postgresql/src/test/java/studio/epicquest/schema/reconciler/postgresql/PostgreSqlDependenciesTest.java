@@ -168,7 +168,7 @@ class PostgreSqlDependenciesTest {
     @DisplayName("an external view dependent on a recreated routine fails planning (5.8.3)")
     void externalViewOnRecreatedRoutine() throws Exception {
         final var ns = namespace();
-        final var view = "ext_v_" + Long.toHexString(SEQUENCE.incrementAndGet());
+        final var view = "ext_v_" + Long.toHexString(RUN_ID) + "_" + SEQUENCE.incrementAndGet();
         try {
             PgTestDatabase.execute(ds, "CREATE FUNCTION " + dialect.quoteIdentifier(ns)
                     + ".f_ret(int) RETURNS int LANGUAGE sql IMMUTABLE AS $$SELECT $1$$");
@@ -192,7 +192,7 @@ class PostgreSqlDependenciesTest {
     @DisplayName("an external check constraint on a recreated routine fails planning (5.8.3)")
     void externalCheckOnRecreatedRoutine() throws Exception {
         final var ns = namespace();
-        final var table = "ext_t_" + Long.toHexString(SEQUENCE.incrementAndGet());
+        final var table = "ext_t_" + Long.toHexString(RUN_ID) + "_" + SEQUENCE.incrementAndGet();
         try {
             PgTestDatabase.execute(ds, "CREATE FUNCTION " + dialect.quoteIdentifier(ns)
                     + ".ok(int) RETURNS boolean LANGUAGE sql IMMUTABLE AS $$SELECT $1 > 0$$");
@@ -213,8 +213,8 @@ class PostgreSqlDependenciesTest {
     @DisplayName("an external trigger dependent on a recreated routine fails planning (5.8.3)")
     void externalTriggerOnRecreatedRoutine() throws Exception {
         final var ns = namespace();
-        final var table = "ext_t_" + Long.toHexString(SEQUENCE.incrementAndGet());
-        final var trigger = "trg_" + Long.toHexString(SEQUENCE.incrementAndGet());
+        final var table = "ext_t_" + Long.toHexString(RUN_ID) + "_" + SEQUENCE.incrementAndGet();
+        final var trigger = "trg_" + Long.toHexString(RUN_ID) + "_" + SEQUENCE.incrementAndGet();
         try {
             PgTestDatabase.execute(ds, "CREATE TABLE public." + table + " (x int)");
             PgTestDatabase.execute(ds, "CREATE FUNCTION " + dialect.quoteIdentifier(ns)
@@ -239,7 +239,7 @@ class PostgreSqlDependenciesTest {
     @DisplayName("an external dictionary dependent on our template blocks its drop (5.8.3)")
     void externalDictOnDroppedTemplate() throws Exception {
         final var ns = namespace();
-        final var dict = "ext_d_" + Long.toHexString(SEQUENCE.incrementAndGet());
+        final var dict = "ext_d_" + Long.toHexString(RUN_ID) + "_" + SEQUENCE.incrementAndGet();
         try {
             PgTestDatabase.execute(ds, "CREATE TEXT SEARCH TEMPLATE "
                     + dialect.quoteIdentifier(ns) + ".tmpl (LEXIZE = dsimple_lexize)");

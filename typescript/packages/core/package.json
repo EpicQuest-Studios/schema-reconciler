@@ -5,14 +5,14 @@
     "license": "Apache-2.0",
     "type": "module",
     "exports": {
-        ".": "./src/index.ts",
-        "./model/*.ts": "./src/model/*.ts",
-        "./spi/*.ts": "./src/spi/*.ts",
-        "./*.ts": "./src/*.ts"
+        ".": "./src/index.ts"
     },
     "files": [
         "src"
     ],
+    "publishConfig": {
+        "access": "public"
+    },
     "engines": {
         "node": ">=22.18"
     },

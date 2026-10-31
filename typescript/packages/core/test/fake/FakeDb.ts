@@ -107,7 +107,7 @@ export class FakeDb {
         return "rcl_scratch_" + ++this.scratchSequence;
     }
 
-    tryLock(handle: FakeConnection, namespace: string, timeout: Duration): boolean {
+    tryLock(handle: FakeConnection, namespace: string, _timeout: Duration): boolean {
         // single-threaded: a held lock is either ours or held until released
         const holder = this.locks.get(namespace);
         if (holder !== undefined && holder !== handle) {
