@@ -94,7 +94,7 @@ class ProfileRulesTest {
                 }
             }
         }
-        assertEquals(48, spec.size());
+        assertEquals(67, spec.size());
         assertEquals(spec, tck, "TCK scenarios and SPEC.md rows must match 1:1");
     }
 

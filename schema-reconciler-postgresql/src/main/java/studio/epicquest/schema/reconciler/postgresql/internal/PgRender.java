@@ -41,7 +41,7 @@ public final class PgRender {
         final var want = desired.objects().get(id);
         return switch (difference.type()) {
             case MISSING -> missing(id, want, desired, targetNamespace);
-            case DRIFTED -> drifted(id, want, difference, targetNamespace);
+            case DRIFTED -> drifted(id, want, difference, desired, targetNamespace);
             default -> throw new PlanningException("difference " + difference.id()
                     + " of type " + difference.type() + " is not renderable");
         };
@@ -55,9 +55,14 @@ public final class PgRender {
             case TABLE -> List.of(new PlannedChange(0, id, ChangeAction.CREATE,
                     ChangeSafety.ADDITIVE, createTableStatements(id, desired, ns),
                     Optional.of(want.definition()), "missing " + id));
+            case FOREIGN_TABLE -> List.of(new PlannedChange(0, id, ChangeAction.CREATE,
+                    ChangeSafety.ADDITIVE, createForeignTableStatements(id, desired, ns),
+                    Optional.of(want.definition()), "missing " + id));
             case COLUMN -> missingColumn(id, want, desired, ns);
-            case PRIMARY_KEY, UNIQUE, FOREIGN_KEY, CHECK, INDEX, VIEW, TRIGGER,
-                    TYPE, DOMAIN, POLICY, EXTENSION ->
+            case PRIMARY_KEY, UNIQUE, FOREIGN_KEY, CHECK, EXCLUSION, INDEX, VIEW,
+                    TRIGGER, TYPE, DOMAIN, POLICY, EXTENSION, STATISTICS, RULE,
+                    COLLATION, CONVERSION, PARTITION, PUBLICATION, CAST,
+                    TRANSFORM ->
                     List.of(additive(id, want, ns, "missing " + id));
             case MATERIALIZED_VIEW -> List.of(new PlannedChange(0, id, ChangeAction.CREATE,
                     ChangeSafety.ADDITIVE, matviewCreateStatements(want, ns),
@@ -65,6 +70,14 @@ public final class PgRender {
             case COMMENT -> List.of(new PlannedChange(0, id, ChangeAction.ALTER,
                     ChangeSafety.REBUILD, List.of(bind(want, PgCatalog.CREATE_SQL, ns)),
                     Optional.of(want.definition()), "missing comment on " + id));
+            case SECURITY_LABEL -> List.of(new PlannedChange(0, id, ChangeAction.ALTER,
+                    ChangeSafety.REBUILD, List.of(bind(want, PgCatalog.CREATE_SQL, ns)),
+                    Optional.of(want.definition()), "missing label on " + id));
+            case OWNERSHIP -> List.of(new PlannedChange(0, id, ChangeAction.ALTER,
+                    ChangeSafety.REBUILD, List.of(bind(want, PgCatalog.CREATE_SQL, ns)),
+                    Optional.of(want.definition()), "missing ownership on " + id));
+            case PRIVILEGES, DEFAULT_PRIVILEGES -> privilegesChanges(id, want,
+                    List.of(), ns, "missing privileges on " + id);
             case SEQUENCE -> {
                 final var statements = new ArrayList<String>();
                 statements.add(bind(want, PgCatalog.CREATE_SQL, ns));
@@ -76,7 +89,12 @@ public final class PgRender {
                         ChangeSafety.ADDITIVE, statements, Optional.of(want.definition()),
                         "missing " + id));
             }
-            case ROUTINE -> List.of(additive(id, want, ns, "missing " + id));
+            case ROUTINE, AGGREGATE -> List.of(additive(id, want, ns, "missing " + id));
+            case TEXT_SEARCH_TEMPLATE, TEXT_SEARCH_PARSER,
+                    TEXT_SEARCH_DICTIONARY, TEXT_SEARCH_CONFIGURATION ->
+                    List.of(additive(id, want, ns, "missing " + id));
+            case OPERATOR, OPERATOR_CLASS, OPERATOR_FAMILY ->
+                    List.of(additive(id, want, ns, "missing " + id));
             default -> List.of();
         };
     }
@@ -109,6 +127,10 @@ public final class PgRender {
                         .collect(Collectors.joining(",\n")))
                 .append("\n)");
         final var tableAttrs = desired.objects().get(table).attributes();
+        final var partkey = tableAttrs.get(PgCatalog.PARTKEY);
+        if (partkey != null) {
+            create.append(" PARTITION BY ").append(partkey);
+        }
         final var options = tableAttrs.getOrDefault(PgCatalog.TABLE_OPTIONS, "");
         if (!options.isEmpty()) {
             create.append(" WITH (").append(options).append(')');
@@ -141,6 +163,31 @@ public final class PgRender {
                 .map(sql -> bind(sql, ns))
                 .forEach(statements::add);
         return statements;
+    }
+
+    /** CREATE FOREIGN TABLE folding in every desired column, then SERVER/OPTIONS (A.6, 5.8.4). */
+    private static List<String> createForeignTableStatements(ObjectId table,
+                                                           SchemaSnapshot desired, String ns) {
+        final var columns = desired.objects().values().stream()
+                .filter(o -> o.id().kind() == ObjectKind.COLUMN
+                        && o.id().parent().orElse("").equals(table.name()))
+                .sorted(Comparator.comparingInt(c -> Integer.parseInt(
+                        c.attributes().getOrDefault(PgCatalog.ATTNUM, "0"))))
+                .toList();
+        final var attrs = desired.objects().get(table).attributes();
+        final var create = new StringBuilder("CREATE FOREIGN TABLE ")
+                .append(PgIdentifiers.quote(ns)).append('.')
+                .append(PgIdentifiers.quote(table.name())).append(" (\n")
+                .append(columns.stream()
+                        .map(c -> "    " + c.attributes().get(PgCatalog.COLUMN_SQL))
+                        .collect(Collectors.joining(",\n")))
+                .append("\n) SERVER ")
+                .append(PgIdentifiers.quote(attrs.get(PgCatalog.FT_SERVER)));
+        final var options = attrs.getOrDefault(PgCatalog.FT_OPTIONS, "");
+        if (!options.isEmpty()) {
+            create.append(" OPTIONS (").append(options).append(')');
+        }
+        return List.of(bind(create.toString(), ns));
     }
 
     /**
@@ -382,19 +429,52 @@ public final class PgRender {
     }
 
     private static List<PlannedChange> drifted(ObjectId id, SchemaObject want,
-                                               Difference difference, String ns) {
+                                               Difference difference, SchemaSnapshot desired,
+                                               String ns) {
         return switch (id.kind()) {
             case COLUMN -> driftedColumn(id, want, difference, ns);
             case TABLE -> driftedTable(id, want, difference, ns);
-            case PRIMARY_KEY, UNIQUE, FOREIGN_KEY, CHECK, INDEX, VIEW, TRIGGER,
-                    POLICY ->
+            case PRIMARY_KEY, UNIQUE, FOREIGN_KEY, CHECK, EXCLUSION, INDEX, VIEW,
+                    TRIGGER, POLICY, STATISTICS, RULE, COLLATION, CONVERSION,
+                    PUBLICATION, CAST, TRANSFORM ->
                     recreate(id, want, ns, "drifted " + id);
+            // a bound change re-homes rows — DESTRUCTIVE, not REBUILD
+            case PARTITION -> List.of(
+                    new PlannedChange(0, id, ChangeAction.DROP, ChangeSafety.DESTRUCTIVE,
+                            List.of(bind(want, PgCatalog.DROP_SQL, ns)),
+                            Optional.empty(), "drifted " + id),
+                    new PlannedChange(0, id, ChangeAction.CREATE, ChangeSafety.DESTRUCTIVE,
+                            List.of(bind(want, PgCatalog.CREATE_SQL, ns)),
+                            Optional.of(want.definition()), "drifted " + id));
+            // no local data — a server/options change is a plain drop+create
+            case FOREIGN_TABLE -> List.of(
+                    new PlannedChange(0, id, ChangeAction.DROP, ChangeSafety.REBUILD,
+                            List.of(bind(want, PgCatalog.DROP_SQL, ns)),
+                            Optional.empty(), "drifted " + id),
+                    new PlannedChange(0, id, ChangeAction.CREATE, ChangeSafety.REBUILD,
+                            createForeignTableStatements(id, desired, ns),
+                            Optional.of(want.definition()), "drifted " + id));
             case MATERIALIZED_VIEW -> driftedMatview(id, want, ns);
-            case TYPE -> driftedEnum(id, want, difference, ns);
+            // a composite's attribute drift and a range's pg_range drift
+            // drop and recreate the type — no in-place recipe exists;
+            // enums keep the label-aware path
+            case TYPE -> want.definition().canonical().startsWith("typtype=e")
+                    ? driftedEnum(id, want, difference, ns)
+                    : recreate(id, want, ns, "drifted " + id);
             case DOMAIN -> driftedDomain(id, want, difference, ns);
             case COMMENT -> List.of(new PlannedChange(0, id, ChangeAction.ALTER,
                     ChangeSafety.REBUILD, List.of(bind(want, PgCatalog.CREATE_SQL, ns)),
                     Optional.of(want.definition()), "drifted comment on " + id));
+            case SECURITY_LABEL -> List.of(new PlannedChange(0, id, ChangeAction.ALTER,
+                    ChangeSafety.REBUILD, List.of(bind(want, PgCatalog.CREATE_SQL, ns)),
+                    Optional.of(want.definition()), "drifted label on " + id));
+            case OWNERSHIP -> List.of(new PlannedChange(0, id, ChangeAction.ALTER,
+                    ChangeSafety.REBUILD, List.of(bind(want, PgCatalog.CREATE_SQL, ns)),
+                    Optional.of(want.definition()), "drifted ownership on " + id));
+            case PRIVILEGES, DEFAULT_PRIVILEGES -> privilegesChanges(id, want,
+                    difference.actual().map(d -> aclTokens(d.canonical()))
+                            .orElse(List.of()),
+                    ns, "drifted privileges on " + id);
             case SEQUENCE -> {
                 final var statements = new ArrayList<String>();
                 final var options = want.attributes().get(PgCatalog.OPTIONS_SQL);
@@ -439,10 +519,117 @@ public final class PgRender {
                 }
                 yield recreate(id, want, ns, "drifted " + id + " (return type changed)");
             }
+            // aggregates have no CREATE OR REPLACE form — every option
+            // change recreates
+            case AGGREGATE -> recreate(id, want, ns, "drifted " + id);
+            // text-search objects compose their canonical from the catalog
+            // row — any field drift recreates (no OR REPLACE form exists)
+            case TEXT_SEARCH_TEMPLATE, TEXT_SEARCH_PARSER,
+                    TEXT_SEARCH_DICTIONARY, TEXT_SEARCH_CONFIGURATION ->
+                    recreate(id, want, ns, "drifted " + id);
+            case OPERATOR, OPERATOR_CLASS, OPERATOR_FAMILY ->
+                    recreate(id, want, ns, "drifted " + id);
             default -> List.of(new PlannedChange(0, id, ChangeAction.ALTER,
                     ChangeSafety.DESTRUCTIVE, List.of(), Optional.empty(),
                     "drifted " + id + " requires a manual change"));
         };
+    }
+
+    /**
+     * The GRANT/REVOKE statement list converging a PRIVILEGES object's acl
+     * token set onto the desired one ({@code grantee:PRIVILEGE[*]}, A.5).
+     * Implicit owner rights ({@code <owner>} grantees) are skipped — they
+     * are not grants and cannot be revoked. A grant-option-only difference
+     * renders {@code REVOKE GRANT OPTION FOR} so the base privilege stays.
+     */
+    private static List<PlannedChange> privilegesChanges(ObjectId id, SchemaObject want,
+            List<String> actual, String ns, String reason) {
+        final var target = bind(want, PgCatalog.GRANT_TARGET, ns);
+        // a column-level grant parenthesizes its column after the privilege
+        // word: GRANT SELECT ("c") ON TABLE t — absent on object-level grants
+        final var column = want.attributes().get(PgCatalog.GRANT_COLUMN);
+        final var colClause = column == null ? "" : " (" + bind(column, ns) + ")";
+        // a scoped default-privileges object prefixes every statement with
+        // ALTER DEFAULT PRIVILEGES FOR ROLE "r" IN SCHEMA "ns"
+        final var prefix = want.attributes().get(PgCatalog.GRANT_PREFIX);
+        final var pfx = prefix == null ? "" : bind(prefix, ns) + " ";
+        final var desired = aclTokens(want.definition().canonical());
+        final var stmts = new ArrayList<String>();
+        for (final var tok : desired) {
+            final var g = grantee(tok);
+            if (g.equals("<owner>") || actual.contains(tok)) {
+                continue;
+            }
+            // the base privilege is held if the actual side has it with or
+            // without the grant option
+            final var bare = tokenSansOption(tok);
+            final var held = actual.contains(bare) || actual.contains(bare + "*");
+            // missing entirely, or held without the grant option — a GRANT
+            // upgrades a bare grant to grantable either way
+            if (!held || grantable(tok)) {
+                stmts.add(pfx + "GRANT " + privilege(tok) + colClause + " ON " + target
+                        + " TO " + granteeSql(g)
+                        + (grantable(tok) ? " WITH GRANT OPTION" : ""));
+            }
+        }
+        for (final var tok : actual) {
+            final var g = grantee(tok);
+            if (g.equals("<owner>") || desired.contains(tok)) {
+                continue;
+            }
+            // the privilege is wanted when the desired side holds it in
+            // either form — bare or grantable
+            final var bare = tokenSansOption(tok);
+            final var wanted = desired.contains(bare) || desired.contains(bare + "*");
+            if (grantable(tok) && desired.contains(bare)) {
+                // same grant, keep the base privilege — drop only the option
+                stmts.add(pfx + "REVOKE GRANT OPTION FOR " + privilege(tok) + colClause
+                        + " ON " + target + " FROM " + granteeSql(g));
+            } else if (!wanted) {
+                stmts.add(pfx + "REVOKE " + privilege(tok) + colClause + " ON " + target
+                        + " FROM " + granteeSql(g));
+            }
+            // else: held bare, wanted grantable — the GRANT above upgrades it
+        }
+        if (stmts.isEmpty()) {
+            return List.of();
+        }
+        return List.of(new PlannedChange(0, id, ChangeAction.ALTER, ChangeSafety.REBUILD,
+                List.copyOf(stmts), Optional.of(want.definition()), reason));
+    }
+
+    /** The {@code grantee:PRIVILEGE[*]} token list of a {@code privileges=} canonical. */
+    private static List<String> aclTokens(String canonical) {
+        var s = canonical;
+        if (s.startsWith("privileges=")) {
+            s = s.substring("privileges=".length());
+        }
+        return s.isEmpty() ? List.of() : List.of(s.split(","));
+    }
+
+    /** The grantee of a {@code grantee:PRIVILEGE[*]} token — the last colon splits it. */
+    private static String grantee(String token) {
+        return token.substring(0, token.lastIndexOf(':'));
+    }
+
+    /** The privilege word of a {@code grantee:PRIVILEGE[*]} token. */
+    private static String privilege(String token) {
+        final var p = token.substring(token.lastIndexOf(':') + 1);
+        return p.endsWith("*") ? p.substring(0, p.length() - 1) : p;
+    }
+
+    private static boolean grantable(String token) {
+        return token.endsWith("*");
+    }
+
+    /** The same token without a grant-option marker. */
+    private static String tokenSansOption(String token) {
+        return token.endsWith("*") ? token.substring(0, token.length() - 1) : token;
+    }
+
+    /** {@code PUBLIC} stays a keyword; a role name is quoted. */
+    private static String granteeSql(String grantee) {
+        return grantee.equals("PUBLIC") ? grantee : PgIdentifiers.quote(grantee);
     }
 
     /**
@@ -709,7 +896,9 @@ public final class PgRender {
     // ---- SPI helpers -------------------------------------------------------
 
     public static Set<ObjectId> coveredChildren(Difference created, SchemaSnapshot desired) {
-        if (created.id().kind() != ObjectKind.TABLE) {
+        if (created.id().kind() != ObjectKind.TABLE
+                && created.id().kind() != ObjectKind.PARTITION
+                && created.id().kind() != ObjectKind.FOREIGN_TABLE) {
             return Set.of();
         }
         final var table = created.id();
@@ -729,8 +918,8 @@ public final class PgRender {
      * prefixes {@code PgCatalog} assigns to those objects.
      */
     private static final Set<String> RELATION_NAMESPACE_OTHERS = Set.of(
-            "inherited", "foreign", "partition", "partindex",
-            "composite", "toast", "relation", "type");
+            "inherited", "partindex",
+            "toast", "relation", "type");
 
     public static Set<String> nameScopes(ObjectId id) {
         return switch (id.kind()) {
@@ -743,12 +932,6 @@ public final class PgRender {
                     if (RELATION_NAMESPACE_OTHERS.contains(category)) {
                         yield Set.of("relation:" + stripped);
                     }
-                    // an exclusion constraint names a backing index in
-                    // pg_class too — it occupies both namespaces
-                    if (category.equals("constraint")) {
-                        final var bare = stripped.substring(stripped.lastIndexOf('.') + 1);
-                        yield Set.of("constraint:" + stripped, "relation:" + bare);
-                    }
                     // aggregates and window functions share pg_proc with
                     // managed routines, keyed by name plus signature
                     if (category.equals("routine")) {
@@ -759,15 +942,21 @@ public final class PgRender {
             }
             // types and domains share the type namespace, which collides
             // with the relation namespace through composite-type rowtypes
-            case TABLE, VIEW, MATERIALIZED_VIEW, SEQUENCE, INDEX, TYPE, DOMAIN ->
+            case TABLE, VIEW, MATERIALIZED_VIEW, SEQUENCE, INDEX, TYPE, DOMAIN,
+                    PARTITION, FOREIGN_TABLE ->
                     Set.of("relation:" + id.name());
-            case ROUTINE -> Set.of("routine:" + id.name());
-            case PRIMARY_KEY, UNIQUE -> Set.of(
+            case ROUTINE, AGGREGATE -> Set.of("routine:" + id.name());
+            case PRIMARY_KEY, UNIQUE, EXCLUSION -> Set.of(
                     "relation:" + id.name(),
                     "constraint:" + id.parent().orElse("") + "." + id.name());
             case FOREIGN_KEY, CHECK ->
                     Set.of("constraint:" + id.parent().orElse("") + "." + id.name());
-            case COLUMN, TRIGGER, POLICY, EXTENSION, COMMENT -> Set.of();
+            case COLUMN, TRIGGER, POLICY, EXTENSION, COMMENT, STATISTICS, RULE,
+                    COLLATION, CONVERSION, SECURITY_LABEL, PUBLICATION,
+                    OWNERSHIP, PRIVILEGES, DEFAULT_PRIVILEGES, CAST,
+                    TRANSFORM, TEXT_SEARCH_TEMPLATE, TEXT_SEARCH_PARSER,
+                    TEXT_SEARCH_DICTIONARY, TEXT_SEARCH_CONFIGURATION,
+                    OPERATOR, OPERATOR_CLASS, OPERATOR_FAMILY -> Set.of();
         };
     }
 }

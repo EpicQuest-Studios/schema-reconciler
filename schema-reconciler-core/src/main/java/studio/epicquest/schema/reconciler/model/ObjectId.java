@@ -17,10 +17,13 @@ public record ObjectId(ObjectKind kind, String name, Optional<String> parent) {
     private static final Set<ObjectKind> PARENTED = Set.of(
             ObjectKind.COLUMN, ObjectKind.PRIMARY_KEY, ObjectKind.UNIQUE,
             ObjectKind.FOREIGN_KEY, ObjectKind.CHECK, ObjectKind.INDEX,
-            ObjectKind.TRIGGER, ObjectKind.POLICY);
+            ObjectKind.TRIGGER, ObjectKind.POLICY, ObjectKind.EXCLUSION,
+            ObjectKind.RULE, ObjectKind.PARTITION);
 
     /** Kinds whose parent mirrors their target's parent: optional, never a bare parent of its own. */
-    private static final Set<ObjectKind> PARENT_MIRRORED = Set.of(ObjectKind.COMMENT);
+    private static final Set<ObjectKind> PARENT_MIRRORED = Set.of(
+            ObjectKind.COMMENT, ObjectKind.PUBLICATION, ObjectKind.OWNERSHIP,
+            ObjectKind.PRIVILEGES);
 
     public ObjectId {
         Objects.requireNonNull(kind, "kind");

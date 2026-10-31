@@ -191,14 +191,15 @@ class PostgreSqlConformanceTest extends DialectConformanceTest {
     @Override
     protected UnsupportedScript unsupportedScript() {
         return new UnsupportedScript(
-                "CREATE TABLE part_parent (id bigint) PARTITION BY RANGE (id);"
-                        + " CREATE VIEW dep_v AS SELECT id FROM part_parent",
+                "CREATE TABLE unsupported_base (a int);"
+                        + " CREATE TABLE unsupported_i (b int) INHERITS (unsupported_base);"
+                        + " CREATE VIEW dep_v AS SELECT * FROM unsupported_i",
                 "dep_v");
     }
 
     @Override
     protected String unsupportedCategory() {
-        return "partition"; // partitioned parents → OTHER id "partition:<name>" (A.5)
+        return "inherited"; // classic-inheritance children → OTHER id "inherited:<name>" (A.5)
     }
 
     @Override
@@ -232,6 +233,78 @@ class PostgreSqlConformanceTest extends DialectConformanceTest {
     @Override
     protected String serialColumnDdl() {
         return "bigserial";
+    }
+
+    @Override
+    protected String foreignServerDdl() throws Exception {
+        // there is no built-in FDW: postgres_fdw must be installable, which
+        // takes a superuser
+        try (Connection c = scratch.getConnection(); final var s = c.createStatement()) {
+            final var rs = s.executeQuery(
+                    "SELECT rolsuper FROM pg_roles WHERE rolname = current_user");
+            if (!rs.next() || !rs.getBoolean(1)) {
+                return null;
+            }
+            s.execute("CREATE EXTENSION IF NOT EXISTS postgres_fdw");
+            s.execute("DROP SERVER IF EXISTS tck_srv CASCADE");
+        }
+        return "CREATE SERVER tck_srv FOREIGN DATA WRAPPER postgres_fdw";
+    }
+
+    @Override
+    protected String foreignServerTeardownDdl() {
+        return "DROP SERVER IF EXISTS tck_srv CASCADE";
+    }
+
+    @Override
+    protected String publicationDdl() throws Exception {
+        try (Connection c = scratch.getConnection(); final var s = c.createStatement()) {
+            final var rs = s.executeQuery(
+                    "SELECT has_database_privilege(current_user, current_database(), 'CREATE')");
+            if (!rs.next() || !rs.getBoolean(1)) {
+                return null;
+            }
+            s.execute("DROP PUBLICATION IF EXISTS tck_pub");
+        }
+        return "CREATE PUBLICATION tck_pub";
+    }
+
+    @Override
+    protected String publicationTeardownDdl() {
+        return "DROP PUBLICATION IF EXISTS tck_pub";
+    }
+
+    @Override
+    protected String ownershipRoleDdl() throws Exception {
+        try (Connection c = scratch.getConnection(); final var s = c.createStatement()) {
+            final var rs = s.executeQuery(
+                    "SELECT rolsuper OR rolcreaterole FROM pg_roles"
+                            + " WHERE rolname = current_user");
+            if (!rs.next() || !rs.getBoolean(1)) {
+                return null;
+            }
+            String user;
+            try (var r = s.executeQuery("SELECT current_user")) {
+                r.next();
+                user = r.getString(1);
+            }
+            s.execute("DROP ROLE IF EXISTS tck_owner");
+            s.execute("DROP ROLE IF EXISTS tck_owner2");
+            s.execute("CREATE ROLE tck_owner");
+            s.execute("CREATE ROLE tck_owner2");
+            s.execute("GRANT tck_owner, tck_owner2 TO "
+                    + dialect.quoteIdentifier(user));
+        }
+        return "SELECT 1";
+    }
+
+    @Override
+    protected String ownershipRoleTeardownDdl() {
+        // per role — a multi-role DROP OWNED BY trips on a default ACL of
+        // one listed role granting to another (the first pass deletes the
+        // row the second pass still lists)
+        return "DROP OWNED BY tck_owner; DROP OWNED BY tck_owner2;"
+                + " DROP ROLE tck_owner; DROP ROLE tck_owner2";
     }
 
     @Override
@@ -399,24 +472,24 @@ class PostgreSqlConformanceTest extends DialectConformanceTest {
     }
 
     @Test
-    @DisplayName("category override tolerates rule/privileges but not statistics")
+    @DisplayName("category override tolerates partindex but not a comment")
     void categoryOverrideSplitsUnsupportedKinds() throws Exception {
         final var script = """
                 CREATE TABLE t (id bigint, n int);
-                GRANT SELECT ON t TO PUBLIC;
-                CREATE RULE rl AS ON INSERT TO t DO ALSO NOTHING;
-                CREATE STATISTICS st ON id, n FROM t
+                CREATE TABLE pp (k int) PARTITION BY RANGE (k);
+                CREATE TABLE pt PARTITION OF pp FOR VALUES FROM (1) TO (10);
+                CREATE INDEX pi ON pp (k);
+                COMMENT ON INDEX pi IS 'x'
                 """;
         final var tolerant = ReconcilePolicy.defaults()
-                .withUnsupportedCategory("rule", Decision.REPORT)
-                .withUnsupportedCategory("privileges", Decision.REPORT);
-        // the statistics category is not tolerated → still fails closed
+                .withUnsupportedCategory("partindex", Decision.REPORT);
+        // the comment category is not tolerated → still fails closed
         assertThrows(PolicyViolationException.class,
                 () -> reconciler(script, tolerant).reconcile());
         final var report = reconciler(script, tolerant
-                .withUnsupportedCategory("statistics", Decision.REPORT)).reconcile();
+                .withUnsupportedCategory("comment", Decision.REPORT)).reconcile();
         // tolerated objects are reported as intentionally ignored, not reconciled
-        assertEquals(3, report.unsupported().size(), report.unsupported().toString());
+        assertEquals(2, report.unsupported().size(), report.unsupported().toString());
         assertTrue(report.unsupported().stream().allMatch(
                 d -> d.type() == DifferenceType.UNSUPPORTED));
         assertTrue(report.applied().stream()
@@ -424,7 +497,7 @@ class PostgreSqlConformanceTest extends DialectConformanceTest {
                 "the managed change still applies: " + report.applied());
         assertEquals(ReconcileOutcome.UP_TO_DATE,
                 reconciler(script, tolerant
-                        .withUnsupportedCategory("statistics", Decision.REPORT))
+                        .withUnsupportedCategory("comment", Decision.REPORT))
                         .reconcile().outcome());
     }
 
@@ -573,29 +646,28 @@ class PostgreSqlConformanceTest extends DialectConformanceTest {
     }
 
     @Test
-    @DisplayName("tolerated rule and grant report; the statistics still fails")
-    void toleratedRuleAndGrantVsStatistics() throws Exception {
-        // rules and privileges may be tolerated per category — an unsupported
+    @DisplayName("tolerated partindex reports; the comment still fails")
+    void toleratedDictionaryAndGrantVsOperator() throws Exception {
+        // some unsupported categories may be tolerated — an unsupported
         // construct must still fail closed under the same policy
         final var script = """
                 CREATE TABLE t (id bigint, n int);
-                CREATE RULE rl AS ON INSERT TO t DO ALSO NOTHING;
-                GRANT SELECT ON t TO PUBLIC;
-                CREATE STATISTICS st ON id, n FROM t
+                CREATE TABLE pp (k int) PARTITION BY RANGE (k);
+                CREATE TABLE pt PARTITION OF pp FOR VALUES FROM (1) TO (10);
+                CREATE INDEX pi ON pp (k);
+                COMMENT ON INDEX pi IS 'x'
                 """;
         final var tolerant = ReconcilePolicy.defaults()
-                .withUnsupportedCategory("rule", Decision.REPORT)
-                .withUnsupportedCategory("privileges", Decision.REPORT);
+                .withUnsupportedCategory("partindex", Decision.REPORT);
         assertThrows(PolicyViolationException.class,
                 () -> reconciler(script, tolerant).reconcile());
         final var report = reconciler(script, tolerant
-                .withUnsupportedCategory("statistics", Decision.REPORT)).reconcile();
+                .withUnsupportedCategory("comment", Decision.REPORT)).reconcile();
         final var names = report.unsupported().stream()
                 .map(d -> d.id().name()).sorted().toList();
-        assertTrue(names.contains("rule:t.rl"), names.toString());
-        assertTrue(names.contains("statistics:t.st"), names.toString());
-        assertTrue(names.stream().anyMatch(n -> n.startsWith("privileges:")),
-                "expected a privileges entry: " + names);
+        assertTrue(names.stream().anyMatch(n -> n.startsWith("comment:")), names.toString());
+        assertTrue(names.stream().anyMatch(n -> n.startsWith("partindex:")),
+                "expected a partindex entry: " + names);
         // tolerated objects are intentionally ignored, never applied
         assertTrue(report.unsupported().stream().allMatch(
                 d -> d.type() == DifferenceType.UNSUPPORTED));
@@ -603,7 +675,7 @@ class PostgreSqlConformanceTest extends DialectConformanceTest {
                 .anyMatch(c -> c.target().equals(table("t"))),
                 "the managed change still applies: " + report.applied());
         assertEquals(ReconcileOutcome.UP_TO_DATE, reconciler(script, tolerant
-                .withUnsupportedCategory("statistics", Decision.REPORT))
+                .withUnsupportedCategory("comment", Decision.REPORT))
                 .reconcile().outcome());
     }
 
@@ -677,6 +749,10 @@ class PostgreSqlConformanceTest extends DialectConformanceTest {
             final var snapshot = dialect.readSnapshot(c, namespace());
             assertTrue(snapshot.objects().keySet().stream()
                     .noneMatch(id -> id.kind() == ObjectKind.INDEX), snapshot.toString());
+            assertTrue(snapshot.objects().keySet().stream()
+                    .anyMatch(id -> id.kind() == ObjectKind.EXCLUSION
+                            && id.name().equals("t_ex")),
+                    "the exclusion constraint must be a managed object: " + snapshot);
         }
     }
 

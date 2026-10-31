@@ -77,11 +77,11 @@ class DependencyEdgesTest {
         new Edge("column -> collation", TYPES
                 + "CREATE COLLATION cl (provider = libc, locale = 'C'); "
                 + "CREATE TABLE t3 (s text COLLATE cl)",
-                id(ObjectKind.COLUMN, "s", "t3"), id(ObjectKind.OTHER, "collation:cl")),
+                id(ObjectKind.COLUMN, "s", "t3"), id(ObjectKind.COLLATION, "cl")),
         new Edge("partition child -> parent", TYPES
                 + "CREATE TABLE pt (k int) PARTITION BY RANGE (k); "
                 + "CREATE TABLE pc PARTITION OF pt FOR VALUES FROM (0) TO (10)",
-                id(ObjectKind.OTHER, "partition:pc"), id(ObjectKind.OTHER, "partition:pt")),
+                id(ObjectKind.PARTITION, "pc", "pt"), id(ObjectKind.TABLE, "pt")),
         new Edge("comment -> table", TYPES + "COMMENT ON TABLE t IS 'x'",
                 id(ObjectKind.COMMENT, "t"), id(ObjectKind.TABLE, "t")),
         new Edge("comment -> column", TYPES + "COMMENT ON COLUMN t.note IS 'x'",
@@ -92,29 +92,53 @@ class DependencyEdgesTest {
                 id(ObjectKind.POLICY, "p_sel", "t"), id(ObjectKind.TABLE, "t")),
         new Edge("domain -> base type", TYPES + "CREATE DOMAIN dm AS mood",
                 id(ObjectKind.DOMAIN, "dm"), id(ObjectKind.TYPE, "mood")),
-        // unsupported (OTHER) objects record the same edges so an
-        // unrecreatable dependent blocks a drop or recreate (5.8.3)
-        new Edge("rule -> table", TYPES
-                + "CREATE RULE rl AS ON INSERT TO t DO NOTHING",
-                id(ObjectKind.OTHER, "rule:t.rl"), id(ObjectKind.TABLE, "t")),
         new Edge("statistics -> table", TYPES
                 + "CREATE STATISTICS st ON id, note FROM t",
-                id(ObjectKind.OTHER, "statistics:t.st"), id(ObjectKind.TABLE, "t")),
+                id(ObjectKind.STATISTICS, "st"), id(ObjectKind.TABLE, "t")),
+        new Edge("rule -> table", TYPES
+                + "CREATE RULE rl AS ON INSERT TO t DO NOTHING",
+                id(ObjectKind.RULE, "rl", "t"), id(ObjectKind.TABLE, "t")),
+        // a range is a managed TYPE whose generated family folds into it:
+        // the multirange, its constructors and the range→multirange cast
+        // are never objects — a routine calling the folded constructor
+        // resolves to the range instead (5.8.3 ordering still holds)
         new Edge("range type -> subtype", TYPES
                 + "CREATE TYPE r AS RANGE (subtype = mood)",
-                id(ObjectKind.OTHER, "type:r"), id(ObjectKind.TYPE, "mood")),
-        new Edge("range cast -> constructor routine", TYPES
-                + "CREATE TYPE r AS RANGE (subtype = mood)",
-                id(ObjectKind.OTHER, "cast:r->r_multirange"),
-                id(ObjectKind.ROUTINE, "r_multirange(r)")),
-        new Edge("range cast -> source type", TYPES
-                + "CREATE TYPE r AS RANGE (subtype = mood)",
-                id(ObjectKind.OTHER, "cast:r->r_multirange"),
-                id(ObjectKind.OTHER, "type:r")),
-        new Edge("multirange -> range type", TYPES
-                + "CREATE TYPE r AS RANGE (subtype = mood)",
-                id(ObjectKind.OTHER, "type:r_multirange"),
-                id(ObjectKind.OTHER, "type:r")),
+                id(ObjectKind.TYPE, "r"), id(ObjectKind.TYPE, "mood")),
+        new Edge("routine -> folded range constructor", TYPES
+                + "CREATE TYPE r AS RANGE (subtype = mood);"
+                + "CREATE FUNCTION mk(x r) RETURNS r_multirange"
+                + " LANGUAGE sql IMMUTABLE AS 'SELECT r_multirange(x)'",
+                id(ObjectKind.ROUTINE, "mk(r)"), id(ObjectKind.TYPE, "r")),
+        // text-search and operator objects are managed, so dependents must
+        // order after them — the legs' refclassid filters cover pg_ts_* and
+        // pg_op* alongside rel/proc/type
+        new Edge("view -> text search configuration", TYPES
+                + "CREATE TEXT SEARCH CONFIGURATION c1 (parser = pg_catalog.default); "
+                + "CREATE VIEW v AS SELECT to_tsvector('c1', note) AS s FROM t",
+                id(ObjectKind.VIEW, "v"),
+                id(ObjectKind.TEXT_SEARCH_CONFIGURATION, "c1")),
+        new Edge("routine -> text search configuration", TYPES
+                + "CREATE TEXT SEARCH CONFIGURATION c1 (parser = pg_catalog.default); "
+                + "CREATE FUNCTION f() RETURNS tsvector LANGUAGE sql"
+                + " BEGIN ATOMIC SELECT to_tsvector('c1','x'); END",
+                id(ObjectKind.ROUTINE, "f()"),
+                id(ObjectKind.TEXT_SEARCH_CONFIGURATION, "c1")),
+        new Edge("column default -> text search configuration", TYPES
+                + "CREATE TEXT SEARCH CONFIGURATION c1 (parser = pg_catalog.default); "
+                + "CREATE TABLE t3 (v tsvector DEFAULT to_tsvector('c1','x'))",
+                id(ObjectKind.COLUMN, "v", "t3"),
+                id(ObjectKind.TEXT_SEARCH_CONFIGURATION, "c1")),
+        new Edge("view -> operator", TYPES
+                + "CREATE OPERATOR === (LEFTARG = int, RIGHTARG = int, PROCEDURE = int4eq); "
+                + "CREATE VIEW v AS SELECT id === id AS x FROM t",
+                id(ObjectKind.VIEW, "v"),
+                id(ObjectKind.OPERATOR, "===(integer,integer)")),
+        new Edge("check constraint -> operator", TYPES
+                + "CREATE OPERATOR === (LEFTARG = int, RIGHTARG = int, PROCEDURE = int4eq); "
+                + "ALTER TABLE t ADD CONSTRAINT ck CHECK (id === id)",
+                id(ObjectKind.CHECK, "ck", "t"),
+                id(ObjectKind.OPERATOR, "===(integer,integer)")),
     };
 
     @Test

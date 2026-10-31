@@ -162,6 +162,19 @@ public final class PgScriptCheck {
             "ACCESS", "DEFAULT", "OWNED", "LANGUAGE", "LARGE");
 
     /**
+     * {@code ALTER ... OWNER TO} targets whose owner column feeds the
+     * snapshot — the pg_class/pg_proc/pg_type ownership legs (A.5
+     * OWNERSHIP). An index's owner follows its table silently, and
+     * conversion, collation, text-search, operator, statistics and
+     * extension owners are never loaded — either way an unlisted target
+     * would apply without a trace.
+     */
+    private static final Set<String> OWNER_MODELED = Set.of(
+            "TABLE", "VIEW", "MATERIALIZED", "SEQUENCE", "FOREIGN",
+            "FUNCTION", "PROCEDURE", "ROUTINE", "AGGREGATE", "TYPE",
+            "DOMAIN");
+
+    /**
      * COMMENT ON / SECURITY LABEL ON kinds whose target can never appear in a
      * namespace snapshot. {@code FOREIGN} is handled separately: {@code
      * FOREIGN SERVER}/{@code FOREIGN DATA WRAPPER} are database-wide, but a
@@ -195,6 +208,11 @@ public final class PgScriptCheck {
             if (first.equals("CLUSTER") && clusterNamesNoTable(t)) {
                 throw rejected(statement,
                         "CLUSTER without a table cannot run inside a transaction block");
+            }
+            if (first.equals("CLUSTER") && t.contains("USING")) {
+                throw rejected(statement,
+                        "CLUSTER ... USING records the clustering index; that"
+                                + " catalog state is outside the snapshot");
             }
             if (first.equals("CREATE") || first.equals("DROP") || first.equals("ALTER")) {
                 checkDdl(statement, first, scratchNamespace);
@@ -378,6 +396,21 @@ public final class PgScriptCheck {
                     first + " " + object + " is a database-wide object"
                             + " that cannot be represented in a namespace snapshot");
         }
+        if (object.equals("DEFAULT") && first.equals("ALTER")) {
+            // ALTER DEFAULT PRIVILEGES — only an IN SCHEMA-scoped form
+            // mutates a namespace-visible row (pg_default_acl); a global
+            // default ACL belongs to no namespace
+            checkDefaultPrivileges(statement, scratchNamespace);
+            return;
+        }
+        if (object.equals("PUBLICATION") && first.equals("ALTER")) {
+            // a binding mutation (ADD|SET|DROP TABLE/TABLES IN SCHEMA/SEQUENCE
+            // — the only PUBLICATION form that touches a namespace) is
+            // namespace-anchored through its bound object; publication
+            // properties, ownership and renames stay database-wide
+            checkPublicationBinding(statement, scratchNamespace);
+            return;
+        }
         if (DATABASE_WIDE_OBJECTS.contains(object)
                 || (object.equals("DATA") && t.contains("WRAPPER"))) {
             throw rejected(statement,
@@ -398,6 +431,102 @@ public final class PgScriptCheck {
             throw rejected(statement,
                     "ALTER INDEX ALL IN TABLESPACE is database-wide"
                             + " and cannot be represented in a snapshot");
+        }
+        // Statements whose catalog effect is outside the snapshot model —
+        // they would apply in the scratch replay yet leave no trace, so a
+        // plan could claim success while the target never changed (6a).
+        if (adjacent(t, "SET", "STATISTICS")) {
+            throw rejected(statement,
+                    "SET STATISTICS tunes the planner and stays outside the snapshot");
+        }
+        if (first.equals("ALTER") && object.equals("COLLATION")
+                && adjacent(t, "REFRESH", "VERSION")) {
+            throw rejected(statement,
+                    "REFRESH VERSION reloads environment metadata, not schema state");
+        }
+        if (first.equals("ALTER")) {
+            var d = 0;
+            for (var i = 1; i + 2 < t.size(); i++) {
+                final var w = t.get(i);
+                if (w.equals("(")) {
+                    d++;
+                } else if (w.equals(")")) {
+                    d--;
+                } else if (d == 0 && w.equals("DEPENDS") && t.get(i + 1).equals("ON")
+                        && t.get(i + 2).equals("EXTENSION")) {
+                    throw rejected(statement,
+                            "DEPENDS ON EXTENSION mutates extension membership,"
+                                    + " which the model excludes");
+                }
+            }
+        }
+        if (first.equals("ALTER") && object.equals("INDEX") && t.contains("ATTACH")) {
+            throw rejected(statement,
+                    "ALTER INDEX ... ATTACH PARTITION mutates an auto-managed"
+                            + " partition index binding");
+        }
+        if (first.equals("ALTER") && (adjacent(t, "CLUSTER", "ON")
+                || adjacent(t, "WITHOUT", "CLUSTER"))) {
+            throw rejected(statement,
+                    "CLUSTER membership is catalog state the snapshot does not model");
+        }
+        if (first.equals("ALTER") && object.equals("TEXT")) {
+            checkFtsAlter(statement, scratchNamespace);
+        }
+        if (first.equals("ALTER") && object.equals("OPERATOR")) {
+            checkOperatorAlter(statement, scratchNamespace);
+        }
+        if (first.equals("ALTER") && adjacent(t, "OWNER", "TO")
+                && !OWNER_MODELED.contains(object)) {
+            throw rejected(statement,
+                    "ownership of " + object + " objects is not modeled");
+        }
+        if (first.equals("ALTER") && object.equals("VIEW")
+                && (adjacent(t, "SET", "DEFAULT") || adjacent(t, "DROP", "DEFAULT"))) {
+            throw rejected(statement,
+                    "view column defaults are not modeled");
+        }
+        var depth = 0;
+        for (var i = 1; i < t.size(); i++) {
+            final var w = t.get(i);
+            if (w.equals("(")) {
+                depth++;
+                continue;
+            }
+            if (w.equals(")")) {
+                depth--;
+                continue;
+            }
+            if (depth > 0) {
+                continue;
+            }
+            // a top-level RESTART is sequence/identity runtime state, a
+            // top-level TABLESPACE the storage clause — an unquoted object
+            // named after either keyword rejects too, but the quoted form
+            // stays legal (fail closed)
+            if (w.equals("RESTART") && first.equals("ALTER")) {
+                throw rejected(statement,
+                        "RESTART changes runtime sequence state, not schema state");
+            }
+            if (w.equals("TABLESPACE")) {
+                throw rejected(statement,
+                        "TABLESPACE is a cluster-level object that cannot be"
+                                + " represented in a snapshot");
+            }
+        }
+        if (object.equals("TABLE")) {
+            // OF at top level is the typed-table clause — PARTITION OF is the
+            // one legal OF form; trailing NOT OF detaches the type
+            final var of = indexAtDepthZero(t, "OF");
+            if (of > 0 && !t.get(of - 1).equals("PARTITION")
+                    && (of + 1 < t.size() || t.get(of - 1).equals("NOT"))) {
+                throw rejected(statement, "typed tables (OF) are not modeled");
+            }
+            if (first.equals("CREATE") && indexAtDepthZero(t, "USING") >= 0) {
+                throw rejected(statement,
+                        "CREATE TABLE ... USING names an access method that"
+                                + " is not modeled");
+            }
         }
         if (scratchNamespace == null) {
             return;
@@ -436,8 +565,9 @@ public final class PgScriptCheck {
         if (first.equals("ALTER") && (object.equals("TABLE") || object.equals("INDEX"))) {
             // ALTER sub-commands whose operand is an object that gets mutated —
             // a partition attaches into (or detaches from) the named table.
-            // INHERIT/OF/PARTITION OF name references instead: a foreign parent
-            // or composite type is a legitimate external dependency (5.8.3).
+            // INHERIT/PARTITION OF name references instead: a foreign parent
+            // is a legitimate external dependency (5.8.3); a bare OF (typed
+            // tables) is rejected above as unmodeled.
             checkQualifiedAfter(statement, t, "ATTACH", "PARTITION", scratchNamespace);
             checkQualifiedAfter(statement, t, "DETACH", "PARTITION", scratchNamespace);
         }
@@ -451,6 +581,81 @@ public final class PgScriptCheck {
                 checkSchemaName(statement, schema + 1, scratchNamespace);
             }
         }
+    }
+
+    /**
+     * The {@code ALTER PUBLICATION} binding forms: {@code ADD|SET|DROP TABLE},
+     * {@code ... TABLES IN SCHEMA} and {@code ... SEQUENCE} mutate the
+     * namespace-visible binding (A.5 PUBLICATION); anything else —
+     * {@code SET (…)}, {@code OWNER TO}, {@code RENAME}, {@code SET SCHEMA} —
+     * mutates the cluster-level publication and is rejected. Bound
+     * table/sequence names take the qualifier check; schema names must be
+     * the scratch namespace. Returns silently when {@code scratchNamespace}
+     * is {@code null}: the form check alone decides admissibility.
+     */
+    private static void checkPublicationBinding(PgSql.StatementTokens statement,
+                                                String scratchNamespace) {
+        final var t = statement.tokens();
+        final var name = nameIndex(t);
+        var i = name + 1;
+        if (i >= t.size() || !Set.of("ADD", "SET", "DROP").contains(t.get(i))) {
+            throw rejected(statement, "ALTER PUBLICATION changes a database-wide"
+                    + " object; only its binding forms can appear in a snapshot");
+        }
+        if (++i >= t.size()
+                || !Set.of("TABLE", "TABLES", "SEQUENCE", "SEQUENCES").contains(t.get(i))) {
+            throw rejected(statement, "ALTER PUBLICATION changes a database-wide"
+                    + " object; only its binding forms can appear in a snapshot");
+        }
+        final var schema = t.get(i).equals("TABLES") || t.get(i).equals("SEQUENCES");
+        if (scratchNamespace == null) {
+            return;
+        }
+        if (schema) {
+            final var s = indexAtDepthZero(t, "SCHEMA");
+            checkSchemaList(statement, s + 1, scratchNamespace);
+            return;
+        }
+        // table/sequence name list — the first name follows the verb word
+        // (with an optional ONLY), the rest follow commas
+        var first = i + 1;
+        if (first < t.size() && t.get(first).equals("ONLY")) {
+            first++;
+        }
+        checkQualifierAt(statement, first, scratchNamespace);
+        checkNameList(statement, i, scratchNamespace);
+    }
+
+    /**
+     * {@code ALTER DEFAULT PRIVILEGES}: only the {@code IN SCHEMA}-scoped
+     * GRANT/REVOKE form is namespace state (A.5 DEFAULT_PRIVILEGES). The
+     * FOR ROLE clause is a cluster reference like a grantee; a global
+     * default ACL (no {@code IN SCHEMA}) is database-wide and rejected.
+     * Schema names must be the scratch namespace. Returns silently when
+     * {@code scratchNamespace} is {@code null}: the form check alone
+     * decides admissibility.
+     */
+    private static void checkDefaultPrivileges(PgSql.StatementTokens statement,
+                                               String scratchNamespace) {
+        final var t = statement.tokens();
+        if (t.size() < 3 || !t.get(2).equals("PRIVILEGES")) {
+            throw rejected(statement, "ALTER DEFAULT changes a database-wide"
+                    + " object that cannot be represented in a snapshot");
+        }
+        final var in = indexAtDepthZero(t, "IN");
+        if (in < 0 || in + 1 >= t.size() || !t.get(in + 1).equals("SCHEMA")) {
+            throw rejected(statement, "ALTER DEFAULT PRIVILEGES without IN SCHEMA"
+                    + " is database-wide; only the IN SCHEMA form can appear"
+                    + " in a snapshot");
+        }
+        if (!t.contains("GRANT") && !t.contains("REVOKE")) {
+            throw rejected(statement, "ALTER DEFAULT PRIVILEGES needs a"
+                    + " GRANT or REVOKE clause");
+        }
+        if (scratchNamespace == null) {
+            return;
+        }
+        checkSchemaList(statement, in + 2, scratchNamespace);
     }
 
     /**
@@ -471,6 +676,10 @@ public final class PgScriptCheck {
         if (object.equals("DATABASE") || object.equals("SCHEMA") || object.equals("SYSTEM")) {
             throw rejected(statement,
                     "REINDEX " + object + " cannot run inside a transaction block");
+        }
+        if (t.contains("TABLESPACE")) {
+            throw rejected(statement,
+                    "REINDEX ... TABLESPACE moves storage, which is not modeled");
         }
     }
 
@@ -896,6 +1105,91 @@ public final class PgScriptCheck {
         return i;
     }
 
+    /**
+     * The {@code ALTER TEXT SEARCH} carve-out. Managed text-search objects
+     * make two member-mutation forms snapshot state: a configuration's
+     * {@code MAPPING} actions ({@code pg_ts_config_map} rows fold into the
+     * configuration object) and a dictionary's option redefinition
+     * ({@code (opt = value, …)}, the {@code dictinitoption} field). Every
+     * other form — {@code RENAME}, {@code OWNER TO}, {@code SET SCHEMA} and
+     * every parser/template body — touches state the snapshot does not
+     * model and rejects. Dictionary references inside {@code WITH} and
+     * {@code REPLACE} name lists still pass the qualifier check.
+     */
+    private static void checkFtsAlter(PgSql.StatementTokens statement,
+                                      String scratchNamespace) {
+        final var t = statement.tokens();
+        final var name = nameIndex(t);
+        final var kind = name > 3 ? t.get(name - 1) : "";
+        var rest = name + 1;
+        if (rest + 1 < t.size() && t.get(rest).equals(".")) {
+            rest += 2;
+        }
+        switch (kind) {
+            case "CONFIGURATION" -> {
+                if (rest + 1 < t.size() && (t.get(rest).equals("ADD")
+                        || t.get(rest).equals("ALTER") || t.get(rest).equals("DROP"))
+                        && t.get(rest + 1).equals("MAPPING")) {
+                    var depth = 0;
+                    for (int i = rest + 2; i < t.size(); i++) {
+                        final var w = t.get(i);
+                        if (w.equals("(")) {
+                            depth++;
+                        } else if (w.equals(")")) {
+                            depth--;
+                        } else if (depth == 0 && (w.equals("WITH")
+                                || w.equals("REPLACE"))) {
+                            checkQualifierAt(statement, i + 1, scratchNamespace);
+                            checkNameList(statement, i + 1, scratchNamespace);
+                        }
+                    }
+                    return;
+                }
+                throw rejected(statement, "ALTER TEXT SEARCH " + kind
+                        + " mutates state the snapshot does not model");
+            }
+            case "DICTIONARY" -> {
+                if (rest < t.size() && t.get(rest).equals("(")) {
+                    return;
+                }
+                throw rejected(statement, "ALTER TEXT SEARCH DICTIONARY"
+                        + " mutates state the snapshot does not model");
+            }
+            default -> throw rejected(statement, "ALTER TEXT SEARCH mutates"
+                    + " members the snapshot does not model");
+        }
+    }
+
+    /**
+     * The {@code ALTER OPERATOR} carve-out. A class's member list is
+     * snapshot state (the {@code pg_amop}/{@code pg_amproc} rows fold into
+     * the {@code OPERATOR_CLASS} canonical), so {@code ALTER OPERATOR
+     * CLASS n USING am ADD|DROP OPERATOR|FUNCTION …} is legal.
+     * {@code ALTER OPERATOR FAMILY … ADD|DROP} member mutations are not —
+     * standalone family members are outside the snapshot model — and
+     * every other form ({@code RENAME}, {@code OWNER TO},
+     * {@code SET SCHEMA}, plain-operator alters) rejects.
+     */
+    private static void checkOperatorAlter(PgSql.StatementTokens statement,
+                                           String scratchNamespace) {
+        final var t = statement.tokens();
+        final var name = nameIndex(t);
+        final var kind = name > 1 ? t.get(name - 1) : "";
+        var rest = name + 1;
+        if (rest + 1 < t.size() && t.get(rest).equals(".")) {
+            rest += 2;
+        }
+        if (kind.equals("CLASS") && rest + 3 < t.size()
+                && t.get(rest).equals("USING")
+                && (t.get(rest + 2).equals("ADD") || t.get(rest + 2).equals("DROP"))
+                && (t.get(rest + 3).equals("OPERATOR")
+                        || t.get(rest + 3).equals("FUNCTION"))) {
+            return;
+        }
+        throw rejected(statement, "ALTER OPERATOR " + (kind.isEmpty() ? "" : kind + " ")
+                + "mutates state the snapshot does not model");
+    }
+
     /** The qualified-name check for the object after {@code ON} (index/table). */
     private static void checkOnTarget(PgSql.StatementTokens statement, int onIndex,
                                       String scratchNamespace) {
@@ -940,8 +1234,9 @@ public final class PgScriptCheck {
             return;
         }
         if (w.equals("SCHEMA")) {
-            checkSchemaList(statement, i + 1, scratchNamespace);
-            return;
+            throw rejected(statement,
+                    "ON SCHEMA grants mutate the namespace object itself,"
+                            + " which the snapshot does not model");
         }
         if (foreignTable || GRANT_KINDS.contains(w)) {
             i += foreignTable ? 2 : 1;
@@ -1020,11 +1315,13 @@ public final class PgScriptCheck {
                     + " has no namespace anchor; a comment or security label on it"
                     + " can never appear in a snapshot (3.2 rule 1)");
         }
-        if (scratchNamespace == null) {
-            return;
-        }
         if (kind.equals("SCHEMA")) {
-            checkSchemaName(statement, on + 2, scratchNamespace);
+            throw rejected(statement,
+                    "SCHEMA is the reconcile unit itself; a comment or"
+                            + " security label on it can never appear in a"
+                            + " namespace snapshot");
+        }
+        if (scratchNamespace == null) {
             return;
         }
         final var column = kind.equals("COLUMN");

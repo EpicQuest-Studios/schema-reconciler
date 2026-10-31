@@ -57,7 +57,7 @@ Most applications need the PostgreSQL dialect, which brings the core transitivel
 <dependency>
     <groupId>studio.epicquest.schema</groupId>
     <artifactId>schema-reconciler-postgresql</artifactId>
-    <version>0.1.6</version>
+    <version>0.9.0</version>
 </dependency>
 ```
 
@@ -65,7 +65,7 @@ Gradle:
 
 ```groovy
 repositories { maven { url = 'https://epicquest-studios.github.io/schema-reconciler/maven' } }
-implementation 'studio.epicquest.schema:schema-reconciler-postgresql:0.1.6'
+implementation 'studio.epicquest.schema:schema-reconciler-postgresql:0.9.0'
 ```
 
 Implementing a dialect for another database? Depend on `-core`, and use `-tck` (test scope) to run the conformance suite against it. No credentials are needed — the repository is served anonymously over HTTPS.

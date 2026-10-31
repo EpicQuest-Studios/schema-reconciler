@@ -13,8 +13,10 @@ import studio.epicquest.schema.reconciler.ReconcileOutcome;
 import studio.epicquest.schema.reconciler.ReconcilePolicy;
 import studio.epicquest.schema.reconciler.ReconcileReport;
 import studio.epicquest.schema.reconciler.SchemaReconciler;
+import studio.epicquest.schema.reconciler.model.ObjectKind;
 
-/** Spec 5.4 / A.5: {@code privileges:*} compares the real ACL, so grants the target already has are not reported. */
+/** Spec 5.4 / A.5: grants on a managed target become {@code PRIVILEGES} objects —
+ * desired GRANTs apply, acl drift renders GRANT/REVOKE to converge. */
 class PrivilegesComparisonTest {
 
     private static final AtomicLong SEQUENCE = new AtomicLong();
@@ -39,7 +41,7 @@ class PrivilegesComparisonTest {
     }
 
     @Test
-    void grantsTheTargetAlreadyHasAreNotReportedButDifferencesAre() throws Exception {
+    void grantsApplyAndAclDriftConverges() throws Exception {
         final var ds = PgTestDatabase.dataSource();
         final var id = Long.toHexString(System.nanoTime()) + SEQUENCE.incrementAndGet();
         final var ns = "privcmp_" + id;
@@ -52,42 +54,58 @@ class PrivilegesComparisonTest {
             final var script = "CREATE TABLE t (id bigint);"
                     + " GRANT SELECT ON t TO " + reader + "; GRANT INSERT ON t TO " + reader;
 
-            // the first run creates the table; the grants are unsupported and still absent
+            // the first run creates the table and grants the desired privileges
             final var first = run(ns, script);
             assertEquals(ReconcileOutcome.RECONCILED, first.outcome());
-            assertEquals("privileges:t", names(first));
-            assertTrue(first.unsupported().get(0).actual().isEmpty());
+            assertEquals("", names(first), first.unsupported().toString());
+            assertTrue(first.applied().stream().anyMatch(c ->
+                            c.target().kind() == ObjectKind.PRIVILEGES
+                                    && c.statements().stream()
+                                            .anyMatch(s -> s.startsWith("GRANT SELECT"))),
+                    "expected a GRANT in " + first.applied());
+            assertEquals(ReconcileOutcome.UP_TO_DATE, run(ns, script).outcome());
 
-            // the target gets the same grants, in the opposite order: nothing left to report
-            PgTestDatabase.execute(ds, "GRANT INSERT ON " + ns + ".t TO " + reader);
-            PgTestDatabase.execute(ds, "GRANT SELECT ON " + ns + ".t TO " + reader);
-            final var equal = run(ns, script);
-            assertEquals(ReconcileOutcome.UP_TO_DATE, equal.outcome());
-            assertEquals("", names(equal), equal.unsupported().toString());
-
-            // an extra privilege, and then a different grantee, are real differences
+            // an extra privilege on the target is drift: it is revoked
             PgTestDatabase.execute(ds, "GRANT DELETE ON " + ns + ".t TO " + reader);
             final var extra = run(ns, script);
-            assertEquals("privileges:t", names(extra));
-            assertTrue(extra.unsupported().get(0).actual().isPresent());
-            PgTestDatabase.execute(ds, "REVOKE DELETE ON " + ns + ".t FROM " + reader);
-            PgTestDatabase.execute(ds, "GRANT SELECT ON " + ns + ".t TO " + writer);
-            assertEquals("privileges:t", names(run(ns, script)));
-            PgTestDatabase.execute(ds, "REVOKE SELECT ON " + ns + ".t FROM " + writer);
-            assertEquals("", names(run(ns, script)));
+            assertEquals(ReconcileOutcome.RECONCILED, extra.outcome());
+            assertTrue(extra.applied().stream().anyMatch(c ->
+                            c.target().kind() == ObjectKind.PRIVILEGES
+                                    && c.statements().stream()
+                                            .anyMatch(s -> s.startsWith("REVOKE DELETE"))),
+                    "expected a REVOKE in " + extra.applied());
+            assertEquals(ReconcileOutcome.UP_TO_DATE, run(ns, script).outcome());
 
-            // the grant option is part of the comparison
+            // a different grantee is drift too: the foreign grant is revoked
+            PgTestDatabase.execute(ds, "GRANT SELECT ON " + ns + ".t TO " + writer);
+            final var grantee = run(ns, script);
+            assertEquals(ReconcileOutcome.RECONCILED, grantee.outcome());
+            assertTrue(grantee.applied().stream().anyMatch(c ->
+                            c.target().kind() == ObjectKind.PRIVILEGES
+                                    && c.statements().stream().anyMatch(s ->
+                                            s.startsWith("REVOKE SELECT")
+                                                    && s.contains(writer))),
+                    "expected a REVOKE in " + grantee.applied());
+            assertEquals(ReconcileOutcome.UP_TO_DATE, run(ns, script).outcome());
+
+            // the grant option is part of the desired state
             final var grantable = run(ns, "CREATE TABLE t (id bigint);"
                     + " GRANT SELECT ON t TO " + reader + " WITH GRANT OPTION;"
                     + " GRANT INSERT ON t TO " + reader);
-            assertEquals("privileges:t", names(grantable));
+            assertEquals(ReconcileOutcome.RECONCILED, grantable.outcome());
+            assertTrue(grantable.applied().stream().anyMatch(c ->
+                            c.target().kind() == ObjectKind.PRIVILEGES
+                                    && c.statements().stream().anyMatch(s ->
+                                            s.contains("WITH GRANT OPTION"))),
+                    "expected WITH GRANT OPTION in " + grantable.applied());
 
-            // a different owner shows up as an unexpected ownership object, and the owner-normalised
-            // ACL still compares equal: no privileges difference
+            // a different owner shows up as an unexpected OWNERSHIP object, and the owner-normalised
+            // ACL still compares equal: the held privileges reconcile, nothing drifts
             PgTestDatabase.execute(ds, "ALTER TABLE " + ns + ".t OWNER TO " + writer);
             final var owned = run(ns, script);
-            assertEquals("", names(owned), owned.unsupported().toString());
-            assertTrue(owned.unexpected().stream().anyMatch(d -> d.id().name().equals("ownership:t")),
+            assertTrue(owned.unexpected().stream().anyMatch(d ->
+                            d.id().kind() == ObjectKind.OWNERSHIP
+                                    && d.id().name().equals("t")),
                     owned.unexpected().toString());
         } finally {
             PgTestDatabase.execute(ds, "DROP SCHEMA " + ns + " CASCADE");

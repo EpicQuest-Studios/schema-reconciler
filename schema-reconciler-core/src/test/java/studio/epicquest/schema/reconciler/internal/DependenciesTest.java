@@ -50,9 +50,9 @@ class DependenciesTest {
 
     @Test
     void otherFillsTheParentableGapWhenNoManagedObjectMatches() {
-        // an unsupported partition child's name is still the parent anchor —
+        // an unsupported inheritance child's name is still the parent anchor —
         // children parented on it must resolve through the OTHER prefix
-        final var child = new ObjectId(ObjectKind.OTHER, "partition:pc");
+        final var child = new ObjectId(ObjectKind.OTHER, "inherited:pc");
         final var index = new ObjectId(ObjectKind.INDEX, "i", "pc");
         final var prereqs = prereqsOf(snapshot(object(child), object(index)));
         assertEquals(Set.of(child), prereqs.get(index));

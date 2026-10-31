@@ -147,7 +147,7 @@ Non-goals for version 1:
 - translating a script from one dialect to another,
 - rename detection (a rename appears as one missing and one unexpected object),
 - down-migrations or rollback scripts,
-- granted privileges, ownership, security labels, partitioning, foreign tables, composite types, non-enum user types (ranges, multiranges, base types), aggregates and window functions, rules, statistics, collations, conversions, text-search objects, operators, casts, transforms, languages and publications. Dialects must report these as `UNSUPPORTED` if a desired script creates them (section 5.4).
+- base types, multiranges declared standalone, standalone operator-family members (`ALTER OPERATOR FAMILY … ADD|DROP`), languages and publication objects (`CREATE PUBLICATION` — publication *bindings* are managed). Dialects must report these as `UNSUPPORTED` if a desired script creates them (section 5.4).
 
 ### 1.6 Platform dependencies
 
@@ -255,7 +255,7 @@ The desired script is a trusted build artefact. It is executed with the privileg
 1. The script should create objects only inside `${namespace}` (or unqualified). A statement that creates an object in another namespace escapes the scratch namespace — it can neither be detected nor cleaned up — so its behaviour is undefined. A dialect may instead reject a statement it can determine would create an object with no namespace anchor at all — a role or a server, for example — since such an object could never appear in a snapshot (5.4).
 2. The script must not create, alter or drop namespaces, must not acquire session-level locks (for example `pg_advisory_lock`), and must not change session state (for example `SET` without `LOCAL`, `RESET`, `LOAD`, or `set_config` with `is_local` other than the literal `true`): session-level effects can leak onto a pooled connection (C-21). A dialect should detect these statically, including inside anonymous code blocks, and must release any session-level lock a script took indirectly (for example inside a function it invoked) before the scratch connection is reused (A.2). A dialect may also reject a statement whose created, altered or dropped object name is qualified by a namespace other than the scratch namespace — the statement would escape the scratch namespace even though its text parses.
 3. On transactional dialects, the script must not contain transaction control (`BEGIN`, `COMMIT`, `ROLLBACK`, `SAVEPOINT`), nor statements that cannot run inside a transaction block, for example `CREATE INDEX CONCURRENTLY` or `VACUUM` (OI-3). After executing the script, the dialect must check that the run's transaction and scratch savepoint are still intact. If they are not, it must remove the scratch namespace and fail with `DesiredStateException`.
-4. Other non-DDL statements may appear; their effects are confined to the scratch connection.
+4. Other non-DDL statements may appear; their effects are confined to the scratch connection. A dialect may instead reject a statement whose catalog effect its snapshot cannot represent — it would apply during the scratch replay yet leave no detectable trace, so a plan could claim success while the target never changed. The PostgreSQL check therefore rejects grants, comments and security labels on the reconcile unit itself (`ON SCHEMA`), storage-placement clauses (`TABLESPACE`, `REINDEX ... TABLESPACE`), typed tables (`OF`), non-heap access methods (`CREATE TABLE ... USING`), clustering-index membership (`CLUSTER ... USING`, `ALTER ... CLUSTER ON`), planner tuning (`SET STATISTICS`), sequence `RESTART`, `OWNER TO` on targets whose owner column is not modeled (including `ALTER INDEX`, whose owner silently follows its table), partition-index attach, operator member mutations beyond an operator class's `ADD|DROP OPERATOR|FUNCTION` forms (snapshot state — standalone `OPERATOR FAMILY` members stay unmodeled) and text-search member mutations beyond a configuration's `MAPPING` forms and a dictionary's option redefinition, `DEPENDS ON EXTENSION`, collation `REFRESH VERSION` and view column defaults.
 5. The script must not refer to the target namespace by its literal name; it uses `${namespace}` or unqualified names instead. Before substitution, the core must search the script for the target namespace identifier — bare or enclosed in the dialect's identifier quotes, compared case-insensitively — immediately followed by `.` and not preceded by an identifier character (letter, digit, `_`, `$`) or by `.`. On a match, `plan()` must fail with `DesiredStateException` giving the position of the first match.
 
    Rationale: in the scratch namespace a literal reference stays literal. In the actual snapshot, normalisation rule 5.3(1) turns the same reference into `${namespace}.`. The object would therefore be `DRIFTED` on every run and never pass verification. The check is lexical, so a match inside a comment or string literal also fails; this follows P4, and the script author can rewrite the text. The same failure has a second form on the placeholder side: substitution replaces `${namespace}` textually, so a bare token inside a string literal — `DEFAULT '${namespace}'` — bakes the scratch name itself into the catalog, where it stays literal and drifts on every run; and a literal the escape leaves behind — `DEFAULT '$${namespace}'` — stores the token text, which binding replaces with the quoted target on apply while normalisation sees no `.` qualifier, drifting forever. The PostgreSQL dialect therefore rejects a string literal whose whole content is the substituted scratch name (bare or in identifier quotes) and any literal containing the token text unless it is followed by `.`; the qualified form `'${namespace}.seq'` inside a literal stays legal because binding and normalisation both see the `.` qualifier.
@@ -364,7 +364,12 @@ All model types live in `studio.epicquest.schema.reconciler.model`.
 public enum ObjectKind {
     TABLE, COLUMN, PRIMARY_KEY, UNIQUE, FOREIGN_KEY, CHECK,
     INDEX, VIEW, SEQUENCE, ROUTINE, TRIGGER, OTHER,
-    MATERIALIZED_VIEW, TYPE, DOMAIN, POLICY, EXTENSION, COMMENT
+    MATERIALIZED_VIEW, TYPE, DOMAIN, POLICY, EXTENSION, COMMENT,
+    STATISTICS, RULE, COLLATION, CONVERSION, SECURITY_LABEL,
+    PARTITION, FOREIGN_TABLE, PUBLICATION, OWNERSHIP, PRIVILEGES,
+    CAST, TRANSFORM, AGGREGATE, DEFAULT_PRIVILEGES,
+    TEXT_SEARCH_TEMPLATE, TEXT_SEARCH_PARSER, TEXT_SEARCH_DICTIONARY,
+    TEXT_SEARCH_CONFIGURATION, OPERATOR, OPERATOR_CLASS, OPERATOR_FAMILY
 }
 
 /** Namespace-neutral identity. */
@@ -372,9 +377,10 @@ public record ObjectId(ObjectKind kind, String name, Optional<String> parent) { 
 ```
 
 - `name` is the identifier as stored by the engine (case as the catalog reports it).
-- `parent` is required for `COLUMN`, all constraint kinds, `INDEX`, `TRIGGER` and `POLICY` (the owning table or view). For `COMMENT` it mirrors the commented target's `parent`: a comment on a column, index, constraint, trigger or policy carries the parent's name, a comment on a top-level object carries none. It must be empty for other kinds. A present `parent` and `name` must be non-empty strings. The compact constructor enforces these rules with `IllegalArgumentException`.
+- `parent` is required for `COLUMN`, all constraint kinds, `INDEX`, `TRIGGER`, `POLICY`, `RULE`, `EXCLUSION` and `PARTITION` (the owning table or view). For the mirrored kinds — `COMMENT`, `SECURITY_LABEL`, `PUBLICATION`, `OWNERSHIP` and `PRIVILEGES` — it mirrors the target's `parent`: one on a column, index, constraint, trigger, policy or partition carries the parent's name, one on a top-level object carries none. It must be empty for other kinds. A present `parent` and `name` must be non-empty strings. The compact constructor enforces these rules with `IllegalArgumentException`.
 - For `ROUTINE`, `name` must include the identity signature, because routines can be overloaded. The signature is the routine name followed by the parenthesised list of its input argument types (`IN`, `INOUT` and `VARIADIC` arguments; never `OUT`), separated by `, `, for example `extract_ts(text)` or `merge_plan(bigint, jsonb)`. Each type is written by the engine's canonical type formatter. Argument names are omitted, because they belong to the canonical definition: renaming a parameter makes the routine `DRIFTED`, not a missing routine plus an unexpected one. A type of the snapshot's own namespace is written unqualified when the dialect binds the search path to that namespace (A.5), as the PostgreSQL profile does; any qualifier that remains is replaced by the `${namespace}.` token of 5.3.
 - `ObjectId` never contains a namespace. Two snapshots of different namespaces are directly comparable.
+- **Cluster-reference boundary.** Every `ObjectId` names a namespace-anchored catalog object. A namespace object may *reference* a cluster-level object — a role (ownership, `GRANT` grantee), a foreign server or user mapping (`FOREIGN TABLE`), a publication (`FOR TABLE` binding) or a tablespace — but the referenced object is never itself in a snapshot: the reference lives inside the referencing object's canonical definition (for example a foreign table's `SERVER` name), so drift on the reference reconciles the *namespace* object. Existence of the referenced cluster object is a preflight concern: the dialect renders statements that name it and the engine reports a failure if it does not exist — it is never diffed and never created or dropped by a plan.
 
 ### 4.2 Schema objects and snapshots
 
@@ -749,6 +755,25 @@ Every message raised during a run must name the target namespace and, where appl
 | C-46 | Comment missing; comment drifted | `COMMENT` `ALTER` changes (`REBUILD`) converge to the desired text |
 | C-47 | Comment absent from desired, present in target | `UNEXPECTED` `COMMENT`, never dropped |
 | C-48 | Desired script with interlocked new kinds (domain-typed column, materialized-view index, policy and comments on the table) | reconciles in dependency order; second run `UP_TO_DATE` |
+| C-49 | Exclusion constraint missing; exclusion drifted | `MISSING` `EXCLUSION` is `ADDITIVE`; the backing index is not a separate `INDEX` change; `DRIFTED` is `DROP`+`CREATE` `REBUILD` |
+| C-50 | Statistics missing; statistics drifted | `MISSING` `STATISTICS` is `ADDITIVE`; `DRIFTED` is `DROP`+`CREATE` `REBUILD` |
+| C-51 | Rule missing; rule drifted | `MISSING` `RULE` is `ADDITIVE`; `DRIFTED` is `DROP`+`CREATE` `REBUILD` |
+| C-52 | Collation missing; collation drifted | `MISSING` `COLLATION` is `ADDITIVE`; `DRIFTED` is `DROP`+`CREATE` `REBUILD` |
+| C-53 | Conversion missing; conversion drifted | `MISSING` `CONVERSION` is `ADDITIVE`; `DRIFTED` is `DROP`+`CREATE` `REBUILD` |
+| C-54 | Partitioned parent and children create; partition bound drifted | `MISSING` `TABLE`/`PARTITION` are `ADDITIVE`; `DRIFTED` partition is `DROP`+`CREATE` `DESTRUCTIVE` |
+| C-55 | Foreign table create; foreign table options drifted | `MISSING` `FOREIGN_TABLE` is `ADDITIVE`; `DRIFTED` is `DROP`+`CREATE` `REBUILD` |
+| C-56 | Publication binding added; binding row filter drifted | `MISSING` `PUBLICATION` binding is `ADDITIVE`; `DRIFTED` is drop+add `REBUILD` |
+| C-57 | Ownership assigned to a cluster role; desired role changed | `MISSING`/`DRIFTED` `OWNERSHIP` is an in-place `ALTER ... OWNER TO` `REBUILD` |
+| C-58 | Privilege granted on a table; held grants differ from desired | `MISSING`/`DRIFTED` `PRIVILEGES` is an in-place `GRANT`/`REVOKE` `REBUILD`; a grant-option-only difference revokes the option, not the privilege |
+| C-59 | Cast missing; cast context drifted | `MISSING` `CAST` is `ADDITIVE`; `DRIFTED` is `DROP`+`CREATE` `REBUILD`. No TCK scenario exists for `TRANSFORM`: a `CREATE TRANSFORM` needs a procedural language that accepts transform functions, and none ships with a stock server |
+| C-60 | Composite type missing; attribute drifted | `MISSING` `TYPE` is `ADDITIVE` `CREATE TYPE ... AS (<attrs>)`; `DRIFTED` attributes are `DROP TYPE`+`CREATE` `REBUILD` — a composite still referenced by a column blocks the drop like every other recreate |
+| C-61 | Range type missing; `pg_range` option drifted | `MISSING` `TYPE` is `ADDITIVE` `CREATE TYPE ... AS RANGE (…)`; the generated family (multirange, constructors, the range→multirange cast) is folded, never an object; `DRIFTED` options are `DROP TYPE`+`CREATE` `REBUILD` |
+| C-62 | Aggregate missing; option drifted | `MISSING` `AGGREGATE` is `ADDITIVE` `CREATE AGGREGATE`; `DRIFTED` options are `DROP AGGREGATE`+`CREATE` `REBUILD` (no `CREATE OR REPLACE` for aggregates) |
+| C-63 | Column privilege granted; held column grants differ | `MISSING`/`DRIFTED` column `PRIVILEGES` (`<col>` parented on the relation) is an in-place `GRANT <priv> (<col>)`/`REVOKE` `REBUILD` |
+| C-64 | Default privilege granted in schema; held default grants differ | `MISSING`/`DRIFTED` `DEFAULT_PRIVILEGES` (`<CLASS> for <role>`) is an in-place `ALTER DEFAULT PRIVILEGES FOR ROLE … IN SCHEMA … GRANT`/`REVOKE` `REBUILD` |
+| C-65 | Window function missing; body drifted | `MISSING` `ROUTINE` (`prokind` `w`) is `ADDITIVE` `CREATE FUNCTION … WINDOW`; a `DRIFTED` body with an unchanged return type is an in-place `CREATE OR REPLACE` `REBUILD` |
+| C-66 | Text-search dictionary/configuration with a token mapping missing; dictionary option drifted | `MISSING` `TEXT_SEARCH_DICTIONARY`/`TEXT_SEARCH_CONFIGURATION` is `ADDITIVE` (`CREATE TEXT SEARCH …`, the mapping as `ALTER … ADD MAPPING` in `POST_SQL`); a `DRIFTED` dictionary option is a `DROP`+`CREATE` `REBUILD` |
+| C-67 | Operator, operator family and operator class missing; class member drift | `MISSING` `OPERATOR`/`OPERATOR_FAMILY`/`OPERATOR_CLASS` is `ADDITIVE` (`CREATE OPERATOR …`, member specs inside `CREATE OPERATOR CLASS`); a `DRIFTED` class member list is a `DROP`+`CREATE` `REBUILD` |
 
 ### 9.3 Implementation conformance
 
@@ -827,55 +852,72 @@ Where `CREATE ON DATABASE` cannot be granted, a separate `scratchDataSource` (6.
 
 | Kind | Source | Canonical definition |
 |---|---|---|
-| `TABLE` | `pg_class` (`relkind` `r`, excluding inheritance children) | `relkind`, `relpersistence`, `reloptions`, `relreplident`, and for replica identity `USING INDEX` the index name; columns are separate objects |
+| `TABLE` | `pg_class` (`relkind` `r` and `p` — `r` excluding inheritance children; `p` is a partitioned table) | `relkind`, `relpersistence`, `reloptions`, `relreplident`, and for replica identity `USING INDEX` the index name, plus `pg_get_partkeydef` for `p`; columns are separate objects |
+| `PARTITION` | `pg_class` (`relkind` `r` under a `p` parent — a partition child) | `pg_get_expr(relpartbound)` — the `FOR VALUES` bound; the parent is the `ObjectId` parent |
+| `FOREIGN_TABLE` | `pg_class` (`relkind` `f`) + `pg_foreign_table` + `pg_foreign_server` | `srvname` (a cluster-object reference, 4.1) plus sorted `ftoptions` plus `reloptions`; columns are separate objects |
+| `PUBLICATION` (binding) | `pg_publication_rel`/`pg_publication_namespace`/`pg_publication_sequences` — the namespace-visible edge to a cluster publication (4.1); `puballsequences` rows are flag expansions, not bindings | binding shape (`table`/`schema`/`sequence`) plus `pg_get_expr(prqual)` and the `prattrs` column list (PG15+) |
+| `OWNERSHIP` | `relowner`/`proowner`/`typowner` on managed rel/proc/type targets — the owning role is a cluster-object reference (4.1). Loaded only when the owner differs from the connecting role, so a script that assigns no owner is "don't care", never a claim to itself | `owner=<role>` |
+| `PRIVILEGES` | `relacl`/`proacl`/`typacl` on managed rel/proc/type targets, plus column-level `attacl` on managed relations — a column grant mirrors the column: `PRIVILEGES <col>` parented on the relation. The grantee roles are cluster-object references (4.1). Loaded only while the acl column holds a real grant, so a script that grants nothing is "don't care", never a claim to itself | sorted `grantee:PRIVILEGE[*]` tokens — `PUBLIC` for grantee 0, `<owner>` for the object's owner, `*` a grant option; the grantor is dropped, so the same grant recorded under another grantor compares equal (5.4) |
+| `DEFAULT_PRIVILEGES` | `pg_default_acl` rows with `defaclnamespace` = the target namespace — one object per (`defaclobjtype`, `defaclrole`) pair, named `<CLASS> for <role>` (`TABLES`/`SEQUENCES`/`FUNCTIONS`/`TYPES`). The `FOR ROLE` role and grantees are cluster-object references (4.1); a global default ACL (`defaclnamespace` = 0) belongs to no namespace and is not an object | sorted `grantee:PRIVILEGE[*]` tokens in the same `privileges=` canonical form `PRIVILEGES` uses — the `FOR ROLE` role takes the `<owner>` slot |
+| `CAST` | `pg_cast` rows anchored to a managed object — a namespace source/target type or the cast function; unanchored or only-unmanaged-anchored rows stay `OTHER` | `castcontext` + `castmethod` + the cast function (`castfunc::regprocedure`, `none` when 0); the `ObjectId` name is `format_type(source)->format_type(target)` |
+| `TRANSFORM` | `pg_transform` rows whose `trftype` is a managed type — the only anchor a script can express (3.2); the language is a cluster-object reference (4.1) | `trffromsql`/`trftosql` as `regprocedure` text (`none` when 0); the `ObjectId` name is `format_type(trftype)/lanname` |
 | `COLUMN` | `pg_attribute`, `pg_attrdef`, `pg_collation` | `format_type(atttypid, atttypmod)`, nullability, `pg_get_expr(adbin, adrelid)` as the default or, when `attgenerated` is set, as the generation expression; collation when it is not the type's default; identity kind and identity sequence options; `attstorage` storage strategy and `attcompression` compression method |
-| `PRIMARY_KEY`, `UNIQUE`, `FOREIGN_KEY`, `CHECK` | `pg_constraint` (`contype` `p`, `u`, `f`, `c`), excluding inherited copies (`conislocal` `false` — partition-child and classic-inheritance constraints, which only the parent's object owns) | `pg_get_constraintdef(oid)` |
+| `PRIMARY_KEY`, `UNIQUE`, `FOREIGN_KEY`, `CHECK`, `EXCLUSION` | `pg_constraint` (`contype` `p`, `u`, `f`, `c`, `x`), excluding inherited copies (`conislocal` `false` — partition-child and classic-inheritance constraints, which only the parent's object owns) | `pg_get_constraintdef(oid)` |
 | `INDEX` | `pg_index` (`relkind` `i`), excluding constraint-backing indexes (`pg_constraint.conindid` on `p`, `u`, `x` constraints) and partition-child indexes | `pg_get_indexdef(indexrelid)` |
 | `VIEW` | `pg_class` (`relkind` `v`) | `pg_get_viewdef(oid, true)` plus column names and types, plus `reloptions` (`check_option`, `security_barrier`, `security_invoker`) in sorted order |
 | `SEQUENCE` | `pg_sequence`, `pg_class.relpersistence` | type, start, increment, min, max, cache, cycle, persistence (`LOGGED`/`UNLOGGED`); never the current value |
-| `ROUTINE` | `pg_proc` (`prokind` `f`, `p`) | `pg_get_functiondef(oid)`; the identity signature (4.1) is `proname` plus `format_type` over each element of `proargtypes` |
+| `ROUTINE` | `pg_proc` (`prokind` `f`, `p`, `w`) | `pg_get_functiondef(oid)`; the identity signature (4.1) is `proname` plus `format_type` over each element of `proargtypes` |
+| `AGGREGATE` | `pg_proc` (`prokind` `a`) joined to `pg_aggregate` | `aggkind` plus the option list composed from `pg_aggregate` — `SFUNC`, `STYPE`, `SSPACE`, `FINALFUNC`, `FINALFUNC_EXTRA`, `FINALFUNC_MODIFY`, `COMBINEFUNC`, `SERIALFUNC`, `DESERIALFUNC`, `INITCOND`, the moving-aggregate (`M…`) fields, `MINITCOND` and `SORTOP`, omitting unset values and defaults; `pg_get_functiondef` refuses aggregates, so the canonical is composed rather than deparsed. The identity signature is `proname` plus `pg_get_function_identity_arguments` (ordered-set `ORDER BY` forms included) |
 | `TRIGGER` | `pg_trigger` (`NOT tgisinternal` and `tgparentid` `0` — partition clones are not standalone objects) | `pg_get_triggerdef(oid, true)` plus the enabled state (`tgenabled`) |
 | `MATERIALIZED_VIEW` | `pg_class` (`relkind` `m`) | `pg_get_viewdef(oid, true)` plus column names and types, plus `reloptions`, `relpersistence` and `relispopulated` |
-| `TYPE` | `pg_type` (`typtype` `e` — enums only) | `typtype` plus the labels of `pg_enum` ordered by `enumsortorder` |
+| `TYPE` | `pg_type` (`typtype` `e` — enums; `typtype` `c` where `typrelid` is a standalone `relkind` `c` relation — composites; `typtype` `r` — ranges, via `pg_range`) | enums: `typtype` plus the labels of `pg_enum` ordered by `enumsortorder`; composites: `typtype` plus the attribute list of `pg_attribute` on `typrelid` (`attname`, `format_type(atttypid, atttypmod)`, non-default collation) in `attnum` order; ranges: `typtype` plus the `pg_range` row — `format_type(rngsubtype)`, non-default collation, `rngsubopc` when it is not the subtype's default btree operator class, canonical and subtype-diff functions (`regproc`). A range's generated family — its multirange (`typtype` `m`), constructor routines and the range→multirange cast — folds into the `TYPE` object: none of them is a standalone object (the multirange has no create form of its own), so they cannot drift or report separately |
 | `DOMAIN` | `pg_type` (`typtype` `d`) | `format_type(typbasetype, typtypmod)`, `typnotnull`, `pg_get_expr(typdefaultbin, 0)`, collation when it differs from the base type's, and the domain's `CHECK` constraints (`pg_constraint` on `contypid`, `contype` `c`, `pg_get_constraintdef`, in constraint-name order) |
 | `POLICY` | `pg_policy` | `polcmd`, `polpermissive`, the role list as sorted, individually quoted names (`polroles` oid `0` is `PUBLIC`), `pg_get_expr(polqual, polrelid)`, `pg_get_expr(polwithcheck, polrelid)` |
+| `STATISTICS` | `pg_statistic_ext` | `pg_get_statisticsobjdef(oid)` — the enabled kinds, column/expression list and source table; `stxstattarget` is a per-column planner property and stays outside the canonical |
+| `RULE` | `pg_rewrite` (`rulename` not `_RETURN`, which is part of its view) | `pg_get_ruledef(oid, true)` plus the enabled state (`ev_enabled`) |
+| `COLLATION` | `pg_collation` (provider `libc`/`icu`, encoding `-1` or this database's) | provider plus the provider-specific fields (`collcollate`/`collctype`, `collencoding`, `colllocale`, `collicurules`, `collisdeterministic`); `collversion` is environment metadata and excluded |
+| `CONVERSION` | `pg_conversion` (`condefault` false — `DEFAULT` is a database-wide object word a script cannot express) | source/target encoding names plus the conversion function (`regproc`) |
+| `TEXT_SEARCH_TEMPLATE` | `pg_ts_template` | `tmplinit` and `tmpllexize` as `regproc` text (`INIT` omitted when unset); composed — no `pg_get_*def` exists |
+| `TEXT_SEARCH_PARSER` | `pg_ts_parser` | `prsstart`, `prstoken`, `prsend`, `prsheadline` (omitted when unset), `prslextype` as `regproc` text; composed |
+| `TEXT_SEARCH_DICTIONARY` | `pg_ts_dict` | the `dicttemplate` reference plus `dictinitoption` verbatim; composed |
+| `TEXT_SEARCH_CONFIGURATION` | `pg_ts_config` + `pg_ts_config_map` | `cfgparser` reference plus the map chain folded in — token alias resolved through `ts_token_type(cfgparser)`, map sequence and dictionary reference in `mapseqno` order; map rows are never standalone objects — `ALTER ... ADD MAPPING` fragments render in `POST_SQL` |
+| `OPERATOR` | `pg_operator` | the option list composed from the row — `format_type` over `oprleft`/`oprright`/`oprresult`, `oprcode`/`oprrest`/`oprjoin` as `regproc` text, `oprcom`/`oprnegate` as qualified names, `oprcanhash`/`oprcanmerge`; the `ObjectId` name is `oprname` plus the `(leftarg,rightarg)` identity signature (`NONE` for an absent operand) — composed, no `pg_get_*def` |
+| `OPERATOR_FAMILY` | `pg_opfamily` joined to `pg_am` | the access method name; the `ObjectId` name is `opfname USING amname`. Standalone family members (`pg_amop`/`pg_amproc` rows not owned through a class) are not modeled |
+| `OPERATOR_CLASS` | `pg_opclass` + `pg_amop`/`pg_amproc` | the access method, `format_type(opcintype)`, the family reference, `opcdefault`, `format_type(opckeytype)` when set, and the member list folded in — `OPERATOR` members (`amopstrategy`, the `regoperator` reference, `FOR ORDER BY` family when `amoppurpose` is `o`) then `FUNCTION` members (`amprocnum`, the type pair, the `regprocedure` reference) in member order. The `ObjectId` name is `opcname USING amname` |
+| `SECURITY_LABEL` | `pg_seclabel` on a managed target | the label text; the id mirrors the target (provider `:` target name), so `SECURITY_LABEL selinux:t` is the label provider `selinux` places on table `t` |
 | `EXTENSION` | `pg_extension` | presence only — the literal `extension`; the version is never compared (`ALTER EXTENSION UPDATE` is out of scope), and `ObjectId.name` keeps the `extension:<name>` form so the id is stable across the promotion |
 | `COMMENT` | `pg_description` joined to the managed object (`objoid`, `objsubid` `0` for objects, `> 0` for columns) | the comment text; a target with no row has no `COMMENT` object |
 | dependencies | `pg_depend`, `pg_rewrite`, `pg_inherits`, `pg_trigger`, restricted to objects of the namespace being read | populate `dependsOn` |
 | `OTHER` | see below | detected so that unsupported constructs are reported (5.4) |
 
 `OTHER` detection covers every namespace-scoped catalog object the managed
-kinds do not claim: non-managed relations (`relkind` `f`, `p`, `c`, `t`,
-`I` and `r` tables with an inheritance parent), exclusion constraints
-(`contype` `x`), non-enum user types (`pg_type` `r`, `m` and base types;
-composite types carry `relkind` `c` and collide with the relation
-namespace, so they stay `OTHER` rather than `TYPE`), aggregates and window
-functions (`pg_proc` `a`, `w`), non-view rules (`pg_rewrite`), statistics
-(`pg_statistic_ext`), collations (`pg_collation`), conversions
-(`pg_conversion`), text-search objects (`pg_ts_config`, `pg_ts_dict`,
-`pg_ts_parser`, `pg_ts_template`), operators, operator classes and families
-(`pg_operator`, `pg_opclass`, `pg_opfamily`), comments on unmanaged or
+kinds do not claim: non-managed relations (`relkind` `t`,
+`I` and `r` tables with an inheritance parent — `relkind` `c` is the
+backing relation of a managed composite `TYPE`), base types
+(`pg_type` `typtype` `b` with no array element), collations the
+dialect cannot recreate (database-default provider or
+bound encoding — `pg_collation`),
+`DEFAULT CONVERSION` rows (`pg_conversion`), security labels on unmanaged
+targets (`pg_seclabel`), comments on unmanaged or
 otherwise unrepresentable targets (`pg_description`), security labels
-(`pg_seclabel`), granted privileges (non-null `relacl`, `proacl`, `typacl`; compared by content: the ACL entries as sorted `grantor>grantee:PRIVILEGE[*]` tokens, with the owner written `<owner>` and `*` marking a grant option, so a target holding the same grants reports no difference), ownership changed away from the connecting role
-(`relowner`, `proowner`, `typowner`) and publication bindings
-(`pg_publication_rel` for tables, `pg_publication_namespace` for
-`FOR TABLES IN SCHEMA` on PostgreSQL 15+, `pg_publication_sequences` for
-sequences on PostgreSQL 19+). Three catalog object kinds have no namespace of their
+(`pg_seclabel`), granted privileges on unmanaged targets (non-null `relacl`, `proacl`, `typacl`, `attacl`; compared by content: the ACL entries as the same sorted `grantee:PRIVILEGE[*]` token form `PRIVILEGES` uses — on a managed target the same rows become `PRIVILEGES`) and ownership of unmanaged targets
+(`relowner`, `proowner`, `typowner` — on a managed target the same rows become `OWNERSHIP`). Three catalog object kinds have no namespace of their
 own but are detected through a namespace anchor instead: `pg_cast` rows
-whose source type, target type or cast function is in the namespace,
-`pg_transform` rows anchored by their type or SQL functions, and
-`pg_language` rows whose handler functions are in the namespace.
+whose only anchors are unmanaged objects (a managed anchor turns the row
+into `CAST`), `pg_transform` rows anchored by unmanaged types or only by
+SQL functions (a managed `trftype` turns the row into `TRANSFORM`), and
+`pg_language` rows whose handler functions are in the namespace — a
+language is a cluster-level object (4.1), so it is always `OTHER`.
 
 `OTHER` object ids carry a documented category prefix — the substring
 before the first `:` of the `ObjectId` name, used by
-`unsupportedCategories` (3.3): `foreign`, `partition`,
-`partindex`, `composite`, `toast`, `inherited` and `relation` (any other
-non-managed `relkind`), `constraint` (exclusion), `type` (non-enum),
-`rule`, `statistics`, `collation`, `conversion`, `fts-config`,
-`fts-dict`, `fts-parser`, `fts-template`, `operator`, `opclass`,
-`opfamily`, `comment` (unmanaged target), `seclabel`, `privileges`,
-`ownership`, `publication`, `cast`, `transform`, `language` and `routine`
-(aggregate or window). Extension *member* objects (`pg_depend`
+`unsupportedCategories` (3.3): `partindex`,
+`toast`, `inherited` and `relation` (any other
+non-managed `relkind`), `type` (base types),
+`collation`, `conversion`, `comment` (unmanaged target), `seclabel`, `privileges`
+(unmanaged target),
+`ownership` (unmanaged target), `cast` and `transform` (unmanaged anchor),
+and `language`. Extension *member* objects (`pg_depend`
 `deptype = 'e'`) are excluded from the model entirely: they cannot be
 created or dropped standalone, so a member function or type must never
 surface as a managed object or an `UNEXPECTED` one — only the
@@ -904,18 +946,25 @@ publications, subscriptions, access methods, default privileges and large
 objects — are outside the snapshot model. The script constraints of 3.2
 reject the non-transactional ones outright, and the PostgreSQL script
 check additionally rejects DDL for every database-wide object it cannot
-represent (`SERVER`, `PUBLICATION`, `FOREIGN DATA WRAPPER`, `USER MAPPING`,
+represent (`SERVER`, `FOREIGN DATA WRAPPER`, `USER MAPPING`,
 `EVENT TRIGGER`, `ACCESS METHOD`, `LANGUAGE`, `ROLE`/`GROUP`/`USER`,
-`DEFAULT PRIVILEGES`, `OWNED`, `REASSIGN OWNED`, role-membership
-`GRANT`/`REVOKE`, and `ALTER ... SET SCHEMA`), so a script cannot silently
+`OWNED`, `REASSIGN OWNED`, role-membership
+`GRANT`/`REVOKE`, `ALTER ... SET SCHEMA`, global `ALTER DEFAULT PRIVILEGES`,
+and `PUBLICATION` statements —
+except the `ALTER PUBLICATION` binding forms, which mutate the
+namespace-visible binding, and the `ALTER DEFAULT PRIVILEGES ... IN SCHEMA`
+GRANT/REVOKE forms, which mutate the namespace-visible `pg_default_acl`
+row), so a script cannot silently
 create an undetectable object. It also rejects any object name in
 `CREATE`/`DROP`/`ALTER` position — including the `ON`-anchored names of
 `CREATE INDEX`, `CREATE TRIGGER` and `CREATE POLICY`, and the object
 targets of `GRANT`/`REVOKE`, `COMMENT` and `SECURITY LABEL` — that is
 qualified by a schema other than the scratch namespace (`pg_temp`
 excepted), because such a statement creates or changes an object outside
-the sandbox (3.2 rule 1); a `GRANT ... ON SCHEMA` is legal only on the
-scratch namespace itself. References to foreign schemas elsewhere in a
+the sandbox (3.2 rule 1); `GRANT`/`REVOKE ... ON SCHEMA`,
+`COMMENT ON SCHEMA` and `SECURITY LABEL ... ON SCHEMA` are rejected
+outright — the namespace is the reconcile unit itself and its own acl,
+description and labels are outside the snapshot. References to foreign schemas elsewhere in a
 statement remain legal: a cross-schema `REFERENCES` clause is a declared
 external dependency, not an escaping creation. Finally it rejects
 session-state changes — `SET` without `LOCAL` or `TRANSACTION`,
@@ -940,13 +989,12 @@ Name scopes (`nameScopes`, 5.8.7). Tables, views, materialized views, sequences 
 
 | Kind | Keys |
 |---|---|
-| `TABLE`, `VIEW`, `MATERIALIZED_VIEW`, `SEQUENCE`, `INDEX`, `OTHER` relations | `relation:<name>` |
+| `TABLE`, `VIEW`, `MATERIALIZED_VIEW`, `SEQUENCE`, `INDEX`, `PARTITION`, `FOREIGN_TABLE`, `OTHER` relations | `relation:<name>` |
 | `TYPE`, `DOMAIN`, `OTHER` types (`type:`) | `relation:<name>` (the shared type/relation namespace) |
-| `ROUTINE`, `OTHER` routines (`routine:` aggregates, window functions) | `routine:<name>(<signature>)` |
-| `PRIMARY_KEY`, `UNIQUE` | `relation:<name>`, `constraint:<parent>.<name>` |
+| `ROUTINE`, `AGGREGATE` | `routine:<name>(<signature>)` |
+| `PRIMARY_KEY`, `UNIQUE`, `EXCLUSION` | `relation:<name>`, `constraint:<parent>.<name>` |
 | `FOREIGN_KEY`, `CHECK` | `constraint:<parent>.<name>` |
-| `OTHER` constraints (`constraint:` exclusion constraints) | `constraint:<parent>.<name>`, `relation:<name>` (the backing index) |
-| `COLUMN`, `TRIGGER`, `POLICY`, `EXTENSION`, `COMMENT` | none (the `ObjectId` is already the engine's uniqueness key) |
+| `COLUMN`, `TRIGGER`, `POLICY`, `EXTENSION`, `COMMENT`, `STATISTICS`, `RULE`, `COLLATION`, `CONVERSION`, `SECURITY_LABEL`, `PUBLICATION`, `OWNERSHIP`, `PRIVILEGES`, `DEFAULT_PRIVILEGES`, `CAST`, `TRANSFORM` | none (the `ObjectId` is already the engine's uniqueness key) |
 
 ### A.6 Rendering
 
@@ -970,10 +1018,25 @@ Name scopes (`nameScopes`, 5.8.7). Tables, views, materialized views, sequences 
 | `MISSING` enum type | `CREATE TYPE <name> AS ENUM (<labels>)` | `ADDITIVE` |
 | `DRIFTED` enum whose desired labels append to the actual ones in order | one `ALTER TYPE ... ADD VALUE` per new label | `ADDITIVE` — pure in-order growth |
 | `DRIFTED` enum with a removed or reordered label | manual change (no statements) | `DESTRUCTIVE` |
+| `MISSING` / `DRIFTED` composite type | `CREATE`: `CREATE TYPE <name> AS (<attrs>)` with the desired attribute list; when drifted, preceded by a `DROP` change `DROP TYPE` — a composite referenced by a column or routine blocks the drop through the dependency graph | `ADDITIVE` / `REBUILD` |
+| `MISSING` / `DRIFTED` range type | `CREATE`: `CREATE TYPE <name> AS RANGE (SUBTYPE = …)` with collation, non-default `SUBTYPE_OPCLASS`, `CANONICAL` and `SUBTYPE_DIFF` as desired; when drifted, preceded by a `DROP` change `DROP TYPE` — `ALTER TYPE` cannot change `pg_range` fields, so every drift recreates | `ADDITIVE` / `REBUILD` |
 | `MISSING` domain | `CREATE DOMAIN` with base type, collation, `DEFAULT`, `NOT NULL` and `CHECK` constraints | `ADDITIVE` |
 | `DRIFTED` domain | in-place `ALTER DOMAIN` statements decomposed from the canonical difference — `SET`/`DROP DEFAULT`, `DROP NOT NULL`, `DROP CONSTRAINT` go in one `ALTER` change; `SET NOT NULL` and `ADD CONSTRAINT` validate existing values, so each renders as a separate `ALTER` change; a base-type or collation change is a manual change (no statements) | `REBUILD` / `DESTRUCTIVE` |
 | `MISSING` policy | `CREATE POLICY ... ON <table> FOR <cmd> TO <roles>` with `USING` / `WITH CHECK` as desired | `ADDITIVE` |
 | `DRIFTED` policy | `DROP POLICY` + `CREATE POLICY` | `REBUILD` |
+| `MISSING` / `DRIFTED` statistics | `CREATE`: the desired `pg_get_statisticsobjdef`; when drifted, preceded by a `DROP` change `DROP STATISTICS` | `ADDITIVE` / `REBUILD` |
+| `MISSING` / `DRIFTED` rule | `CREATE`: the desired `pg_get_ruledef`, followed by `ALTER TABLE ... ENABLE|DISABLE RULE` for a non-default enabled state; when drifted, preceded by a `DROP` change `DROP RULE ... ON` | `ADDITIVE` / `REBUILD` |
+| `MISSING` / `DRIFTED` collation | `CREATE`: the desired `CREATE COLLATION` composed from the provider fields; when drifted, preceded by a `DROP` change `DROP COLLATION` | `ADDITIVE` / `REBUILD` |
+| `MISSING` / `DRIFTED` conversion | `CREATE`: the desired `CREATE CONVERSION` composed from encodings and function; when drifted, preceded by a `DROP` change `DROP CONVERSION` | `ADDITIVE` / `REBUILD` |
+| `MISSING` / `DRIFTED` partition | `CREATE`: `CREATE TABLE <child> PARTITION OF <parent> <bound>`; when drifted, preceded by a `DROP` change `DROP TABLE <child>` — a bound change re-homes rows | `ADDITIVE` / `DESTRUCTIVE` |
+| `MISSING` / `DRIFTED` foreign table | `CREATE`: `CREATE FOREIGN TABLE <name> (<columns>) SERVER <srv> OPTIONS (…)`; when drifted, preceded by a `DROP` change `DROP FOREIGN TABLE <name>` — a foreign table holds no local data | `ADDITIVE` / `REBUILD` |
+| `MISSING` / `DRIFTED` publication binding | `ALTER PUBLICATION <pub> ADD TABLE|TABLES IN SCHEMA|SEQUENCE <target>`; when drifted (row filter or column list changed), preceded by the `DROP` form | `ADDITIVE` / `REBUILD` |
+| `MISSING` / `DRIFTED` aggregate | `CREATE`: `CREATE AGGREGATE <name>(<args>) (<options>)` composed from `pg_aggregate`; when drifted, preceded by a `DROP` change `DROP AGGREGATE` — aggregates have no `CREATE OR REPLACE` form | `ADDITIVE` / `REBUILD` |
+| `MISSING` / `DRIFTED` cast | `CREATE`: `CREATE CAST (<src> AS <tgt>) WITH FUNCTION <f(args)>|WITH INOUT [AS ASSIGNMENT|AS IMPLICIT]`; when drifted, preceded by a `DROP` change `DROP CAST (<src> AS <tgt>)` — the cast is cluster-visible, but its identity is anchored to namespace objects (4.1) | `ADDITIVE` / `REBUILD` |
+| `MISSING` / `DRIFTED` transform | `CREATE`: `CREATE TRANSFORM FOR <type> LANGUAGE <lang> (FROM|TO SQL WITH FUNCTION …)`; when drifted, preceded by a `DROP` change `DROP TRANSFORM FOR <type> LANGUAGE <lang>` | `ADDITIVE` / `REBUILD` |
+| `MISSING` / `DRIFTED` ownership | `ALTER <kind> <target> OWNER TO <role>` — an in-place reassignment; fails at apply when the connecting role may not become the named role (a cluster-reference preflight, 4.1) | `REBUILD` |
+| `MISSING` / `DRIFTED` privileges | `ALTER`: one `GRANT <priv> ON <target> TO <role> [WITH GRANT OPTION]` per desired token not held, one `REVOKE` per held token not desired — `REVOKE GRANT OPTION FOR` when the privilege itself stays; implicit `<owner>` rights are never granted or revoked. A column-level grant parenthesizes the column after the privilege word; a `DEFAULT_PRIVILEGES` object prefixes every statement with `ALTER DEFAULT PRIVILEGES FOR ROLE <role> IN SCHEMA <ns>`. Fails at apply when a grantee role does not exist (a cluster-reference preflight, 4.1) | `REBUILD` |
+| `MISSING` / `DRIFTED` security label | `ALTER`: `SECURITY LABEL FOR <provider> ON <target> IS '<text>'` — the same statement re-issues the label in place | `REBUILD` |
 | `DRIFTED` table limited to `relrowsecurity` | `ALTER`: `ALTER TABLE ... ENABLE|DISABLE ROW LEVEL SECURITY` | `REBUILD` |
 | `MISSING` extension | `CREATE EXTENSION IF NOT EXISTS <name> WITH SCHEMA <target>` | `ADDITIVE` |
 | `DRIFTED` extension | unreachable — the canonical definition is presence-only (asserted manual change as a safeguard) | `DESTRUCTIVE` |
@@ -1025,29 +1088,42 @@ Coverage of the PostgreSQL SQL command set by the reference dialect, measured ag
 
 | SQL construct | Handling |
 |---|---|
-| `CREATE TABLE` / `ALTER TABLE` | `TABLE` objects (columns, generated columns, identity columns, `NOT NULL`, defaults, collations, `relpersistence`, `reloptions`, `relreplident`); inheritance children and partition children are `OTHER` instead |
-| `PRIMARY KEY`, `UNIQUE`, `FOREIGN KEY`, `CHECK` | constraint kinds via `pg_constraint` |
+| `CREATE TABLE` / `ALTER TABLE` | `TABLE` objects incl. partitioned parents (`relkind` `r`/`p`; columns, generated columns, identity columns, `NOT NULL`, defaults, collations, `relpersistence`, `reloptions`, `relreplident`, `pg_get_partkeydef`); classic-inheritance children are `OTHER` instead |
+| `CREATE TABLE ... PARTITION OF` | `PARTITION` objects (`relkind` `r` under a `p` parent); the bound `pg_get_expr(relpartbound)` is the canonical definition |
+| `CREATE FOREIGN TABLE` | `FOREIGN_TABLE` objects (`relkind` `f`); `SERVER`/`OPTIONS` are in the canonical — the server is a cluster-object reference (4.1), never managed |
+| `PRIMARY KEY`, `UNIQUE`, `FOREIGN KEY`, `CHECK`, `EXCLUDE` | constraint kinds via `pg_constraint`; an exclusion's backing index is covered, not a separate `INDEX` |
 | `CREATE INDEX` | `INDEX` objects (partial, expression, unique — including indexes that back `FOREIGN KEY` references); `CONCURRENTLY` is non-transactional and rejected (3.2) |
 | `CREATE [OR REPLACE] VIEW` | `VIEW` objects incl. `reloptions` (`check_option`, `security_barrier`, `security_invoker`) |
 | `CREATE MATERIALIZED VIEW` / `REFRESH MATERIALIZED VIEW` | `MATERIALIZED_VIEW` objects incl. `reloptions`, `relpersistence`, populated state; its indexes are managed `INDEX` objects |
-| `CREATE TYPE ... AS ENUM` / `ALTER TYPE ... ADD VALUE` | `TYPE` objects; other `typtype` values stay `OTHER` |
+| `CREATE TYPE ... AS ENUM` / `ALTER TYPE ... ADD VALUE` / `CREATE TYPE ... AS (<attrs>)` / `CREATE TYPE ... AS RANGE` | `TYPE` objects; base types stay `OTHER`, and a range's generated multirange, constructor routines and casts fold into the range |
 | `CREATE DOMAIN` / `ALTER DOMAIN` | `DOMAIN` objects incl. base type, `NOT NULL`, `DEFAULT`, `CHECK` constraints |
 | `CREATE POLICY` / `ALTER POLICY` / `DROP POLICY`, `ALTER TABLE ... ENABLE|DISABLE ROW LEVEL SECURITY` | `POLICY` objects; `relrowsecurity` is part of the `TABLE` canonical definition |
 | `CREATE EXTENSION` | `EXTENSION` objects, presence-only; member objects stay excluded; `ALTER EXTENSION` is rejected (version upgrades out of scope) |
-| `COMMENT ON` | `COMMENT` objects on managed targets (`TABLE`, `COLUMN`, `VIEW`, `MATERIALIZED_VIEW`, `SEQUENCE`, `INDEX`, constraint kinds, `ROUTINE`, `TRIGGER`, `TYPE`, `DOMAIN`, `POLICY`); on any other target it is detected as `OTHER` — see below. `COMMENT ON EXTENSION` stays rejected: an extension's shipped description is database-wide metadata anchored to the extension row, which already reports |
+| `COMMENT ON` | `COMMENT` objects on managed targets (`TABLE`, `COLUMN`, `VIEW`, `MATERIALIZED_VIEW`, `SEQUENCE`, `INDEX`, constraint kinds, `ROUTINE`, `TRIGGER`, `TYPE`, `DOMAIN`, `POLICY`, `STATISTICS`, `RULE`, `COLLATION`, `CONVERSION`, `SECURITY_LABEL`); on any other target it is detected as `OTHER` — see below. `COMMENT ON EXTENSION` stays rejected: an extension's shipped description is database-wide metadata anchored to the extension row, which already reports |
 | `CREATE SEQUENCE` / `ALTER SEQUENCE` | `SEQUENCE` objects; serial-owned and identity sequences folded per A.5 |
 | `CREATE FUNCTION` / `CREATE PROCEDURE` | `ROUTINE` objects (`prokind` `f`, `p`) |
 | `CREATE TRIGGER` | `TRIGGER` objects incl. `tgenabled` state; constraint triggers are excluded by `tgisinternal` |
-| `GRANT`/`REVOKE`, `ALTER ... OWNER TO`, `SECURITY LABEL` | attributes are detected — see below |
+| `CREATE STATISTICS` | `STATISTICS` objects (`pg_statistic_ext`), incl. expression statistics |
+| `CREATE RULE` | `RULE` objects (`pg_rewrite`, excluding `_RETURN` — part of its view), incl. `ev_enabled` state |
+| `CREATE COLLATION` | `COLLATION` objects (`pg_collation` provider `libc`/`icu`, encoding `-1` or the database's; `collversion` excluded) |
+| `CREATE CONVERSION` | `CONVERSION` objects (`pg_conversion`, `condefault` false) |
+| `SECURITY LABEL` | `SECURITY_LABEL` objects (`pg_seclabel`) on managed targets; labels on unmanaged targets stay `OTHER`. No TCK scenario exists: a `SECURITY LABEL` statement fails unless the named provider module is loaded, and none ships with a stock server — coverage is the catalog-fixture test in `AppendixCoverageTest` |
+| `GRANT`/`REVOKE` on a managed target (`TABLE`, `VIEW`, `MATERIALIZED_VIEW`, `SEQUENCE`, `FOREIGN TABLE`, `ROUTINE`, `TYPE`, `DOMAIN`), including a column list (`GRANT SELECT (c) ON t`) | `PRIVILEGES` objects mirroring the target — a column grant mirrors the column; the acl token diff renders `GRANT`/`REVOKE` (the column name parenthesized after the privilege word for column grants), a grant-option-only difference `REVOKE GRANT OPTION FOR`. `GRANT ... ON ALL ... IN SCHEMA` expands to per-target acls and stays legal; `GRANT ... ON SCHEMA` is rejected (the namespace itself is not a snapshot object), and grants on unmanaged targets stay `OTHER` |
+| `ALTER DEFAULT PRIVILEGES [FOR ROLE r] IN SCHEMA s GRANT`/`REVOKE` | `DEFAULT_PRIVILEGES` objects per (`defaclobjtype`, `defaclrole`); the acl token diff renders `ALTER DEFAULT PRIVILEGES FOR ROLE "r" IN SCHEMA <ns> GRANT`/`REVOKE` on the class word (`TABLES`/`SEQUENCES`/`FUNCTIONS`/`TYPES`). A global default privilege (no `IN SCHEMA`) is database-wide and rejected |
+| `ALTER ... OWNER TO` | `OWNERSHIP` objects on managed targets; ownership of unmanaged targets stays `OTHER` — see below |
+| `CREATE CAST` | `CAST` objects when a namespace source/target type or the cast function is managed; a cast anchored only to unmanaged objects stays `OTHER`, and one with no namespace anchor is invisible to the model |
+| `CREATE TRANSFORM` | `TRANSFORM` objects when the `FOR` type is managed; the language is a cluster-object reference (4.1). Anchored to an unmanaged type it stays `OTHER`; `CREATE LANGUAGE` itself is rejected — a language is cluster-level |
 | `CREATE SCHEMA` | rejected: the core owns the namespace (3.2) |
 
 ### Detected but unsupported (`OTHER` → `UNSUPPORTED` per 5.4)
 
-`EXCLUDE` constraints, `CREATE TYPE` for non-enum types (range/multirange/base/composite — composites stay `OTHER` because their `relkind` `c` rowtype collides with the relation namespace), `CREATE FOREIGN TABLE`, `IMPORT FOREIGN SCHEMA`, partitioned tables and indexes, classic-inheritance children, `CREATE AGGREGATE`, window functions, `CREATE RULE`, `CREATE STATISTICS`, `CREATE COLLATION`, `CREATE CONVERSION`, `CREATE TEXT SEARCH CONFIGURATION|DICTIONARY|PARSER|TEMPLATE`, `CREATE OPERATOR`, `CREATE OPERATOR CLASS`, `CREATE OPERATOR FAMILY`, `CREATE CAST` and `CREATE TRANSFORM` when anchored to a namespace object, `COMMENT ON` an unmanaged target, `SECURITY LABEL`, granted privileges, ownership reassignment, `FOR TABLE` publication bindings, `FOR TABLES IN SCHEMA` publication bindings (`pg_publication_namespace`, PostgreSQL 15+) and sequence publication bindings (`pg_publication_sequences`, PostgreSQL 19+). Publication bindings are observable on the target only: the script check rejects every `PUBLICATION` statement, so a script cannot create one.
+`CREATE TYPE` for base types (a multirange cannot be created standalone — it arrives with its range), indexes on partitioned tables (`relkind` `I` — auto-cloned per child, never standalone), classic-inheritance children, `CREATE DEFAULT CONVERSION`, `CREATE TEXT SEARCH CONFIGURATION|DICTIONARY|PARSER|TEMPLATE`, `CREATE OPERATOR`, `CREATE OPERATOR CLASS`, `CREATE OPERATOR FAMILY`, `CREATE CAST`/`CREATE TRANSFORM` anchored only to unmanaged objects, `COMMENT ON` an unmanaged target, `SECURITY LABEL`, granted privileges on an unmanaged target, ownership reassignment on an unmanaged target and `CREATE PUBLICATION` (the publication itself is a cluster-level object, 4.1 — only its `ALTER PUBLICATION` binding forms are namespace-anchored).
 
 ### Out of scope (cluster-level or statement-only, per 1.5/3.2)
 
-Objects with no namespace anchor — `CREATE DATABASE`*, `CREATE TABLESPACE`*, `CREATE SUBSCRIPTION`*, `CREATE PUBLICATION`, `CREATE EVENT TRIGGER`, `CREATE SERVER`, `CREATE FOREIGN DATA WRAPPER`, `CREATE USER MAPPING`, `CREATE ACCESS METHOD`, `CREATE LANGUAGE`, `CREATE ROLE|GROUP|USER`, default privileges, `REASSIGN OWNED`, `DROP OWNED`, `ALTER SYSTEM`*, `ALTER ... SET SCHEMA`, role-membership `GRANT`/`REVOKE` — and session/utility statements — transaction control*, `VACUUM`*, `CHECKPOINT`*, bare `CLUSTER`* (no table), `DISCARD`* (`DISCARD ALL` cannot run in a transaction; the other forms are session state), session-level advisory locks, `LOAD`*, bare and `CONCURRENTLY` `REPACK`*, `WAIT FOR LSN`. Large objects are created by function call, not by a statement, so the script check does not see them. Items marked `*` are rejected by the script check because they cannot run inside a transaction; the rest are rejected because their catalog rows have no namespace anchor and could never be detected (5.4), or — `WAIT FOR LSN` — because the statement manipulates session or replication state only. `LISTEN`/`NOTIFY`/`UNLISTEN`, `CLUSTER t`, `REPACK t`, `TRUNCATE`, `LOCK`, `ANALYZE`, `REFRESH MATERIALIZED VIEW` and foreign-table DML are transactional effects confined to the scratch connection and stay legal (3.2 rule 4). Casts and transforms anchored only to foreign objects have no anchor either and stay invisible; `DO`-block bodies are scanned only for `set_config` and session advisory locks (3.2 rule 2), so dynamic DDL issued from them is not scanned.
+Objects with no namespace anchor — `CREATE DATABASE`*, `CREATE TABLESPACE`*, `CREATE SUBSCRIPTION`*, `CREATE PUBLICATION`, `CREATE EVENT TRIGGER`, `CREATE SERVER`, `CREATE FOREIGN DATA WRAPPER`, `CREATE USER MAPPING`, `CREATE ACCESS METHOD`, `CREATE LANGUAGE`, `CREATE ROLE|GROUP|USER`, default privileges, `REASSIGN OWNED`, `DROP OWNED`, `ALTER SYSTEM`*, `ALTER ... SET SCHEMA`, role-membership `GRANT`/`REVOKE` — and session/utility statements — transaction control*, `VACUUM`*, `CHECKPOINT`*, bare `CLUSTER`* (no table), `DISCARD`* (`DISCARD ALL` cannot run in a transaction; the other forms are session state), session-level advisory locks, `LOAD`*, bare and `CONCURRENTLY` `REPACK`*, `WAIT FOR LSN`. Large objects are created by function call, not by a statement, so the script check does not see them. Items marked `*` are rejected by the script check because they cannot run inside a transaction; the rest are rejected because their catalog rows have no namespace anchor and could never be detected (5.4), or — `WAIT FOR LSN` — because the statement manipulates session or replication state only.
+
+A second rejected group is everything whose catalog effect the snapshot cannot represent (3.2 rule 4, fail closed): `GRANT`/`REVOKE`/`COMMENT`/`SECURITY LABEL ... ON SCHEMA` (the reconcile unit itself), `TABLESPACE` clauses including `REINDEX ... TABLESPACE`, typed tables (`CREATE|ALTER TABLE ... OF`, `NOT OF`), `CREATE TABLE ... USING` access methods, `CLUSTER ... USING` and `ALTER ... CLUSTER ON`/`SET WITHOUT CLUSTER` (index membership), `SET STATISTICS`, sequence and identity `RESTART`, `ALTER ... OWNER TO` on targets whose owner column is not modeled (`INDEX`, `COLLATION`, `CONVERSION`, `TEXT SEARCH`, `OPERATOR`, `STATISTICS` — an index's owner follows its table silently), `ALTER INDEX ... ATTACH PARTITION`, `ALTER TEXT SEARCH` and `ALTER OPERATOR` member mutations, `DEPENDS ON EXTENSION`, collation `REFRESH VERSION`, and `ALTER VIEW ... SET|DROP DEFAULT` (view column defaults are not loaded). `LISTEN`/`NOTIFY`/`UNLISTEN`, `CLUSTER t`, `REPACK t`, `TRUNCATE`, `LOCK`, `ANALYZE`, `REFRESH MATERIALIZED VIEW` and foreign-table DML are transactional effects confined to the scratch connection and stay legal (3.2 rule 4). Casts and transforms anchored only to foreign objects have no anchor either and stay invisible; `DO`-block bodies are scanned only for `set_config` and session advisory locks (3.2 rule 2), so dynamic DDL issued from them is not scanned.
 
 ### Test corpus
 

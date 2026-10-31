@@ -2,8 +2,6 @@ SELECT pg_advisory_lock(hashtext('w001.w545-w546.schema'));
 
 CREATE SCHEMA IF NOT EXISTS fixture;
 
-GRANT USAGE ON SCHEMA fixture TO w547;
-
 CREATE OR REPLACE FUNCTION fixture.w548(t text) RETURNS timestamptz
     LANGUAGE sql IMMUTABLE PARALLEL SAFE AS 'SELECT t::timestamptz';
 

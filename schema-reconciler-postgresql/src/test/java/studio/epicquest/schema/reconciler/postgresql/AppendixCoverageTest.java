@@ -26,47 +26,32 @@ class AppendixCoverageTest {
     /** {setup SQL (run in the schema, search_path bound), expected OTHER name prefix}.
      *  A third element {@code "super"} marks cases that need a superuser. */
     private static final String[][] CASES = {
-        {"CREATE TABLE t (id int, CONSTRAINT t_ex EXCLUDE (id WITH =))", "constraint:"},
-        {"CREATE TYPE rng AS RANGE (subtype = int)", "type:"},
-        {"CREATE TYPE comp AS (a int, b text)", "composite:"},
-        {"CREATE TABLE pt (id int) PARTITION BY RANGE (id)", "partition:"},
-        {"CREATE TABLE ptp (id int) PARTITION BY RANGE (id);"
-                + " CREATE TABLE pch PARTITION OF ptp FOR VALUES FROM (0) TO (100)",
-                "partition:pch"},
         {"CREATE TABLE pt2 (k int) PARTITION BY RANGE (k); CREATE INDEX pix ON pt2 (k)", "partindex:"},
         {"CREATE TABLE parent (id int); CREATE TABLE child () INHERITS (parent)", "inherited:"},
-        {"CREATE AGGREGATE mysum (int) (sfunc = int4pl, stype = int, initcond = '0')", "routine:"},
-        {"CREATE TABLE r (id int); CREATE RULE rl AS ON INSERT TO r DO ALSO NOTHING", "rule:"},
-        {"CREATE TABLE s (a int, b int); CREATE STATISTICS st ON a, b FROM s", "statistics:"},
-        {"CREATE COLLATION coll (provider = libc, locale = 'C')", "collation:"},
-        {"CREATE CONVERSION conv FOR 'LATIN1' TO 'UTF8' FROM iso8859_1_to_utf8", "conversion:"},
-        {"CREATE TEXT SEARCH DICTIONARY d (template = simple)", "fts-dict:"},
-        {"CREATE TEXT SEARCH CONFIGURATION c (copy = simple)", "fts-config:"},
-        {"CREATE OPERATOR === (leftarg = int, rightarg = int, function = int4eq)", "operator:"},
-        {"CREATE OPERATOR FAMILY fam USING btree", "opfamily:"},
-        {"CREATE COLLATION cc (provider = libc, locale = 'C'); COMMENT ON COLLATION cc IS 'x'",
-                "comment:"},
-        {"CREATE TABLE g (id int); GRANT SELECT ON g TO PUBLIC", "privileges:"},
-        {"CREATE FOREIGN DATA WRAPPER fdw_cov; CREATE SERVER srv_cov FOREIGN DATA WRAPPER fdw_cov;"
-                + " CREATE FOREIGN TABLE ft (a int) SERVER srv_cov", "foreign:"},
-        {"CREATE TYPE ce AS ENUM ('a'); CREATE CAST (ce AS int4) WITH INOUT", "cast:"},
-        {"CREATE ROLE role_cov_owner; CREATE TABLE ow (id int);"
-                + " ALTER TABLE ow OWNER TO role_cov_owner", "ownership:"},
-        {"CREATE TABLE pb (id int); CREATE PUBLICATION pub_cov FOR TABLE pb", "publication:"},
-        {"CREATE TEXT SEARCH PARSER prs (START = prsd_start, GETTOKEN = prsd_nexttoken,"
-                + " END = prsd_end, LEXTYPES = prsd_lextype)", "fts-parser:"},
-        {"CREATE TEXT SEARCH TEMPLATE tmpl (INIT = dsimple_init, LEXIZE = dsimple_lexize)",
-                "fts-template:"},
+        {"CREATE DEFAULT CONVERSION conv FOR 'LATIN1' TO 'UTF8' FROM iso8859_1_to_utf8",
+                "conversion:"},
+        {"CREATE TABLE cmtp (id int); CREATE TABLE cmtc () INHERITS (cmtp);"
+                + " COMMENT ON TABLE cmtc IS 'x'", "comment:"},
+        {"CREATE TABLE gp (id int); CREATE TABLE gc () INHERITS (gp);"
+                + " GRANT SELECT ON gc TO PUBLIC", "privileges:"},
+        // a cast needs an in-namespace anchor that is not managed — the
+        // rowtypes of an inheritance pair are the last unmanaged anchor:
+        // an inout cast between them stays cast: OTHER
+        {"CREATE TABLE cast_p (a int); CREATE TABLE cast_c () INHERITS (cast_p);"
+                + " CREATE CAST (cast_c AS cast_p) WITH INOUT", "cast:"},
+        {"CREATE ROLE role_cov_owner; CREATE TABLE ow_p (id int);"
+                + " CREATE TABLE ow_c () INHERITS (ow_p);"
+                + " ALTER TABLE ow_c OWNER TO role_cov_owner", "ownership:"},
         // superuser-only: a stand-in transform function, and a catalog row in place of a
         // security-label provider module (none ships with a stock server)
         {"CREATE FUNCTION tfrom(internal) RETURNS internal LANGUAGE internal IMMUTABLE AS 'textin';"
                 + " CREATE TRANSFORM FOR int4 LANGUAGE plpgsql (FROM SQL WITH FUNCTION tfrom(internal))",
                 "transform:", "super"},
-        {"CREATE TABLE lt (id int); INSERT INTO pg_seclabel (objoid, classoid, objsubid, provider, label)"
-                + " VALUES ('lt'::regclass::oid, 'pg_class'::regclass::oid, 0, 'dummy', 'x')",
+        {"CREATE TABLE lp (id int); CREATE TABLE lc () INHERITS (lp);"
+                + " INSERT INTO pg_seclabel (objoid, classoid, objsubid, provider, label)"
+                + " VALUES ((SELECT oid FROM pg_class WHERE relname = 'lc'),"
+                + " 'pg_class'::regclass::oid, 0, 'dummy', 'x')",
                 "seclabel:", "super"},
-        {"CREATE OPERATOR CLASS oc FOR TYPE int4 USING hash AS OPERATOR 1 =,"
-                + " FUNCTION 1 hashint4(int4)", "opclass:"},
     };
 
     private static boolean superuser(java.sql.Statement s) throws SQLException {
@@ -102,6 +87,43 @@ class AppendixCoverageTest {
                 } finally {
                     c.rollback();
                 }
+            }
+        }
+    }
+
+    @Test
+    void labelOnManagedTargetIsManaged() throws Exception {
+        // superuser-only: a catalog row stands in for a security-label
+        // provider module — none ships with a stock server
+        final var ds = PgTestDatabase.dataSource();
+        final var schema = "cov_" + Long.toHexString(System.nanoTime())
+                + "_" + SEQUENCE.incrementAndGet();
+        final var quoted = dialect.quoteIdentifier(schema);
+        try (var c = ds.getConnection(); var s = c.createStatement()) {
+            c.setAutoCommit(false);
+            org.junit.jupiter.api.Assumptions.assumeTrue(superuser(s));
+            try {
+                s.execute("CREATE SCHEMA " + quoted);
+                s.execute("SET LOCAL search_path = " + quoted);
+                s.execute("CREATE TABLE lt (id int)");
+                s.execute("INSERT INTO pg_seclabel (objoid, classoid, objsubid, provider, label)"
+                        + " VALUES ('lt'::regclass::oid, 'pg_class'::regclass::oid, 0,"
+                        + " 'dummy', 'x')");
+                final var snapshot = dialect.readSnapshot(c, schema);
+                final var label = snapshot.objects().entrySet().stream()
+                        .filter(e -> e.getKey().kind() == ObjectKind.SECURITY_LABEL)
+                        .findFirst().orElseThrow(() -> new AssertionError(
+                                "no SECURITY_LABEL in " + snapshot.objects().keySet()));
+                assertTrue(label.getKey().name().equals("dummy:lt"),
+                        "expected dummy:lt, got " + label.getKey().name());
+                assertTrue(label.getValue().definition().canonical().equals("x"),
+                        "expected canonical label text 'x'");
+                assertTrue(label.getValue().dependsOn().stream()
+                                .anyMatch(d -> d.kind() == ObjectKind.TABLE
+                                        && d.name().equals("lt")),
+                        "expected a dependency on TABLE lt");
+            } finally {
+                c.rollback();
             }
         }
     }

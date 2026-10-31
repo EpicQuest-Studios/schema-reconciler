@@ -190,8 +190,8 @@ public final class FakeDialect implements Dialect {
 
     /** OTHER categories whose stripped names occupy the relation namespace (mirrors PgRender). */
     private static final Set<String> RELATION_NAMESPACE_OTHERS = Set.of(
-            "inherited", "foreign", "partition", "partindex",
-            "composite", "toast", "relation", "type");
+            "inherited", "partindex",
+            "toast", "relation", "type");
 
     @Override
     public Set<String> nameScopes(ObjectId id) {
@@ -215,16 +215,22 @@ public final class FakeDialect implements Dialect {
                 }
                 yield Set.of("relation:" + name);
             }
-            case TABLE, VIEW, SEQUENCE, INDEX, MATERIALIZED_VIEW, TYPE, DOMAIN ->
+            case TABLE, VIEW, SEQUENCE, INDEX, MATERIALIZED_VIEW, TYPE, DOMAIN,
+                    PARTITION, FOREIGN_TABLE ->
                     Set.of("relation:" + id.name());
-            case PRIMARY_KEY, UNIQUE -> Set.of(
+            case PRIMARY_KEY, UNIQUE, EXCLUSION -> Set.of(
                     "constraint:" + id.parent().orElse("") + "." + id.name(),
                     "relation:" + id.name());
             case FOREIGN_KEY, CHECK -> Set.of("constraint:" + id.parent().orElse("") + "." + id.name());
             case COLUMN -> Set.of("column:" + id.parent().orElse("") + "." + id.name());
             case TRIGGER -> Set.of("trigger:" + id.parent().orElse("") + "." + id.name());
-            case ROUTINE -> Set.of("routine:" + id.name());
-            case POLICY, EXTENSION, COMMENT -> Set.of();
+            case ROUTINE, AGGREGATE -> Set.of("routine:" + id.name());
+            case POLICY, EXTENSION, COMMENT, STATISTICS, RULE, COLLATION,
+                    CONVERSION, SECURITY_LABEL, PUBLICATION, OWNERSHIP,
+                    PRIVILEGES, DEFAULT_PRIVILEGES, CAST, TRANSFORM,
+                    TEXT_SEARCH_TEMPLATE, TEXT_SEARCH_PARSER,
+                    TEXT_SEARCH_DICTIONARY, TEXT_SEARCH_CONFIGURATION,
+                    OPERATOR, OPERATOR_CLASS, OPERATOR_FAMILY -> Set.of();
         };
     }
 

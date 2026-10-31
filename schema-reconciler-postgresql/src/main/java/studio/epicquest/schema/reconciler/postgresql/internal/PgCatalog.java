@@ -54,6 +54,19 @@ public final class PgCatalog {
     public static final String TABLE_OPTIONS = "tableOptions";
     /** The {@code relreplident} letter of a table. */
     public static final String REPLIDENT = "replident";
+    public static final String PARTKEY = "partkey";
+    /** The {@code <KEYWORD> ${namespace}.<name>} phrase of a {@code GRANT|REVOKE ... ON} target. */
+    public static final String GRANT_TARGET = "grantTarget";
+    /** The quoted column name of a column-level grant, parenthesized after
+     *  the privilege word ({@code GRANT SELECT ("c") ON TABLE t}). */
+    public static final String GRANT_COLUMN = "grantColumn";
+    /** A statement prefix ahead of the GRANT/REVOKE verb — the
+     *  {@code ALTER DEFAULT PRIVILEGES FOR ROLE "r" IN SCHEMA ${namespace}}
+     *  clause of a scoped default-privileges object. */
+    public static final String GRANT_PREFIX = "grantPrefix";
+    /** Foreign server name and rendered OPTIONS fragment of a FOREIGN_TABLE (A.5). */
+    public static final String FT_SERVER = "ftServer";
+    public static final String FT_OPTIONS = "ftOptions";
     /** Whether a materialized view currently holds its result rows. */
     public static final String POPULATED = "populated";
     /**
@@ -72,6 +85,7 @@ public final class PgCatalog {
         final var data = new Data(namespace);
         data.serverMajor = conn.getMetaData().getDatabaseMajorVersion();
         data.loadExtensionOwned(conn);
+        data.loadAutoTypeFamily(conn);
         data.loadRelations(conn);
         data.loadColumns(conn);
         data.loadConstraints(conn);
@@ -79,10 +93,20 @@ public final class PgCatalog {
         data.loadViews(conn);
         data.loadSequences(conn);
         data.loadRoutines(conn);
+        data.loadAggregates(conn);
         data.loadTriggers(conn);
         data.loadEnums(conn);
         data.loadDomains(conn);
+        data.loadComposites(conn);
+        data.loadRanges(conn);
         data.loadPolicies(conn);
+        data.loadStatistics(conn);
+        data.loadRules(conn);
+        data.loadCollations(conn);
+        data.loadConversions(conn);
+        data.loadTextSearch(conn);
+        data.loadOperators(conn);
+        data.loadSecLabels(conn);
         data.loadOther(conn);
         data.loadComments(conn);
         data.loadDependencies(conn);
@@ -106,8 +130,18 @@ public final class PgCatalog {
         private final Map<Long, ObjectId> typeByOid = new HashMap<>();
         private final Map<Long, ObjectId> polByOid = new HashMap<>();
         private final Map<Long, ObjectId> tgByOid = new HashMap<>();
+        private final Map<Long, ObjectId> stxByOid = new HashMap<>();
+        private final Map<Long, ObjectId> ruleByOid = new HashMap<>();
+        private final Map<Long, ObjectId> convByOid = new HashMap<>();
         private final Map<Long, ObjectId> collByOid = new HashMap<>();
         private final Map<Long, ObjectId> langByOid = new HashMap<>();
+        private final Map<Long, ObjectId> tmplByOid = new HashMap<>();
+        private final Map<Long, ObjectId> prsByOid = new HashMap<>();
+        private final Map<Long, ObjectId> dictByOid = new HashMap<>();
+        private final Map<Long, ObjectId> cfgByOid = new HashMap<>();
+        private final Map<Long, ObjectId> oprByOid = new HashMap<>();
+        private final Map<Long, ObjectId> opcByOid = new HashMap<>();
+        private final Map<Long, ObjectId> opfByOid = new HashMap<>();
         /** Catalog-row oid -> the OTHER object it loaded as, per classid, so
          *  an unsupported object that depends on a managed one still records
          *  the edge and blocks an unrecreatable drop (5.8.3). */
@@ -117,6 +151,17 @@ public final class PgCatalog {
          *  objects cannot be created or dropped standalone, so they never
          *  enter the model; the extension itself is reported as OTHER. */
         private final Set<Long> extOwned = new HashSet<>();
+        /** A range type's generated members (its multirange and the
+         *  constructor routines and {@code range→multirange} cast recorded
+         *  with {@code deptype 'i'}) fold into the range like a table's
+         *  rowtype — they are never objects, their oids remap to the
+         *  {@code TYPE} id so dependents still order after the range. */
+        private final Map<Long, Long> autoProcs = new HashMap<>();
+        private final Map<Long, Long> autoCasts = new HashMap<>();
+        /** Oids that must never resolve to an annotation/acl target: a
+         *  comment or grant on a folded member has no renderable target
+         *  (GRANT on a multirange is even rejected by the server). */
+        private final Set<Long> foldedMembers = new HashSet<>();
 
         Data(String ns) {
             this.ns = ns;
@@ -154,6 +199,27 @@ public final class PgCatalog {
             }
             if (to == null) {
                 to = langByOid.get(oid);
+            }
+            if (to == null) {
+                to = tmplByOid.get(oid);
+            }
+            if (to == null) {
+                to = prsByOid.get(oid);
+            }
+            if (to == null) {
+                to = dictByOid.get(oid);
+            }
+            if (to == null) {
+                to = cfgByOid.get(oid);
+            }
+            if (to == null) {
+                to = oprByOid.get(oid);
+            }
+            if (to == null) {
+                to = opcByOid.get(oid);
+            }
+            if (to == null) {
+                to = opfByOid.get(oid);
             }
             return to;
         }
@@ -207,17 +273,102 @@ public final class PgCatalog {
             }
         }
 
+        /**
+         * A range type's generated family: the {@code typtype 'm'}
+         * multirange, the constructor routines and the
+         * {@code range→multirange} cast, all internally bound to the range
+         * ({@code pg_depend deptype 'i'}). They fold into the managed
+         * {@code TYPE} like a table's rowtype — never objects of their own;
+         * their oids remap to the range so dependents and annotations on
+         * the family still resolve. Runs before every other type and
+         * routine loader so the oid maps are populated early.
+         */
+        void loadAutoTypeFamily(Connection conn) throws SQLException {
+            try (PreparedStatement ps = conn.prepareStatement("""
+                    SELECT t.oid, t.typname, r.rngmultitypid
+                    FROM pg_range r
+                    JOIN pg_type t ON t.oid = r.rngtypid
+                    JOIN pg_namespace n ON n.oid = t.typnamespace
+                    WHERE n.nspname = ?
+                    """)) {
+                ps.setString(1, ns);
+                try (ResultSet rs = ps.executeQuery()) {
+                    while (rs.next()) {
+                        final var oid = rs.getLong("oid");
+                        if (extMember(oid)) {
+                            continue;
+                        }
+                        final var id = new ObjectId(ObjectKind.TYPE,
+                                rs.getString("typname"));
+                        typeByOid.put(oid, id);
+                        final var mr = rs.getLong("rngmultitypid");
+                        typeByOid.put(mr, id);
+                        foldedMembers.add(mr);
+                    }
+                }
+            }
+            try (PreparedStatement ps = conn.prepareStatement("""
+                    SELECT d.objid, coalesce(rg.rngtypid, d.refobjid) AS rng
+                    FROM pg_depend d
+                    JOIN pg_type t ON t.oid = d.refobjid
+                    JOIN pg_namespace n ON n.oid = t.typnamespace
+                    LEFT JOIN pg_range rg ON rg.rngmultitypid = d.refobjid
+                    WHERE n.nspname = ? AND t.typtype IN ('r','m')
+                      AND d.classid = 'pg_proc'::regclass
+                      AND d.refclassid = 'pg_type'::regclass
+                      AND d.deptype = 'i'
+                    """)) {
+                ps.setString(1, ns);
+                try (ResultSet rs = ps.executeQuery()) {
+                    while (rs.next()) {
+                        autoProcs.put(rs.getLong("objid"), rs.getLong("rng"));
+                        foldedMembers.add(rs.getLong("objid"));
+                    }
+                }
+            }
+            try (PreparedStatement ps = conn.prepareStatement("""
+                    SELECT d.objid, coalesce(rg.rngtypid, d.refobjid) AS rng
+                    FROM pg_depend d
+                    JOIN pg_type t ON t.oid = d.refobjid
+                    JOIN pg_namespace n ON n.oid = t.typnamespace
+                    LEFT JOIN pg_range rg ON rg.rngmultitypid = d.refobjid
+                    WHERE n.nspname = ? AND t.typtype IN ('r','m')
+                      AND d.classid = 'pg_cast'::regclass
+                      AND d.refclassid = 'pg_type'::regclass
+                      AND d.deptype = 'i'
+                    """)) {
+                ps.setString(1, ns);
+                try (ResultSet rs = ps.executeQuery()) {
+                    while (rs.next()) {
+                        autoCasts.put(rs.getLong("objid"), rs.getLong("rng"));
+                        foldedMembers.add(rs.getLong("objid"));
+                    }
+                }
+            }
+        }
+
         void loadRelations(Connection conn) throws SQLException {
             try (PreparedStatement ps = conn.prepareStatement("""
                     SELECT c.oid, c.relname, c.relkind, c.relpersistence,
                            c.reloptions::text AS options, c.relreplident,
                            c.relrowsecurity, c.relforcerowsecurity,
+                           pg_get_partkeydef(c.oid) AS partkey,
+                           pg_get_expr(c.relpartbound, c.oid) AS partbound,
+                           (SELECT p.relname FROM pg_inherits i
+                              JOIN pg_class p ON p.oid = i.inhparent
+                             WHERE i.inhrelid = c.oid AND p.relkind = 'p'
+                             LIMIT 1) AS pparent,
                            (SELECT string_agg(p.relkind, '') FROM pg_inherits i
                               JOIN pg_class p ON p.oid = i.inhparent
                              WHERE i.inhrelid = c.oid) AS parentkinds,
                            (SELECT ic.relname FROM pg_index ix JOIN pg_class ic ON ic.oid = ix.indexrelid
-                             WHERE ix.indrelid = c.oid AND ix.indisreplident) AS replindex
+                             WHERE ix.indrelid = c.oid AND ix.indisreplident) AS replindex,
+                           (SELECT t.oid FROM pg_type t
+                             WHERE t.typrelid = c.oid) AS typeoid,
+                           s.srvname AS ftserver, f.ftoptions::text AS ftoptions
                     FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+                    LEFT JOIN pg_foreign_table f ON f.ftrelid = c.oid
+                    LEFT JOIN pg_foreign_server s ON s.oid = f.ftserver
                     WHERE n.nspname = ? AND c.relkind IN ('r','v','m','f','p','c','t','I','S')
                     ORDER BY c.oid
                     """)) {
@@ -235,42 +386,99 @@ public final class PgCatalog {
                         final var parentkinds = nullToEmpty(rs.getString("parentkinds"));
                         final var inherited = !parentkinds.isEmpty();
                         // a plain table whose parents are also plain tables is a
-                        // classic-inheritance child; a partition child has a
-                        // partitioned ('p') parent. Neither is faithfully
-                        // creatable as a standalone TABLE, so both are OTHER —
-                        // but under distinct prefixes, so tolerating classic
-                        // inheritance cannot exempt partition children (3.3).
+                        // classic-inheritance child — not faithfully creatable
+                        // as a standalone TABLE, so it stays OTHER. A partition
+                        // child ('r' under a 'p' parent) is managed as PARTITION
+                        // parented on the partitioned table; the 'p' parent
+                        // itself is a TABLE whose canonical carries the key.
                         final var id = switch (kind) {
                             case "r" -> !inherited ? new ObjectId(ObjectKind.TABLE, name)
-                                    : new ObjectId(ObjectKind.OTHER,
-                                            (parentkinds.contains("p")
-                                                    ? "partition:" : "inherited:") + name);
+                                    : parentkinds.contains("p")
+                                            ? new ObjectId(ObjectKind.PARTITION, name,
+                                                    rs.getString("pparent"))
+                                            : new ObjectId(ObjectKind.OTHER,
+                                                    "inherited:" + name);
                             case "v" -> new ObjectId(ObjectKind.VIEW, name);
                             case "S" -> new ObjectId(ObjectKind.SEQUENCE, name);
                             // managed: canonical definition lands in loadViews
                             case "m" -> new ObjectId(ObjectKind.MATERIALIZED_VIEW, name);
+                            case "p" -> new ObjectId(ObjectKind.TABLE, name);
+                            case "f" -> new ObjectId(ObjectKind.FOREIGN_TABLE, name);
                             // a documented category prefix per relkind (3.3):
                             // tolerating one non-managed relation kind must
                             // not exempt the others
-                            case "f" -> new ObjectId(ObjectKind.OTHER, "foreign:" + name);
-                            case "p" -> new ObjectId(ObjectKind.OTHER, "partition:" + name);
                             case "I" -> new ObjectId(ObjectKind.OTHER, "partindex:" + name);
-                            case "c" -> new ObjectId(ObjectKind.OTHER, "composite:" + name);
+                            // a standalone composite's 'c' row is the type's
+                            // backing — the managed TYPE object claims it in
+                            // loadComposites
+                            case "c" -> null;
                             case "t" -> new ObjectId(ObjectKind.OTHER, "toast:" + name);
                             default -> new ObjectId(ObjectKind.OTHER, "relation:" + name);
                         };
+                        if (id == null) {
+                            continue;
+                        }
                         relByOid.put(oid, id);
+                        // the companion composite rowtype — a column typed as
+                        // the relation resolves the pg_type oid, so it maps to
+                        // the same object (OTHER rowtypes included: an
+                        // inherited child's rowtype is equally unsupported)
+                        final var typeoid = rs.getLong("typeoid");
+                        if (typeoid != 0) {
+                            typeByOid.putIfAbsent(typeoid, id);
+                            if (id.kind() == ObjectKind.OTHER) {
+                                otherOid("pg_type", typeoid, id);
+                            }
+                        }
                         if (id.kind() == ObjectKind.TABLE) {
                             final var replident = rs.getString("relreplident");
                             final var replindex = rs.getString("replindex");
-                            define(id, "relkind=r;relpersistence=" + persistence
+                            final var partkey = rs.getString("partkey");
+                            final var attrs = new LinkedHashMap<String, String>();
+                            attrs.put(TABLE_OPTIONS, String.join(", ", options));
+                            attrs.put(REPLIDENT, replident);
+                            if (partkey != null) {
+                                attrs.put(PARTKEY, partkey);
+                            }
+                            define(id, "relkind=" + kind + ";relpersistence=" + persistence
                                     + ";options=" + options
                                     + ";replident=" + replident
                                     + (replindex != null ? ";replindex=" + replindex : "")
                                     + ";rls=" + rs.getBoolean("relrowsecurity")
-                                    + ";forcerls=" + rs.getBoolean("relforcerowsecurity"),
-                                    Map.of(TABLE_OPTIONS, String.join(", ", options),
-                                            REPLIDENT, replident));
+                                    + ";forcerls=" + rs.getBoolean("relforcerowsecurity")
+                                    + (partkey != null ? ";partkey=" + partkey : ""),
+                                    attrs);
+                        } else if (id.kind() == ObjectKind.PARTITION) {
+                            final var bound = rs.getString("partbound");
+                            final var qName = tableRef(name);
+                            define(id, "bound=" + bound,
+                                    Map.of(
+                                            CREATE_SQL, "CREATE TABLE " + qName
+                                                    + " PARTITION OF "
+                                                    + tableRef(id.parent().get())
+                                                    + " " + bound,
+                                            DROP_SQL, "DROP TABLE " + qName));
+                        } else if (id.kind() == ObjectKind.FOREIGN_TABLE) {
+                            // the server name is a cluster object reference
+                            // (4.1): it lives inside the canonical so drift on
+                            // it reconciles the table, never the server
+                            final var server = rs.getString("ftserver");
+                            final var ftoptions = reloptions(rs.getString("ftoptions"));
+                            final var optionSql = ftoptions.stream()
+                                    .map(o -> {
+                                        final var eq = o.indexOf('=');
+                                        return o.substring(0, eq) + " "
+                                                + sqlLiteral(o.substring(eq + 1));
+                                    })
+                                    .collect(Collectors.joining(", "));
+                            final var attrs = new LinkedHashMap<String, String>();
+                            attrs.put(FT_SERVER, server);
+                            attrs.put(FT_OPTIONS, optionSql);
+                            attrs.put(DROP_SQL, "DROP FOREIGN TABLE " + tableRef(name));
+                            define(id, "server=" + server
+                                    + ";ftoptions=" + String.join(", ", ftoptions)
+                                    + ";options=" + options,
+                                    attrs);
                         } else if (id.kind() == ObjectKind.OTHER) {
                             define(id, "relkind=" + kind + (inherited ? ";inherited" : ""),
                                     Map.of());
@@ -296,7 +504,7 @@ public final class PgCatalog {
                            ids.seqincrement, ids.seqmin, ids.seqmax,
                            ids.seqstart, ids.seqcache, ids.seqcycle
                     FROM pg_attribute a
-                    JOIN pg_class c ON c.oid = a.attrelid AND c.relkind = 'r'
+                    JOIN pg_class c ON c.oid = a.attrelid AND c.relkind IN ('r', 'p', 'f')
                     JOIN pg_namespace n ON n.oid = c.relnamespace
                     JOIN pg_type t ON t.oid = a.atttypid
                     LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum
@@ -445,12 +653,12 @@ public final class PgCatalog {
                             case "u" -> ObjectKind.UNIQUE;
                             case "f" -> ObjectKind.FOREIGN_KEY;
                             case "c" -> ObjectKind.CHECK;
+                            case "x" -> ObjectKind.EXCLUSION;
                             default -> ObjectKind.OTHER;
                         };
                         final var name = rs.getString("conname");
                         final var parent = rs.getString("parent");
                         final var def = rs.getString("def");
-                        // exclusion constraints are OTHER: unsupported but detected
                         final var id = kind == ObjectKind.OTHER
                                 ? new ObjectId(kind, "constraint:" + parent + "." + name)
                                 : new ObjectId(kind, name, parent);
@@ -692,13 +900,21 @@ public final class PgCatalog {
                                || format_type(p.prorettype, NULL) AS rettype,
                            pg_get_functiondef(p.oid) AS def
                     FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
-                    WHERE n.nspname = ? AND p.prokind IN ('f','p')
+                    WHERE n.nspname = ? AND p.prokind IN ('f','p','w')
                     ORDER BY p.oid
                     """)) {
                 ps.setString(1, ns);
                 try (ResultSet rs = ps.executeQuery()) {
                     while (rs.next()) {
-                        if (extMember(rs.getLong("oid"))) {
+                        final var oid = rs.getLong("oid");
+                        if (extMember(oid)) {
+                            continue;
+                        }
+                        if (autoProcs.containsKey(oid)) {
+                            // a range/multirange constructor folds into its
+                            // range type — dependents resolve its oid to the
+                            // TYPE object
+                            procByOid.put(oid, typeByOid.get(autoProcs.get(oid)));
                             continue;
                         }
                         final var proname = rs.getString("proname");
@@ -719,6 +935,139 @@ public final class PgCatalog {
                                 RETURN_TYPE, rettype));
                     }
                 }
+            }
+        }
+
+        /**
+         * Aggregates ({@code prokind 'a'}): {@code pg_get_functiondef}
+         * refuses them, so the canonical definition is composed from the
+         * {@code pg_aggregate} row — every option that can appear between
+         * the parentheses, in a fixed order, with {@code null}/default
+         * fields omitted. The same option list renders {@code CREATE
+         * AGGREGATE}; drift recreates ({@code DROP AGGREGATE} +
+         * {@code CREATE AGGREGATE}) because aggregates have no
+         * {@code CREATE OR REPLACE} form. Ordered-set and hypothetical-set
+         * aggregates ride the same path — {@code ORDER BY} inside the
+         * signature and the {@code HYPOTHETICAL} flag carry their
+         * difference. Window functions ({@code 'w'}) stay {@code OTHER}.
+         */
+        void loadAggregates(Connection conn) throws SQLException {
+            try (PreparedStatement ps = conn.prepareStatement("""
+                    SELECT p.oid, p.proname,
+                           pg_get_function_identity_arguments(p.oid) AS idargs,
+                           pg_get_function_arguments(p.oid) AS args,
+                           a.aggkind,
+                           a.aggtransfn::regprocedure::text AS sfunc,
+                           CASE WHEN a.aggtranstype = 0 THEN 'internal'
+                                ELSE format_type(a.aggtranstype, NULL) END AS stype,
+                           NULLIF(a.aggtransspace, 0) AS sspace,
+                           NULLIF(a.aggfinalfn::text, '-')::regprocedure::text AS ffunc,
+                           a.aggfinalextra, a.aggfinalmodify,
+                           NULLIF(a.aggcombinefn::text, '-')::regprocedure::text AS combine,
+                           NULLIF(a.aggserialfn::text, '-')::regprocedure::text AS serial,
+                           NULLIF(a.aggdeserialfn::text, '-')::regprocedure::text AS deserial,
+                           a.agginitval,
+                           NULLIF(a.aggmtransfn::text, '-')::regprocedure::text AS msfunc,
+                           NULLIF(a.aggminvtransfn::text, '-')::regprocedure::text AS minv,
+                           CASE WHEN a.aggmtransfn::text = '-' THEN NULL
+                                WHEN a.aggmtranstype = 0 THEN 'internal'
+                                ELSE format_type(a.aggmtranstype, NULL) END AS mstype,
+                           NULLIF(a.aggmtransspace, 0) AS msspace,
+                           NULLIF(a.aggmfinalfn::text, '-')::regprocedure::text AS mffunc,
+                           a.aggmfinalextra, a.aggmfinalmodify,
+                           a.aggminitval,
+                           NULLIF(a.aggsortop, 0)::regoperator::text AS sortop
+                    FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+                    JOIN pg_aggregate a ON a.aggfnoid = p.oid
+                    WHERE n.nspname = ? AND p.prokind = 'a'
+                    ORDER BY p.oid
+                    """)) {
+                ps.setString(1, ns);
+                try (ResultSet rs = ps.executeQuery()) {
+                    while (rs.next()) {
+                        final var oid = rs.getLong("oid");
+                        if (extMember(oid) || autoProcs.containsKey(oid)) {
+                            continue;
+                        }
+                        final var proname = rs.getString("proname");
+                        final var idargs = rs.getString("idargs");
+                        final var options = new ArrayList<String>();
+                        final var kind = rs.getString("aggkind");
+                        if ("h".equals(kind)) {
+                            options.add("HYPOTHETICAL");
+                        }
+                        options.add("SFUNC = " + rs.getString("sfunc"));
+                        options.add("STYPE = " + rs.getString("stype"));
+                        aggOpt(options, "SSPACE", rs.getString("sspace"));
+                        aggOpt(options, "FINALFUNC", rs.getString("ffunc"));
+                        if (rs.getBoolean("aggfinalextra")) {
+                            options.add("FINALFUNC_EXTRA");
+                        }
+                        aggModify(options, "FINALFUNC_MODIFY",
+                                rs.getString("aggfinalmodify"));
+                        aggOpt(options, "COMBINEFUNC", rs.getString("combine"));
+                        aggOpt(options, "SERIALFUNC", rs.getString("serial"));
+                        aggOpt(options, "DESERIALFUNC", rs.getString("deserial"));
+                        if (rs.getString("agginitval") != null) {
+                            options.add("INITCOND = '"
+                                    + rs.getString("agginitval")
+                                            .replace("'", "''")
+                                    + "'");
+                        }
+                        aggOpt(options, "MSFUNC", rs.getString("msfunc"));
+                        aggOpt(options, "MINVFUNC", rs.getString("minv"));
+                        aggOpt(options, "MSTYPE", rs.getString("mstype"));
+                        aggOpt(options, "MSSPACE", rs.getString("msspace"));
+                        aggOpt(options, "MFINALFUNC", rs.getString("mffunc"));
+                        if (rs.getBoolean("aggmfinalextra")) {
+                            options.add("MFINALFUNC_EXTRA");
+                        }
+                        aggModify(options, "MFINALFUNC_MODIFY",
+                                rs.getString("aggmfinalmodify"));
+                        if (rs.getString("aggminitval") != null) {
+                            options.add("MINITCOND = '"
+                                    + rs.getString("aggminitval")
+                                            .replace("'", "''")
+                                    + "'");
+                        }
+                        if (rs.getString("sortop") != null) {
+                            options.add("SORTOP = OPERATOR("
+                                    + rs.getString("sortop") + ")");
+                        }
+                        final var opts = String.join(", ", options);
+                        final var id = new ObjectId(ObjectKind.AGGREGATE,
+                                PgSql.normalize(
+                                        proname + "(" + idargs + ")", ns));
+                        procByOid.put(oid, id);
+                        final var qName = qNs + "." + PgIdentifiers.quote(proname);
+                        define(id, "prokind=a;kind=" + kind + ";" + opts,
+                                Map.of(
+                                        CREATE_SQL, "CREATE AGGREGATE " + qName
+                                                + "(" + rs.getString("args") + ")"
+                                                + " (" + opts + ")",
+                                        DROP_SQL, "DROP AGGREGATE " + qName
+                                                + "(" + idargs + ")",
+                                        SIG_ARGS, idargs,
+                                        PROKIND, "a"));
+                    }
+                }
+            }
+        }
+
+        /** Adds a {@code KEY = value} aggregate option when non-null. */
+        private static void aggOpt(List<String> options, String key, String value) {
+            if (value != null) {
+                options.add(key + " = " + value);
+            }
+        }
+
+        /** {@code FINALFUNC_MODIFY}/{@code MFINALFUNC_MODIFY} — {@code 'r'}
+         *  (read-only) is the default and stays implicit. */
+        private static void aggModify(List<String> options, String key, String value) {
+            switch (value) {
+                case "w" -> options.add(key + " = READ_WRITE");
+                case "s" -> options.add(key + " = SHAREABLE");
+                default -> { }
             }
         }
 
@@ -939,6 +1288,149 @@ public final class PgCatalog {
         }
 
         /**
+         * Standalone composite types ({@code CREATE TYPE n AS (a int, …)}):
+         * the canonical definition is the ordered attribute list — quoted
+         * name, deparsed type and non-default collation — in attnum order,
+         * since field order is part of the type. The twin {@code relkind 'c'}
+         * row is the composite's backing relation, not an object of its own;
+         * {@code relByOid} maps it back to the type so dependency edges and
+         * annotations resolve to the managed {@link ObjectKind#TYPE} object.
+         * A table's rowtype also carries {@code typtype 'c'}, but its
+         * {@code typrelid} is an {@code 'r'} relation — the join keeps only
+         * standalone composites.
+         */
+        void loadComposites(Connection conn) throws SQLException {
+            try (PreparedStatement ps = conn.prepareStatement("""
+                    SELECT t.oid, t.typname, t.typrelid,
+                           (SELECT string_agg(quote_ident(a.attname) || ' '
+                                    || format_type(a.atttypid, a.atttypmod)
+                                    || CASE WHEN a.attcollation <> at.typcollation
+                                            THEN ' collate '
+                                                 || a.attcollation::regcollation::text
+                                            ELSE '' END,
+                                    ', ' ORDER BY a.attnum)
+                              FROM pg_attribute a
+                              JOIN pg_type at ON at.oid = a.atttypid
+                              WHERE a.attrelid = t.typrelid
+                                AND a.attnum > 0 AND NOT a.attisdropped) AS attrs
+                    FROM pg_type t
+                    JOIN pg_class c ON c.oid = t.typrelid AND c.relkind = 'c'
+                    JOIN pg_namespace n ON n.oid = t.typnamespace
+                    WHERE n.nspname = ? AND t.typtype = 'c'
+                    ORDER BY t.oid
+                    """)) {
+                ps.setString(1, ns);
+                try (ResultSet rs = ps.executeQuery()) {
+                    while (rs.next()) {
+                        final var oid = rs.getLong("oid");
+                        final var relid = rs.getLong("typrelid");
+                        if (extMember(oid) || extMember(relid)) {
+                            continue;
+                        }
+                        final var name = rs.getString("typname");
+                        final var attrs = nullToEmpty(rs.getString("attrs"));
+                        final var qName = qNs + "." + PgIdentifiers.quote(name);
+                        final var id = new ObjectId(ObjectKind.TYPE, name);
+                        define(id, "typtype=c;attrs=" + attrs,
+                                Map.of(CREATE_SQL, "CREATE TYPE " + qName
+                                                + " AS (" + attrs + ")",
+                                        DROP_SQL, "DROP TYPE " + qName));
+                        typeByOid.put(oid, id);
+                        relByOid.put(relid, id);
+                    }
+                }
+            }
+        }
+
+        /**
+         * Range types ({@code CREATE TYPE n AS RANGE (SUBTYPE = t, …)}):
+         * the canonical definition is the {@code pg_range} row — subtype,
+         * non-default collation, subtype operator class, canonical and
+         * subtype-diff functions. The generated family (multirange,
+         * constructor routines, the range→multirange cast) folds into the
+         * range in {@link #loadAutoTypeFamily}; a multirange has no
+         * standalone create form, so it is never an object of its own.
+         * {@code typeByOid} is already populated there.
+         */
+        void loadRanges(Connection conn) throws SQLException {
+            try (PreparedStatement ps = conn.prepareStatement("""
+                    SELECT t.oid, t.typname,
+                           format_type(r.rngsubtype, NULL) AS subtype,
+                           NULLIF(r.rngcollation, 0)::regcollation::text AS coll,
+                           -- SUBTYPE_OPCLASS takes a bare name and pg_range
+                           -- always stores the resolved class, so it is
+                           -- reported only when it is not the subtype's
+                           -- default btree operator class
+                           CASE WHEN EXISTS (
+                                    SELECT 1 FROM pg_opclass d
+                                    JOIN pg_opfamily f
+                                      ON f.oid = d.opcfamily
+                                    JOIN pg_am am
+                                      ON am.oid = f.opfmethod
+                                    WHERE am.amname = 'btree'
+                                      AND d.opcintype = r.rngsubtype
+                                      AND d.opcdefault
+                                      AND d.oid = r.rngsubopc)
+                                THEN NULL
+                                ELSE (SELECT o.opcname FROM pg_opclass o
+                                      WHERE o.oid = r.rngsubopc)
+                           END AS opc,
+                           NULLIF(r.rngcanonical, 0)::regproc::text AS canonical,
+                           NULLIF(r.rngsubdiff, 0)::regproc::text AS diff
+                    FROM pg_range r
+                    JOIN pg_type t ON t.oid = r.rngtypid
+                    JOIN pg_namespace n ON n.oid = t.typnamespace
+                    WHERE n.nspname = ?
+                    ORDER BY t.oid
+                    """)) {
+                ps.setString(1, ns);
+                try (ResultSet rs = ps.executeQuery()) {
+                    while (rs.next()) {
+                        final var oid = rs.getLong("oid");
+                        if (extMember(oid)) {
+                            continue;
+                        }
+                        final var name = rs.getString("typname");
+                        final var subtype = rs.getString("subtype");
+                        final var coll = rs.getString("coll");
+                        final var opc = rs.getString("opc");
+                        final var canonical = rs.getString("canonical");
+                        final var diff = rs.getString("diff");
+                        final var canon = new StringBuilder(
+                                "typtype=r;subtype=" + subtype);
+                        final var create = new StringBuilder(
+                                "CREATE TYPE " + qNs + "."
+                                        + PgIdentifiers.quote(name)
+                                        + " AS RANGE (SUBTYPE = " + subtype);
+                        if (opc != null) {
+                            canon.append(";opclass=").append(opc);
+                            create.append(", SUBTYPE_OPCLASS = ").append(opc);
+                        }
+                        if (coll != null) {
+                            canon.append(";collation=").append(coll);
+                            create.append(", COLLATION = ").append(coll);
+                        }
+                        if (canonical != null) {
+                            canon.append(";canonical=").append(canonical);
+                            create.append(", CANONICAL = ").append(canonical);
+                        }
+                        if (diff != null) {
+                            canon.append(";subtype_diff=").append(diff);
+                            create.append(", SUBTYPE_DIFF = ").append(diff);
+                        }
+                        create.append(')');
+                        final var id = new ObjectId(ObjectKind.TYPE, name);
+                        define(id, canon.toString(),
+                                Map.of(CREATE_SQL, create.toString(),
+                                        DROP_SQL, "DROP TYPE " + qNs + "."
+                                                + PgIdentifiers.quote(name)));
+                        typeByOid.put(oid, id);
+                    }
+                }
+            }
+        }
+
+        /**
          * Row-level-security policies on our tables: a {@code POLICY} object
          * parented on its table. The canonical definition is the command,
          * permissive flag, sorted distinct role list ({@code {0}} renders as
@@ -1017,19 +1509,854 @@ public final class PgCatalog {
             }
         }
 
+        /**
+         * Extended statistics objects (pg_statistic_ext): a {@code STATISTICS}
+         * object named by {@code stxname} — statistics names are unique per
+         * schema, not per table, so the id is unparented; an explicit
+         * {@code dependsOn} edge ties it to its table. The canonical
+         * definition is {@code pg_get_statisticsobjdef}, which carries the
+         * enabled statistic kinds, the column/expression list and the source
+         * table. {@code stxstattarget} is a per-column planner property, not
+         * declarable, so it stays outside the canonical (like attstattarget).
+         */
+        void loadStatistics(Connection conn) throws SQLException {
+            try (PreparedStatement ps = conn.prepareStatement("""
+                    SELECT s.oid, s.stxname, s.stxrelid,
+                           pg_get_statisticsobjdef(s.oid) AS def
+                    FROM pg_statistic_ext s
+                    JOIN pg_namespace n ON n.oid = s.stxnamespace AND n.nspname = ?
+                    ORDER BY s.oid
+                    """)) {
+                ps.setString(1, ns);
+                try (ResultSet rs = ps.executeQuery()) {
+                    while (rs.next()) {
+                        if (extMember(rs.getLong("oid"))) {
+                            continue;
+                        }
+                        final var name = rs.getString("stxname");
+                        final var def = rs.getString("def");
+                        final var id = new ObjectId(ObjectKind.STATISTICS, name);
+                        stxByOid.put(rs.getLong("oid"), id);
+                        // the unsupported-dependents union resolves edges from
+                        // expression statistics (function/type refs in
+                        // stxexprs) through this registration too
+                        otherOid("pg_statistic_ext", rs.getLong("oid"), id);
+                        define(id, def, Map.of(
+                                CREATE_SQL, def,
+                                DROP_SQL, "DROP STATISTICS " + qNs + "."
+                                        + PgIdentifiers.quote(name)));
+                        dep(id, relByOid.get(rs.getLong("stxrelid")));
+                    }
+                }
+            }
+        }
+
+        /**
+         * Non-view rewrite rules (pg_rewrite rows other than {@code _RETURN},
+         * which is part of its view): a {@code RULE} object parented on its
+         * relation — rule names are unique per table. The canonical
+         * definition is {@code pg_get_ruledef} plus the enabled state
+         * ({@code ev_enabled}, like a trigger's {@code tgenabled}); the
+         * {@code pg_rewrite}-classid registration feeds the
+         * unsupported-dependents union, which records the rule's edges to
+         * its relation and every object the action references.
+         */
+        void loadRules(Connection conn) throws SQLException {
+            try (PreparedStatement ps = conn.prepareStatement("""
+                    SELECT r.oid, r.rulename, c.relname AS parent, r.ev_class,
+                           r.ev_enabled, pg_get_ruledef(r.oid, true) AS def
+                    FROM pg_rewrite r
+                    JOIN pg_class c ON c.oid = r.ev_class
+                    JOIN pg_namespace n ON n.oid = c.relnamespace AND n.nspname = ?
+                    WHERE r.rulename <> '_RETURN'
+                    ORDER BY r.oid
+                    """)) {
+                ps.setString(1, ns);
+                try (ResultSet rs = ps.executeQuery()) {
+                    while (rs.next()) {
+                        if (extMember(rs.getLong("oid"))) {
+                            continue;
+                        }
+                        final var name = rs.getString("rulename");
+                        final var parent = rs.getString("parent");
+                        final var enabled = rs.getString("ev_enabled");
+                        final var def = rs.getString("def");
+                        final var id = new ObjectId(ObjectKind.RULE, name, parent);
+                        ruleByOid.put(rs.getLong("oid"), id);
+                        otherOid("pg_rewrite", rs.getLong("oid"), id);
+                        final var qName = PgIdentifiers.quote(name);
+                        final var qParent = tableRef(parent);
+                        final var attrs = new LinkedHashMap<String, String>();
+                        attrs.put(CREATE_SQL, def);
+                        attrs.put(DROP_SQL, "DROP RULE " + qName + " ON " + qParent);
+                        if (!enabled.equals("O")) {
+                            final var verb = switch (enabled) {
+                                case "D" -> "DISABLE";
+                                case "R" -> "ENABLE REPLICA";
+                                default -> "ENABLE ALWAYS";
+                            };
+                            attrs.put(POST_SQL, "ALTER TABLE " + qParent + " "
+                                    + verb + " RULE " + qName);
+                        }
+                        define(id, def + ";enabled=" + enabled, attrs);
+                        dep(id, relByOid.get(rs.getLong("ev_class")));
+                    }
+                }
+            }
+        }
+
+        /**
+         * Collations a desired script can create: libc or ICU provider and an
+         * encoding either universal ({@code -1}) or bound to this database's
+         * own encoding — that is what {@code CREATE COLLATION} records, and a
+         * collation bound to a different encoding cannot be recreated here
+         * (the database-default provider can't either — both stay
+         * {@code OTHER}). There is no {@code pg_get_collationdef}, so the
+         * canonical definition and the {@code CREATE COLLATION} fragment are
+         * composed from the provider fields; {@code collversion} is
+         * environment metadata (the libc/ICU library version at creation)
+         * and deliberately excluded so the same collation does not drift
+         * across hosts. {@code colllocale} is named {@code colliculocale}
+         * before PostgreSQL 17 — read via {@code to_json} so both spellings
+         * resolve.
+         */
+        void loadCollations(Connection conn) throws SQLException {
+            try (PreparedStatement ps = conn.prepareStatement("""
+                    SELECT cl.oid, cl.collname, cl.collprovider, cl.collisdeterministic,
+                           cl.collencoding, cl.collcollate, cl.collctype,
+                           COALESCE(to_json(cl)->>'colllocale',
+                                    to_json(cl)->>'colliculocale') AS colllocale,
+                           cl.collicurules
+                    FROM pg_collation cl
+                    JOIN pg_namespace n ON n.oid = cl.collnamespace AND n.nspname = ?
+                    WHERE cl.collprovider IN ('c', 'i')
+                      AND cl.collencoding IN (-1,
+                          (SELECT encoding FROM pg_database
+                           WHERE datname = current_database()))
+                    ORDER BY cl.oid
+                    """)) {
+                ps.setString(1, ns);
+                try (ResultSet rs = ps.executeQuery()) {
+                    while (rs.next()) {
+                        if (extMember(rs.getLong("oid"))) {
+                            continue;
+                        }
+                        final var name = rs.getString("collname");
+                        final var icu = rs.getString("collprovider").equals("i");
+                        final var deterministic = rs.getBoolean("collisdeterministic");
+                        final var collate = rs.getString("collcollate");
+                        final var ctype = rs.getString("collctype");
+                        final var locale = rs.getString("colllocale");
+                        final var rules = rs.getString("collicurules");
+                        String canonical;
+                        String options;
+                        if (icu) {
+                            options = "provider = icu, locale = " + sqlLiteral(locale)
+                                    + (rules == null ? "" : ", rules = " + sqlLiteral(rules))
+                                    + (deterministic ? "" : ", deterministic = false");
+                            canonical = "provider=icu;locale=" + locale
+                                    + (rules == null ? "" : ";rules=" + rules)
+                                    + (deterministic ? "" : ";deterministic=false")
+                                    + ";encoding=" + rs.getInt("collencoding");
+                        } else {
+                            options = collate.equals(ctype)
+                                    ? "locale = " + sqlLiteral(collate)
+                                    : "lc_collate = " + sqlLiteral(collate)
+                                            + ", lc_ctype = " + sqlLiteral(ctype);
+                            canonical = "provider=libc;collate=" + collate
+                                    + ";ctype=" + ctype
+                                    + ";encoding=" + rs.getInt("collencoding");
+                        }
+                        final var id = new ObjectId(ObjectKind.COLLATION, name);
+                        collByOid.put(rs.getLong("oid"), id);
+                        final var qName = tableRef(name);
+                        define(id, canonical, Map.of(
+                                CREATE_SQL, "CREATE COLLATION " + qName + " (" + options + ")",
+                                DROP_SQL, "DROP COLLATION " + qName));
+                    }
+                }
+            }
+        }
+
+        /**
+         * Conversions between client encodings: there is no deparsed
+         * definition, so the canonical composes source/target encoding names
+         * and the conversion function ({@code regproc}, which is the
+         * reference form {@code CREATE CONVERSION ... FROM} accepts).
+         * {@code DEFAULT CONVERSION} rows stay {@code OTHER} — {@code DEFAULT}
+         * heads the script check's database-wide list, so a desired script
+         * can never express the flag. A conversion depends on its function
+         * when the function is managed.
+         */
+        void loadConversions(Connection conn) throws SQLException {
+            try (PreparedStatement ps = conn.prepareStatement("""
+                    SELECT cv.oid, cv.conname,
+                           pg_encoding_to_char(cv.conforencoding) AS forenc,
+                           pg_encoding_to_char(cv.contoencoding) AS toenc,
+                           cv.conproc::regproc::text AS procname,
+                           cv.conproc::oid AS conproc
+                    FROM pg_conversion cv
+                    JOIN pg_namespace n ON n.oid = cv.connamespace AND n.nspname = ?
+                    WHERE NOT cv.condefault
+                    ORDER BY cv.oid
+                    """)) {
+                ps.setString(1, ns);
+                try (ResultSet rs = ps.executeQuery()) {
+                    while (rs.next()) {
+                        if (extMember(rs.getLong("oid"))) {
+                            continue;
+                        }
+                        final var name = rs.getString("conname");
+                        final var forenc = rs.getString("forenc");
+                        final var toenc = rs.getString("toenc");
+                        final var conproc = rs.getString("procname");
+                        final var id = new ObjectId(ObjectKind.CONVERSION, name);
+                        convByOid.put(rs.getLong("oid"), id);
+                        final var qName = tableRef(name);
+                        define(id,
+                                "from=" + forenc + ";to=" + toenc + ";proc=" + conproc,
+                                Map.of(
+                                        CREATE_SQL, "CREATE CONVERSION " + qName
+                                                + " FOR " + sqlLiteral(forenc)
+                                                + " TO " + sqlLiteral(toenc)
+                                                + " FROM " + conproc,
+                                        DROP_SQL, "DROP CONVERSION " + qName));
+                        dep(id, procByOid.get(rs.getLong("conproc")));
+                    }
+                }
+            }
+        }
+
+        /**
+         * Full-text-search objects — four managed kinds:
+         * {@code TEXT_SEARCH_TEMPLATE}, {@code TEXT_SEARCH_PARSER},
+         * {@code TEXT_SEARCH_DICTIONARY} and {@code TEXT_SEARCH_CONFIGURATION}.
+         * No {@code pg_get_*def} exists for them, so the canonical and the
+         * {@code CREATE TEXT SEARCH …} fragment are composed from the catalog
+         * row (the AGGREGATE pattern): function references as
+         * {@code regproc} text, the dictionary's template reference and
+         * {@code dictinitoption} verbatim, the configuration's parser
+         * reference plus the {@code pg_ts_config_map} token→dictionary chain
+         * folded into the configuration object (map rows are never objects —
+         * {@code ALTER ... ADD MAPPING} fragments ride in {@code POST_SQL} in
+         * {@code mapseqno} order). Token aliases resolve through
+         * {@code ts_token_type(cfgparser)}; an unresolvable alias falls back
+         * to {@code tok<N>}. Any canonical drift is a DROP+CREATE REBUILD —
+         * PostgreSQL has no in-place create for the function references.
+         */
+        void loadTextSearch(Connection conn) throws SQLException {
+            // templates: the two support functions are the whole body
+            try (PreparedStatement ps = conn.prepareStatement("""
+                    SELECT t.oid, t.tmplname,
+                           t.tmplinit::regproc::text AS init,
+                           t.tmpllexize::regproc::text AS lexize,
+                           t.tmplinit::oid AS init_oid,
+                           t.tmpllexize::oid AS lexize_oid
+                    FROM pg_ts_template t
+                    JOIN pg_namespace n ON n.oid = t.tmplnamespace
+                    WHERE n.nspname = ?
+                    ORDER BY t.oid
+                    """)) {
+                ps.setString(1, ns);
+                try (ResultSet rs = ps.executeQuery()) {
+                    while (rs.next()) {
+                        final var oid = rs.getLong("oid");
+                        if (extMember(oid)) {
+                            continue;
+                        }
+                        final var name = rs.getString("tmplname");
+                        final var init = rs.getString("init");
+                        final var lexize = rs.getString("lexize");
+                        final var id = new ObjectId(
+                                ObjectKind.TEXT_SEARCH_TEMPLATE, name);
+                        tmplByOid.put(oid, id);
+                        otherOid("pg_ts_template", oid, id);
+                        final var qName = qNs + "." + PgIdentifiers.quote(name);
+                        final var opts = "-".equals(init)
+                                ? "LEXIZE = " + lexize
+                                : "INIT = " + init + ", LEXIZE = " + lexize;
+                        define(id,
+                                "ts_template=init:" + init + ";lexize:" + lexize,
+                                Map.of(
+                                        CREATE_SQL, "CREATE TEXT SEARCH TEMPLATE "
+                                                + qName + " (" + opts + ")",
+                                        DROP_SQL, "DROP TEXT SEARCH TEMPLATE "
+                                                + qName));
+                        if (!"-".equals(init)) {
+                            dep(id, procByOid.get(rs.getLong("init_oid")));
+                        }
+                        dep(id, procByOid.get(rs.getLong("lexize_oid")));
+                    }
+                }
+            }
+            // parsers: five support functions; prsheadline is optional ('-')
+            try (PreparedStatement ps = conn.prepareStatement("""
+                    SELECT p.oid, p.prsname,
+                           p.prsstart::regproc::text AS start,
+                           p.prstoken::regproc::text AS token,
+                           p.prsend::regproc::text AS end,
+                           p.prsheadline::regproc::text AS headline,
+                           p.prslextype::regproc::text AS lextype,
+                           p.prsstart::oid AS start_oid,
+                           p.prstoken::oid AS token_oid,
+                           p.prsend::oid AS end_oid,
+                           p.prsheadline::oid AS headline_oid,
+                           p.prslextype::oid AS lextype_oid
+                    FROM pg_ts_parser p
+                    JOIN pg_namespace n ON n.oid = p.prsnamespace
+                    WHERE n.nspname = ?
+                    ORDER BY p.oid
+                    """)) {
+                ps.setString(1, ns);
+                try (ResultSet rs = ps.executeQuery()) {
+                    while (rs.next()) {
+                        final var oid = rs.getLong("oid");
+                        if (extMember(oid)) {
+                            continue;
+                        }
+                        final var name = rs.getString("prsname");
+                        final var headline = rs.getString("headline");
+                        final var id = new ObjectId(
+                                ObjectKind.TEXT_SEARCH_PARSER, name);
+                        prsByOid.put(oid, id);
+                        otherOid("pg_ts_parser", oid, id);
+                        final var qName = qNs + "." + PgIdentifiers.quote(name);
+                        var opts = "START = " + rs.getString("start")
+                                + ", GETTOKEN = " + rs.getString("token")
+                                + ", END = " + rs.getString("end")
+                                + ", LEXTYPES = " + rs.getString("lextype");
+                        if (!"-".equals(headline)) {
+                            opts += ", HEADLINE = " + headline;
+                        }
+                        define(id, "ts_parser=start:" + rs.getString("start")
+                                        + ";token:" + rs.getString("token")
+                                        + ";end:" + rs.getString("end")
+                                        + ";headline:" + headline
+                                        + ";lextype:" + rs.getString("lextype"),
+                                Map.of(
+                                        CREATE_SQL, "CREATE TEXT SEARCH PARSER "
+                                                + qName + " (" + opts + ")",
+                                        DROP_SQL, "DROP TEXT SEARCH PARSER "
+                                                + qName));
+                        for (final var c : new String[]{"start_oid", "token_oid",
+                                "end_oid", "headline_oid", "lextype_oid"}) {
+                            final var fn = rs.getLong(c);
+                            if (fn != 0) {
+                                dep(id, procByOid.get(fn));
+                            }
+                        }
+                    }
+                }
+            }
+            // dictionaries: template reference + free-form init option text
+            try (PreparedStatement ps = conn.prepareStatement("""
+                    SELECT d.oid, d.dictname, d.dicttemplate,
+                           tn.nspname || '.' || t.tmplname AS tmplref,
+                           d.dictinitoption
+                    FROM pg_ts_dict d
+                    JOIN pg_ts_template t ON t.oid = d.dicttemplate
+                    JOIN pg_namespace tn ON tn.oid = t.tmplnamespace
+                    JOIN pg_namespace n ON n.oid = d.dictnamespace
+                    WHERE n.nspname = ?
+                    ORDER BY d.oid
+                    """)) {
+                ps.setString(1, ns);
+                try (ResultSet rs = ps.executeQuery()) {
+                    while (rs.next()) {
+                        final var oid = rs.getLong("oid");
+                        if (extMember(oid)) {
+                            continue;
+                        }
+                        final var name = rs.getString("dictname");
+                        final var tmplref = rs.getString("tmplref");
+                        final var initopt = rs.getString("dictinitoption");
+                        final var id = new ObjectId(
+                                ObjectKind.TEXT_SEARCH_DICTIONARY, name);
+                        dictByOid.put(oid, id);
+                        otherOid("pg_ts_dict", oid, id);
+                        final var qName = qNs + "." + PgIdentifiers.quote(name);
+                        var opts = "TEMPLATE = " + tmplref;
+                        if (initopt != null && !initopt.isBlank()) {
+                            opts += ", " + initopt;
+                        }
+                        define(id, "ts_dict=template:" + tmplref
+                                        + ";init:" + (initopt == null
+                                                ? "-" : initopt),
+                                Map.of(
+                                        CREATE_SQL, "CREATE TEXT SEARCH DICTIONARY "
+                                                + qName + " (" + opts + ")",
+                                        DROP_SQL, "DROP TEXT SEARCH DICTIONARY "
+                                                + qName));
+                        dep(id, tmplByOid.get(rs.getLong("dicttemplate")));
+                    }
+                }
+            }
+            // configurations: parser reference plus the folded token→dict
+            // map chain; each map row renders an ALTER ... ADD MAPPING in
+            // mapseqno order inside POST_SQL
+            try (PreparedStatement ps = conn.prepareStatement("""
+                    SELECT c.oid, c.cfgname, c.cfgparser,
+                           pn.nspname || '.' || p.prsname AS prsref
+                    FROM pg_ts_config c
+                    JOIN pg_ts_parser p ON p.oid = c.cfgparser
+                    JOIN pg_namespace pn ON pn.oid = p.prsnamespace
+                    JOIN pg_namespace n ON n.oid = c.cfgnamespace
+                    WHERE n.nspname = ?
+                    ORDER BY c.oid
+                    """)) {
+                ps.setString(1, ns);
+                try (ResultSet rs = ps.executeQuery()) {
+                    while (rs.next()) {
+                        final var oid = rs.getLong("oid");
+                        if (extMember(oid)) {
+                            continue;
+                        }
+                        final var name = rs.getString("cfgname");
+                        final var prsref = rs.getString("prsref");
+                        final var id = new ObjectId(
+                                ObjectKind.TEXT_SEARCH_CONFIGURATION, name);
+                        cfgByOid.put(oid, id);
+                        otherOid("pg_ts_config", oid, id);
+                        final var qName = qNs + "." + PgIdentifiers.quote(name);
+                        final var attrs = new LinkedHashMap<String, String>();
+                        attrs.put(CREATE_SQL, "CREATE TEXT SEARCH CONFIGURATION "
+                                + qName + " (PARSER = " + prsref + ")");
+                        attrs.put(DROP_SQL, "DROP TEXT SEARCH CONFIGURATION "
+                                + qName);
+                        final var maps = configMaps(conn, oid, qName);
+                        var canon = "ts_config=parser:" + prsref;
+                        if (!maps.isEmpty()) {
+                            final var entries = new ArrayList<String>();
+                            final var alters = new ArrayList<String>();
+                            for (final var m : maps) {
+                                entries.add(m.alias + "@" + m.seq + "=" + m.dictref);
+                                alters.add("ALTER TEXT SEARCH CONFIGURATION "
+                                        + qName + " ADD MAPPING FOR " + m.alias
+                                        + " WITH " + m.dictref);
+                                dep(id, dictByOid.get(m.dictoid));
+                            }
+                            canon += ";map=" + String.join(",", entries);
+                            attrs.put(POST_SQL, String.join("; ", alters));
+                        }
+                        define(id, canon, attrs);
+                        dep(id, prsByOid.get(rs.getLong("cfgparser")));
+                    }
+                }
+            }
+        }
+
+        /**
+         * The {@code pg_ts_config_map} rows of one configuration, ordered by
+         * {@code mapseqno}: token alias (resolved through
+         * {@code ts_token_type(cfgparser)}, {@code tok<N>} when unresolvable),
+         * sequence number and the dictionary reference as
+         * {@code nspname.dictname} — normalized to {@code ${namespace}} by
+         * {@code define}'s caller path like every reference.
+         */
+        private List<TsMap> configMaps(Connection conn, long cfgoid,
+                                       String qName) throws SQLException {
+            final var out = new ArrayList<TsMap>();
+            try (PreparedStatement ps = conn.prepareStatement("""
+                    SELECT m.maptokentype, m.mapseqno, m.mapdict,
+                           dn.nspname || '.' || d.dictname AS dictref,
+                           tt.alias
+                    FROM pg_ts_config_map m
+                    JOIN pg_ts_config c ON c.oid = m.mapcfg
+                    JOIN pg_ts_dict d ON d.oid = m.mapdict
+                    JOIN pg_namespace dn ON dn.oid = d.dictnamespace
+                    LEFT JOIN LATERAL (
+                        SELECT alias FROM ts_token_type(c.cfgparser)
+                        WHERE tokid = m.maptokentype
+                    ) tt ON true
+                    WHERE m.mapcfg = ?
+                    ORDER BY m.mapseqno
+                    """)) {
+                ps.setLong(1, cfgoid);
+                try (ResultSet rs = ps.executeQuery()) {
+                    while (rs.next()) {
+                        var alias = rs.getString("alias");
+                        if (alias == null) {
+                            alias = "tok" + rs.getLong("maptokentype");
+                        }
+                        out.add(new TsMap(alias, rs.getInt("mapseqno"),
+                                rs.getLong("mapdict"), rs.getString("dictref")));
+                    }
+                }
+            }
+            return out;
+        }
+
+        /** One {@code pg_ts_config_map} row folded into its configuration. */
+        private record TsMap(String alias, int seq, long dictoid,
+                             String dictref) { }
+
+        /**
+         * Operator objects — three managed kinds: {@code OPERATOR} (name
+         * plus its {@code (leftarg,rightarg)} identity signature like a
+         * routine, {@code NONE} for an absent prefix operand),
+         * {@code OPERATOR_FAMILY} (name {@code opfname USING amname} — the
+         * access method is part of identity) and {@code OPERATOR_CLASS}
+         * (same name form; a class's {@code pg_amop}/{@code pg_amproc}
+         * members fold into its canonical like a configuration's map).
+         * No {@code pg_get_*def} exists, so canonical and {@code CREATE}
+         * fragments are composed from the catalog rows: operator options
+         * (procedure, argument/result types, commutator, negator,
+         * restrict/join selectivity, HASHES/MERGES), family options (the
+         * access method), class options (DEFAULT, FOR TYPE, FAMILY,
+         * STORAGE, ordered {@code OPERATOR n}/{@code FUNCTION n} member
+         * specs). Member operator references render as
+         * {@code regoperator} text (name plus operand types), member
+         * functions as {@code regprocedure}. Standalone family members
+         * are not modeled — {@code ALTER OPERATOR FAMILY … ADD|DROP}
+         * stays rejected in the desired-script check. Any drift is a
+         * DROP+CREATE REBUILD.
+         */
+        void loadOperators(Connection conn) throws SQLException {
+            try (PreparedStatement ps = conn.prepareStatement("""
+                    SELECT o.oid, o.oprname, o.oprleft, o.oprright,
+                           o.oprleft::regtype::text AS leftt,
+                           o.oprright::regtype::text AS rightt,
+                           o.oprresult::regtype::text AS result,
+                           o.oprcode::regproc::text AS proc,
+                           o.oprcode::oid AS proc_oid,
+                           o.oprrest::regproc::text AS rest,
+                           o.oprrest::oid AS rest_oid,
+                           o.oprjoin::regproc::text AS joinsel,
+                           o.oprjoin::oid AS join_oid,
+                           cn.nspname || '.' || co.oprname AS comref,
+                           nn.nspname || '.' || no.oprname AS negref,
+                           o.oprcom, o.oprnegate,
+                           o.oprresult AS result_oid,
+                           o.oprcanhash, o.oprcanmerge
+                    FROM pg_operator o
+                    JOIN pg_namespace n ON n.oid = o.oprnamespace
+                    LEFT JOIN pg_operator co ON co.oid = o.oprcom
+                    LEFT JOIN pg_namespace cn ON cn.oid = co.oprnamespace
+                    LEFT JOIN pg_operator no ON no.oid = o.oprnegate
+                    LEFT JOIN pg_namespace nn ON nn.oid = no.oprnamespace
+                    WHERE n.nspname = ?
+                    ORDER BY o.oid
+                    """)) {
+                ps.setString(1, ns);
+                try (ResultSet rs = ps.executeQuery()) {
+                    while (rs.next()) {
+                        final var oid = rs.getLong("oid");
+                        if (extMember(oid)) {
+                            continue;
+                        }
+                        final var left = rs.getLong("oprleft");
+                        final var right = rs.getLong("oprright");
+                        final var name = rs.getString("oprname") + "("
+                                + (left == 0 ? "NONE" : rs.getString("leftt"))
+                                + ","
+                                + (right == 0 ? "NONE" : rs.getString("rightt"))
+                                + ")";
+                        final var id = new ObjectId(ObjectKind.OPERATOR, name);
+                        oprByOid.put(oid, id);
+                        otherOid("pg_operator", oid, id);
+                        // operator names are symbol strings, not identifiers
+                        // — double-quoting them is invalid syntax
+                        final var qName = qNs + "." + rs.getString("oprname");
+                        var canon = "operator=" + rs.getString("result")
+                                + ";proc:" + rs.getString("proc")
+                                + ";rest:" + rs.getString("rest")
+                                + ";join:" + rs.getString("joinsel")
+                                + ";hash:" + rs.getBoolean("oprcanhash")
+                                + ";merge:" + rs.getBoolean("oprcanmerge")
+                                + ";com:" + nullToDash(rs.getString("comref"))
+                                + ";neg:" + nullToDash(rs.getString("negref"));
+                        var opts = new StringBuilder("PROCEDURE = ")
+                                .append(rs.getString("proc"));
+                        if (left != 0) {
+                            opts.append(", LEFTARG = ").append(rs.getString("leftt"));
+                        }
+                        if (right != 0) {
+                            opts.append(", RIGHTARG = ").append(rs.getString("rightt"));
+                        }
+                        opts.append(", RESULT = ").append(rs.getString("result"));
+                        if (rs.getLong("oprcom") != 0) {
+                            opts.append(", COMMUTATOR = OPERATOR(")
+                                    .append(rs.getString("comref")).append(')');
+                        }
+                        if (rs.getLong("oprnegate") != 0) {
+                            opts.append(", NEGATOR = OPERATOR(")
+                                    .append(rs.getString("negref")).append(')');
+                        }
+                        if (!"-".equals(rs.getString("rest"))) {
+                            opts.append(", RESTRICT = ").append(rs.getString("rest"));
+                        }
+                        if (!"-".equals(rs.getString("joinsel"))) {
+                            opts.append(", JOIN = ").append(rs.getString("joinsel"));
+                        }
+                        if (rs.getBoolean("oprcanhash")) {
+                            opts.append(", HASHES");
+                        }
+                        if (rs.getBoolean("oprcanmerge")) {
+                            opts.append(", MERGES");
+                        }
+                        define(id, canon, Map.of(
+                                CREATE_SQL, "CREATE OPERATOR " + qName
+                                        + " (" + opts + ")",
+                                DROP_SQL, "DROP OPERATOR " + qName + " ("
+                                        + (left == 0 ? "NONE" : rs.getString("leftt"))
+                                        + ", "
+                                        + (right == 0 ? "NONE" : rs.getString("rightt"))
+                                        + ")"));
+                        dep(id, procByOid.get(rs.getLong("proc_oid")));
+                        dep(id, typeByOid.get(left));
+                        dep(id, typeByOid.get(right));
+                        dep(id, typeByOid.get(rs.getLong("result_oid")));
+                        dep(id, oprByOid.get(rs.getLong("oprcom")));
+                        dep(id, oprByOid.get(rs.getLong("oprnegate")));
+                        dep(id, procByOid.get(rs.getLong("rest_oid")));
+                        dep(id, procByOid.get(rs.getLong("join_oid")));
+                    }
+                }
+            }
+            // families: name + access method only — standalone members are
+            // not modeled (ALTER FAMILY member mutations stay rejected)
+            try (PreparedStatement ps = conn.prepareStatement("""
+                    SELECT f.oid, f.opfname, a.amname
+                    FROM pg_opfamily f
+                    JOIN pg_am a ON a.oid = f.opfmethod
+                    JOIN pg_namespace n ON n.oid = f.opfnamespace
+                    WHERE n.nspname = ?
+                    ORDER BY f.oid
+                    """)) {
+                ps.setString(1, ns);
+                try (ResultSet rs = ps.executeQuery()) {
+                    while (rs.next()) {
+                        final var oid = rs.getLong("oid");
+                        if (extMember(oid)) {
+                            continue;
+                        }
+                        final var name = rs.getString("opfname") + " USING "
+                                + rs.getString("amname");
+                        final var id = new ObjectId(ObjectKind.OPERATOR_FAMILY,
+                                name);
+                        opfByOid.put(oid, id);
+                        otherOid("pg_opfamily", oid, id);
+                        final var qName = qNs + "."
+                                + PgIdentifiers.quote(rs.getString("opfname"));
+                        define(id, "opfamily=" + rs.getString("amname"), Map.of(
+                                CREATE_SQL, "CREATE OPERATOR FAMILY " + qName
+                                        + " USING " + rs.getString("amname"),
+                                DROP_SQL, "DROP OPERATOR FAMILY " + qName
+                                        + " USING " + rs.getString("amname")));
+                    }
+                }
+            }
+            // classes: am/type/family/default/storage plus the folded
+            // amop/amproc member list (members where the row's left type is
+            // the class's indexed type — cross-type members included)
+            try (PreparedStatement ps = conn.prepareStatement("""
+                    SELECT c.oid, c.opcname, a.amname, c.opcfamily,
+                           fn.nspname || '.' || f.opfname AS famref,
+                           format_type(c.opcintype, NULL) AS intype,
+                           format_type(c.opckeytype, NULL) AS storage,
+                           c.opcintype, c.opckeytype, c.opcdefault
+                    FROM pg_opclass c
+                    JOIN pg_am a ON a.oid = c.opcmethod
+                    JOIN pg_opfamily f ON f.oid = c.opcfamily
+                    JOIN pg_namespace fn ON fn.oid = f.opfnamespace
+                    JOIN pg_namespace n ON n.oid = c.opcnamespace
+                    WHERE n.nspname = ?
+                    ORDER BY c.oid
+                    """)) {
+                ps.setString(1, ns);
+                try (ResultSet rs = ps.executeQuery()) {
+                    while (rs.next()) {
+                        final var oid = rs.getLong("oid");
+                        if (extMember(oid)) {
+                            continue;
+                        }
+                        final var name = rs.getString("opcname") + " USING "
+                                + rs.getString("amname");
+                        final var id = new ObjectId(ObjectKind.OPERATOR_CLASS,
+                                name);
+                        opcByOid.put(oid, id);
+                        otherOid("pg_opclass", oid, id);
+                        final var qName = qNs + "."
+                                + PgIdentifiers.quote(rs.getString("opcname"));
+                        final var members = opclassMembers(conn,
+                                rs.getLong("opcfamily"), rs.getLong("opcintype"),
+                                id);
+                        var canon = "opclass=am:" + rs.getString("amname")
+                                + ";type:" + rs.getString("intype")
+                                + ";family:" + rs.getString("famref")
+                                + ";default:" + rs.getBoolean("opcdefault")
+                                + ";storage:" + nullToDash(rs.getString("storage"));
+                        final var body = new StringBuilder(
+                                rs.getBoolean("opcdefault") ? "DEFAULT " : "")
+                                .append("FOR TYPE ").append(rs.getString("intype"))
+                                .append(" USING ").append(rs.getString("amname"))
+                                .append(" FAMILY ").append(rs.getString("famref"));
+                        final var specs = new ArrayList<String>();
+                        if (rs.getLong("opckeytype") != 0) {
+                            specs.add("STORAGE " + rs.getString("storage"));
+                        }
+                        for (final var m : members) {
+                            canon += ";m" + specs.size() + ":" + m;
+                            specs.add(m);
+                        }
+                        body.append(specs.isEmpty() ? "" : " AS "
+                                + String.join(", ", specs));
+                        define(id, canon, Map.of(
+                                CREATE_SQL, "CREATE OPERATOR CLASS " + qName
+                                        + " " + body,
+                                DROP_SQL, "DROP OPERATOR CLASS " + qName
+                                        + " USING " + rs.getString("amname")));
+                        dep(id, typeByOid.get(rs.getLong("opcintype")));
+                        dep(id, opfByOid.get(rs.getLong("opcfamily")));
+                    }
+                }
+            }
+        }
+
+        /**
+         * The {@code pg_amop}/{@code pg_amproc} member specs of one
+         * operator class — rows whose left type matches the class's
+         * {@code opcintype}, ordered so {@code DROP} runs over a stable
+         * list: {@code OPERATOR} members first (strategy, operator
+         * reference, {@code FOR ORDER BY} family when set), then
+         * {@code FUNCTION} members (number, type pair, function
+         * reference). Dependency edges to member operators/functions and
+         * sort families record on {@code id}.
+         */
+        private List<String> opclassMembers(Connection conn, long family,
+                                            long intype, ObjectId id)
+                throws SQLException {
+            final var out = new ArrayList<String>();
+            try (PreparedStatement ps = conn.prepareStatement("""
+                    SELECT m.amopstrategy, m.amoppurpose,
+                           m.amopopr::regoperator::text AS opref,
+                           m.amopopr::oid AS amopopr_oid,
+                           sn.nspname || '.' || sf.opfname AS sortref,
+                           m.amopsortfamily
+                    FROM pg_amop m
+                    LEFT JOIN pg_opfamily sf ON sf.oid = m.amopsortfamily
+                    LEFT JOIN pg_namespace sn ON sn.oid = sf.opfnamespace
+                    WHERE m.amopfamily = ? AND m.amoplefttype = ?
+                    ORDER BY m.amopstrategy, m.amoprighttype, m.oid
+                    """)) {
+                ps.setLong(1, family);
+                ps.setLong(2, intype);
+                try (ResultSet rs = ps.executeQuery()) {
+                    while (rs.next()) {
+                        var spec = "OPERATOR " + rs.getInt("amopstrategy") + " "
+                                + rs.getString("opref");
+                        if ("o".equals(rs.getString("amoppurpose"))) {
+                            spec += " FOR ORDER BY " + rs.getString("sortref");
+                        }
+                        out.add(spec);
+                        dep(id, oprByOid.get(rs.getLong("amopopr_oid")));
+                        dep(id, opfByOid.get(rs.getLong("amopsortfamily")));
+                    }
+                }
+            }
+            try (PreparedStatement ps = conn.prepareStatement("""
+                    SELECT m.amprocnum,
+                           format_type(m.amproclefttype, NULL) AS lt,
+                           format_type(m.amprocrighttype, NULL) AS rt,
+                           m.amproc::regprocedure::text AS fn,
+                           m.amproc::oid AS amproc_oid
+                    FROM pg_amproc m
+                    WHERE m.amprocfamily = ? AND m.amproclefttype = ?
+                    ORDER BY m.amprocnum, m.oid
+                    """)) {
+                ps.setLong(1, family);
+                ps.setLong(2, intype);
+                try (ResultSet rs = ps.executeQuery()) {
+                    while (rs.next()) {
+                        out.add("FUNCTION " + rs.getInt("amprocnum") + " ("
+                                + rs.getString("lt") + "," + rs.getString("rt")
+                                + ") " + rs.getString("fn"));
+                        dep(id, procByOid.get(rs.getLong("amproc_oid")));
+                    }
+                }
+            }
+            return out;
+        }
+
+        private static String nullToDash(String v) {
+            return v == null || v.isBlank() || "0".equals(v) || "-".equals(v)
+                    ? "-" : v;
+        }
+
+        /**
+         * Security labels ({@code pg_seclabel}) on managed targets: the id
+         * mirrors the target like a {@code COMMENT}, prefixed with the
+         * provider — {@code SECURITY_LABEL selinux:t}. The canonical is the
+         * label text; re-issuing {@code SECURITY LABEL FOR ... ON ... IS}
+         * is both the create and the in-place drift fix, and
+         * {@code IS NULL} the drop. Labels on targets the dialect does not
+         * manage stay {@code OTHER} (provider-qualified so two providers
+         * cannot collapse into one entry).
+         */
+        void loadSecLabels(Connection conn) throws SQLException {
+            try (PreparedStatement ps = conn.prepareStatement("""
+                    SELECT o.name AS target, d.objoid, o.cls::text AS cls, d.objsubid,
+                           a.attname, d.provider, d.label
+                    FROM pg_seclabel d
+                    JOIN (""" + NS_OBJECTS + """
+                    ) o ON o.cls = d.classoid AND o.obj = d.objoid
+                    LEFT JOIN pg_attribute a ON d.classoid = 'pg_class'::regclass
+                            AND a.attrelid = d.objoid AND a.attnum = d.objsubid
+                    ORDER BY 1, 2, 3
+                    """)) {
+                bindNamespace(ps, 17);
+                try (ResultSet rs = ps.executeQuery()) {
+                    while (rs.next()) {
+                        if (extMember(rs.getLong("objoid"))) {
+                            continue;
+                        }
+                        final var target = annotatedTarget(rs.getString("cls"),
+                                rs.getLong("objoid"), rs.getInt("objsubid"),
+                                rs.getString("attname"));
+                        final var provider = rs.getString("provider");
+                        if (target != null && target.kind() != ObjectKind.OTHER
+                                && objects.containsKey(target)) {
+                            var lid = seclabelId(target, provider, "");
+                            if (objects.containsKey(lid)) {
+                                // mirrors the COMMENT collision escape (A.5)
+                                lid = seclabelId(target, provider, " ("
+                                        + target.kind().name().toLowerCase(Locale.ROOT)
+                                        + ")");
+                            }
+                            final var label = rs.getString("label");
+                            define(lid, label, Map.of(
+                                    CREATE_SQL, "SECURITY LABEL FOR "
+                                            + PgIdentifiers.quote(provider) + " ON "
+                                            + annotationTarget(target)
+                                            + " IS " + sqlLiteral(label),
+                                    DROP_SQL, "SECURITY LABEL FOR "
+                                            + PgIdentifiers.quote(provider) + " ON "
+                                            + annotationTarget(target) + " IS NULL"));
+                            dep(lid, target);
+                        } else {
+                            define(new ObjectId(ObjectKind.OTHER, "seclabel:" + provider
+                                    + "." + rs.getString("target")
+                                    + (rs.getString("attname") == null
+                                            ? "" : "." + rs.getString("attname"))),
+                                    "security-label", Map.of());
+                        }
+                    }
+                }
+            }
+        }
+
         /** Loads every catalog object a desired script can create in the
          *  namespace that has no managed {@link ObjectKind}, as OTHER, so the
          *  diff reports it UNSUPPORTED instead of ignoring it (5.4). */
         void loadOther(Connection conn) throws SQLException {
-            // user-defined types that stay unsupported: ranges, multiranges
-            // and base types (array types carry typelem != 0 and are not
-            // standalone; enums and domains are managed TYPE/DOMAIN objects)
+            // user-defined types that stay unsupported: base types (array
+            // types carry typelem != 0 and are not standalone; enums,
+            // composites and ranges are managed TYPE objects, domains
+            // managed DOMAIN, and a range's multirange folds into it)
             try (PreparedStatement ps = conn.prepareStatement("""
                     SELECT t.oid, t.typname, t.typtype
                     FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace
-                    WHERE n.nspname = ?
-                      AND (t.typtype IN ('r','m')
-                           OR (t.typtype = 'b' AND t.typelem = 0))
+                    WHERE n.nspname = ? AND t.typtype = 'b' AND t.typelem = 0
                     ORDER BY t.oid
                     """)) {
                 ps.setString(1, ns);
@@ -1071,36 +2398,12 @@ public final class PgCatalog {
             }
             // policies on our tables load as managed POLICY objects in
             // loadPolicies — nothing to detect here
-            // aggregates and window functions (prokind 'a','w') — detected as
-            // OTHER; functions and procedures ('f','p') are managed ROUTINEs
-            try (PreparedStatement ps = conn.prepareStatement("""
-                    SELECT p.oid, p.proname || '(' || coalesce(
-                            (SELECT string_agg(format_type(a, NULL), ', ' ORDER BY x.i)
-                               FROM unnest(string_to_array(p.proargtypes::text, ' ')::oid[])
-                                  WITH ORDINALITY AS x(a, i)), '') || ')' AS name,
-                           p.prokind
-                    FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
-                    WHERE n.nspname = ? AND p.prokind IN ('a','w')
-                    ORDER BY p.oid
-                    """)) {
-                ps.setString(1, ns);
-                try (ResultSet rs = ps.executeQuery()) {
-                    while (rs.next()) {
-                        if (extMember(rs.getLong("oid"))) {
-                            continue;
-                        }
-                        final var id = new ObjectId(ObjectKind.OTHER,
-                                "routine:" + rs.getString("name"));
-                        procByOid.put(rs.getLong("oid"), id);
-                        define(id, "prokind=" + rs.getString("prokind"), Map.of());
-                    }
-                }
-            }
-            // encoding conversions
+            // encoding conversions a desired script cannot express
+            // (DEFAULT CONVERSION is a database-wide object word)
             try (PreparedStatement ps = conn.prepareStatement("""
                     SELECT cv.oid, cv.conname
                     FROM pg_conversion cv JOIN pg_namespace n ON n.oid = cv.connamespace
-                    WHERE n.nspname = ?
+                    WHERE n.nspname = ? AND cv.condefault
                     ORDER BY cv.oid
                     """)) {
                 ps.setString(1, ns);
@@ -1116,54 +2419,16 @@ public final class PgCatalog {
                     }
                 }
             }
-            // non-view rewrite rules (_RETURN is part of the view itself)
-            try (PreparedStatement ps = conn.prepareStatement("""
-                    SELECT r.oid, c.relname || '.' || r.rulename AS name
-                    FROM pg_rewrite r
-                    JOIN pg_class c ON c.oid = r.ev_class
-                    JOIN pg_namespace n ON n.oid = c.relnamespace AND n.nspname = ?
-                    WHERE r.rulename <> '_RETURN'
-                    ORDER BY 2
-                    """)) {
-                ps.setString(1, ns);
-                try (ResultSet rs = ps.executeQuery()) {
-                    while (rs.next()) {
-                        if (extMember(rs.getLong("oid"))) {
-                            continue;
-                        }
-                        final var id = new ObjectId(ObjectKind.OTHER,
-                                "rule:" + rs.getString("name"));
-                        otherOid("pg_rewrite", rs.getLong("oid"), id);
-                        define(id, "rule", Map.of());
-                    }
-                }
-            }
-            // extended statistics objects
-            try (PreparedStatement ps = conn.prepareStatement("""
-                    SELECT s.oid, c.relname || '.' || s.stxname AS name
-                    FROM pg_statistic_ext s
-                    JOIN pg_class c ON c.oid = s.stxrelid
-                    JOIN pg_namespace n ON n.oid = s.stxnamespace AND n.nspname = ?
-                    ORDER BY 2
-                    """)) {
-                ps.setString(1, ns);
-                try (ResultSet rs = ps.executeQuery()) {
-                    while (rs.next()) {
-                        if (extMember(rs.getLong("oid"))) {
-                            continue;
-                        }
-                        final var id = new ObjectId(ObjectKind.OTHER,
-                                "statistics:" + rs.getString("name"));
-                        otherOid("pg_statistic_ext", rs.getLong("oid"), id);
-                        define(id, "statistics", Map.of());
-                    }
-                }
-            }
-            // collations (referenced by column dependencies too)
+            // collations the managed loader cannot express (default provider,
+            // bound encoding) stay OTHER
             try (PreparedStatement ps = conn.prepareStatement("""
                     SELECT cl.oid, cl.collname
                     FROM pg_collation cl JOIN pg_namespace n ON n.oid = cl.collnamespace
                     WHERE n.nspname = ?
+                      AND (cl.collprovider NOT IN ('c', 'i')
+                           OR cl.collencoding NOT IN (-1,
+                               (SELECT encoding FROM pg_database
+                                WHERE datname = current_database())))
                     ORDER BY cl.oid
                     """)) {
                 ps.setString(1, ns);
@@ -1179,161 +2444,224 @@ public final class PgCatalog {
                     }
                 }
             }
-            // full-text-search objects
+            // granted privileges: object acl columns are NULL until a
+            // GRANT. On a managed target the acl becomes a managed
+            // PRIVILEGES object mirroring the target like OWNERSHIP —
+            // grantee roles are cluster-object references (4.1), whose
+            // existence is a preflight concern. On an unmanaged target the
+            // acl stays privileges: OTHER — still content-compared, so a
+            // target holding the same grants reports nothing (5.4). The
+            // definition is the sorted grantee:PRIVILEGE[*] token list with
+            // the owner written <owner> and the grantor dropped.
             try (PreparedStatement ps = conn.prepareStatement("""
-                    SELECT 'fts-config:' || g.cfgname AS name, 'pg_ts_config' AS cls, g.oid
-                    FROM pg_ts_config g JOIN pg_namespace n ON n.oid = g.cfgnamespace AND n.nspname = ?
-                    UNION ALL
-                    SELECT 'fts-dict:' || g.dictname, 'pg_ts_dict', g.oid
-                    FROM pg_ts_dict g JOIN pg_namespace n ON n.oid = g.dictnamespace AND n.nspname = ?
-                    UNION ALL
-                    SELECT 'fts-parser:' || g.prsname, 'pg_ts_parser', g.oid
-                    FROM pg_ts_parser g JOIN pg_namespace n ON n.oid = g.prsnamespace AND n.nspname = ?
-                    UNION ALL
-                    SELECT 'fts-template:' || g.tmplname, 'pg_ts_template', g.oid
-                    FROM pg_ts_template g JOIN pg_namespace n ON n.oid = g.tmplnamespace AND n.nspname = ?
-                    ORDER BY 1
-                    """)) {
-                bindNamespace(ps, 4);
-                try (ResultSet rs = ps.executeQuery()) {
-                    while (rs.next()) {
-                        if (extMember(rs.getLong("oid"))) {
-                            continue;
-                        }
-                        final var id = new ObjectId(ObjectKind.OTHER, rs.getString("name"));
-                        otherOid(rs.getString("cls"), rs.getLong("oid"), id);
-                        define(id, "text-search", Map.of());
-                    }
-                }
-            }
-            // operators, operator classes and families
-            try (PreparedStatement ps = conn.prepareStatement("""
-                    SELECT 'operator:' || g.oprname || '('
-                            || COALESCE(g.oprleft::regtype::text, '-') || ','
-                            || COALESCE(g.oprright::regtype::text, '-') || ')' AS name,
-                           'pg_operator' AS cls, g.oid
-                    FROM pg_operator g JOIN pg_namespace n ON n.oid = g.oprnamespace AND n.nspname = ?
-                    UNION ALL
-                    SELECT 'opclass:' || g.opcname, 'pg_opclass', g.oid
-                    FROM pg_opclass g JOIN pg_namespace n ON n.oid = g.opcnamespace AND n.nspname = ?
-                    UNION ALL
-                    SELECT 'opfamily:' || g.opfname, 'pg_opfamily', g.oid
-                    FROM pg_opfamily g JOIN pg_namespace n ON n.oid = g.opfnamespace AND n.nspname = ?
-                    ORDER BY 1
-                    """)) {
-                bindNamespace(ps, 3);
-                try (ResultSet rs = ps.executeQuery()) {
-                    while (rs.next()) {
-                        if (extMember(rs.getLong("oid"))) {
-                            continue;
-                        }
-                        final var id = new ObjectId(ObjectKind.OTHER, rs.getString("name"));
-                        otherOid(rs.getString("cls"), rs.getLong("oid"), id);
-                        define(id, "operator", Map.of());
-                    }
-                }
-            }
-
-            // security labels on namespace objects (pg_seclabel)
-            try (PreparedStatement ps = conn.prepareStatement("""
-                    SELECT 'seclabel:' || o.name
-                            || CASE WHEN a.attname IS NULL THEN '' ELSE '.' || a.attname END AS name,
-                            d.objoid, o.cls::text AS cls, d.objsubid, a.attname
-                    FROM pg_seclabel d
-                    JOIN (""" + NS_OBJECTS + """
-                    ) o ON o.cls = d.classoid AND o.obj = d.objoid
-                    LEFT JOIN pg_attribute a ON d.classoid = 'pg_class'::regclass
-                            AND a.attrelid = d.objoid AND a.attnum = d.objsubid
-                    ORDER BY 1
-                    """)) {
-                bindNamespace(ps, 17);
-                try (ResultSet rs = ps.executeQuery()) {
-                    while (rs.next()) {
-                        if (extMember(rs.getLong("objoid"))) {
-                            continue;
-                        }
-                        final var id = new ObjectId(ObjectKind.OTHER,
-                                rs.getString("name"));
-                        define(id, "security-label", Map.of());
-                        // a label dies with its target but cannot be recreated —
-                        // it blocks an unrecreatable drop like any dependent
-                        dep(id, commentTarget(rs.getString("cls"), rs.getLong("objoid"),
-                                rs.getInt("objsubid"), rs.getString("attname")));
-                    }
-                }
-            }
-            // granted privileges: object acl columns are NULL until a GRANT. The
-            // definition is the sorted ACL, with the owner written as <owner>, so a
-            // target that already holds the same grants compares equal (5.4).
-            try (PreparedStatement ps = conn.prepareStatement("""
-                    SELECT 'privileges:' || c.relname AS name, c.oid,
+                    SELECT 'pg_class' AS cls, 'privileges:' || c.relname AS name,
+                           c.oid, '' AS attname,
                            """ + aclTokens("c.relacl", "c.relowner") + """
                            AS acl
                     FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
                     WHERE n.nspname = ? AND c.relacl IS NOT NULL
                     UNION ALL
-                    SELECT 'privileges:' || p.proname || '('
-                            || pg_get_function_identity_arguments(p.oid) || ')', p.oid,
+                    SELECT 'pg_proc', 'privileges:' || p.proname || '('
+                            || pg_get_function_identity_arguments(p.oid) || ')',
+                            p.oid, '',
                            """ + aclTokens("p.proacl", "p.proowner") + """
                            AS acl
                     FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
                     WHERE n.nspname = ? AND p.proacl IS NOT NULL
                     UNION ALL
-                    SELECT 'privileges:' || t.typname, t.oid,
+                    SELECT 'pg_type', 'privileges:' || t.typname, t.oid, '',
                            """ + aclTokens("t.typacl", "t.typowner") + """
                            AS acl
                     FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace
                     WHERE n.nspname = ? AND t.typacl IS NOT NULL
-                    ORDER BY 1
+                    UNION ALL
+                    SELECT 'pg_attribute', 'privileges:' || c.relname
+                            || '.' || a.attname, a.attrelid, a.attname,
+                           """ + aclTokens("a.attacl", "c.relowner") + """
+                           AS acl
+                    FROM pg_attribute a
+                    JOIN pg_class c ON c.oid = a.attrelid
+                    JOIN pg_namespace n ON n.oid = c.relnamespace
+                    WHERE n.nspname = ? AND a.attacl IS NOT NULL
+                      AND a.attnum > 0 AND NOT a.attisdropped
+                    ORDER BY 2, 1
                     """)) {
-                bindNamespace(ps, 3);
+                bindNamespace(ps, 4);
                 try (ResultSet rs = ps.executeQuery()) {
                     while (rs.next()) {
-                        if (extMember(rs.getLong("oid"))) {
+                        final var oid = rs.getLong("oid");
+                        if (extMember(oid)) {
                             continue;
                         }
-                        define(new ObjectId(ObjectKind.OTHER, rs.getString("name")),
-                                "privileges=" + rs.getString("acl"),
-                                Map.of(Dialect.CONTENT_COMPARED_ATTRIBUTE, "true"));
+                        final var acl = rs.getString("acl");
+                        if (acl == null) {
+                            // an acl of '{}' unnests to no rows — no grants
+                            // held, so nothing to compare
+                            continue;
+                        }
+                        final var attname = rs.getString("attname");
+                        if (rs.getString("cls").equals("pg_attribute")) {
+                            columnPrivileges(oid, rs.getString("name"),
+                                    attname, acl);
+                            continue;
+                        }
+                        final var target = switch (rs.getString("cls")) {
+                            case "pg_class" -> relByOid.get(oid);
+                            case "pg_proc" -> procByOid.get(oid);
+                            default -> typeByOid.get(oid);
+                        };
+                        if (target == null || target.kind() == ObjectKind.OTHER
+                                || foldedMembers.contains(oid)) {
+                            define(new ObjectId(ObjectKind.OTHER,
+                                    rs.getString("name")), "privileges=" + acl,
+                                    Map.of(Dialect.CONTENT_COMPARED_ATTRIBUTE,
+                                            "true"));
+                            continue;
+                        }
+                        var pid = privilegesId(target, "");
+                        if (objects.containsKey(pid)) {
+                            pid = privilegesId(target, " (" + target.kind().name()
+                                    .toLowerCase(Locale.ROOT) + ")");
+                        }
+                        define(pid, "privileges=" + acl,
+                                Map.of(GRANT_TARGET, grantTarget(target)));
+                        dep(pid, target);
                     }
                 }
             }
-            // ownership changed away from the executing role
+            // schema-scoped default privileges (pg_default_acl) — future
+            // grants the namespace applies to every new object of a class.
+            // Global rows (defaclnamespace = 0) belong to no namespace and
+            // stay invisible like every other cluster object (A.5).
             try (PreparedStatement ps = conn.prepareStatement("""
-                    SELECT 'ownership:' || c.relname AS name, c.oid
+                    SELECT d.oid, r.rolname AS role, d.defaclobjtype AS objtype,
+                           """ + aclTokens("d.defaclacl", "d.defaclrole") + """
+                           AS acl
+                    FROM pg_default_acl d
+                    JOIN pg_roles r ON r.oid = d.defaclrole
+                    JOIN pg_namespace n ON n.oid = d.defaclnamespace
+                    WHERE n.nspname = ?
+                    ORDER BY 2, 3
+                    """)) {
+                bindNamespace(ps, 1);
+                try (ResultSet rs = ps.executeQuery()) {
+                    while (rs.next()) {
+                        final var oid = rs.getLong("oid");
+                        if (extMember(oid)) {
+                            continue;
+                        }
+                        final var acl = rs.getString("acl");
+                        final var classWord = defaultAclClass(rs.getString("objtype"));
+                        if (acl == null || classWord == null) {
+                            continue;
+                        }
+                        final var role = rs.getString("role");
+                        final var id = new ObjectId(ObjectKind.DEFAULT_PRIVILEGES,
+                                classWord + " for " + role);
+                        define(id, "privileges=" + acl, Map.of(
+                                GRANT_TARGET, classWord,
+                                GRANT_PREFIX, "ALTER DEFAULT PRIVILEGES FOR ROLE "
+                                        + PgIdentifiers.quote(role)
+                                        + " IN SCHEMA ${namespace}"));
+                    }
+                }
+            }
+            // ownership: the role that owns each object, filtered by the
+            // session role — a script that assigns no owner leaves the
+            // object session-owned, so an absent OWNER TO means "don't
+            // care", not "claim". On a managed target the role is a
+            // cluster-object reference (4.1): the ownership binding becomes
+            // a managed OWNERSHIP object named and parented like the target
+            // (mirroring COMMENT); on an unmanaged target it stays OTHER.
+            // An index's relowner always follows its table's — it cannot
+            // diverge, so index rows are skipped outright.
+            try (PreparedStatement ps = conn.prepareStatement("""
+                    -- an index's relowner always follows its table's — it
+                    -- cannot diverge — and a composite's 'c' or a toast 't'
+                    -- row follows its type/table, so 'i'/'I'/'c'/'t' are out
+                    SELECT 'pg_class' AS cls, 'ownership:' || c.relname AS name,
+                           c.oid, c.relowner::regrole::text AS owner
                     FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
-                    WHERE n.nspname = ? AND c.relowner::regrole::text <> current_user
+                    WHERE n.nspname = ? AND c.relkind NOT IN ('i', 'I', 'c', 't')
+                      AND c.relowner::regrole::text <> current_user
                     UNION ALL
-                    SELECT 'ownership:' || p.proname || '('
-                            || pg_get_function_identity_arguments(p.oid) || ')', p.oid
+                    SELECT 'pg_proc', 'ownership:' || p.proname || '('
+                            || pg_get_function_identity_arguments(p.oid) || ')',
+                           p.oid, p.proowner::regrole::text
                     FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
                     WHERE n.nspname = ? AND p.proowner::regrole::text <> current_user
                     UNION ALL
-                    SELECT 'ownership:' || t.typname, t.oid
+                    SELECT 'pg_type', 'ownership:' || t.typname,
+                           t.oid, t.typowner::regrole::text
                     FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace
                     WHERE n.nspname = ? AND t.typowner::regrole::text <> current_user
-                    ORDER BY 1
+                      -- a table's implicit rowtype and its array type flip
+                      -- owner with the table — neither is a type object of
+                      -- its own; only a standalone composite's 'c' relation
+                      -- counts. A multirange follows its range (ALTER TYPE on
+                      -- it is rejected outright), so 'm' is out too
+                      AND t.typtype <> 'm'
+                      AND t.typelem = 0
+                      AND NOT EXISTS (SELECT 1 FROM pg_class rt
+                                      WHERE rt.oid = t.typrelid
+                                        AND rt.relkind <> 'c')
+                    ORDER BY 2
                     """)) {
                 bindNamespace(ps, 3);
                 try (ResultSet rs = ps.executeQuery()) {
                     while (rs.next()) {
-                        if (extMember(rs.getLong("oid"))) {
+                        final var oid = rs.getLong("oid");
+                        if (extMember(oid)) {
                             continue;
                         }
-                        define(new ObjectId(ObjectKind.OTHER, rs.getString("name")),
-                                "ownership", Map.of());
+                        final var target = switch (rs.getString("cls")) {
+                            case "pg_class" -> relByOid.get(oid);
+                            case "pg_proc" -> procByOid.get(oid);
+                            default -> typeByOid.get(oid);
+                        };
+                        if (target != null && target.kind() == ObjectKind.INDEX) {
+                            continue;
+                        }
+                        final var owner = rs.getString("owner");
+                        if (target == null || target.kind() == ObjectKind.OTHER
+                                || foldedMembers.contains(oid)) {
+                            define(new ObjectId(ObjectKind.OTHER,
+                                    rs.getString("name")), "ownership", Map.of());
+                            continue;
+                        }
+                        var wid = ownershipId(target, "");
+                        if (objects.containsKey(wid)) {
+                            wid = ownershipId(target, " (" + target.kind().name()
+                                    .toLowerCase(Locale.ROOT) + ")");
+                        }
+                        define(wid, "owner=" + owner,
+                                Map.of(CREATE_SQL, "ALTER " + annotationTarget(target)
+                                        + " OWNER TO " + PgIdentifiers.quote(owner)));
+                        dep(wid, target);
                     }
                 }
             }
             // publication bindings on namespace tables (the publication itself
-            // is database-level; the FOR TABLE edge is the namespace-visible part)
+            // is a cluster-level reference, 4.1; the FOR TABLE edge is the
+            // namespace-visible part). The binding's parent is the bound
+            // table, so it orders after it; filter/column lists ride in the
+            // canonical (pg_publication_rel.prqual/.prattrs, PG15+)
+            final var relBindingCols = serverMajor >= 15;
             try (PreparedStatement ps = conn.prepareStatement("""
-                    SELECT 'publication:' || p.pubname || ':' || c.relname AS name, c.oid
+                    SELECT p.pubname, c.relname, c.oid,
+                           """ + (relBindingCols ? """
+                           pg_get_expr(pr.prqual, pr.prrelid) AS qual,
+                           (SELECT string_agg(a.attname, ',' ORDER BY u.ord)
+                              FROM unnest(string_to_array(pr.prattrs::text, ' ')::smallint[])
+                                   WITH ORDINALITY u(attnum, ord)
+                              JOIN pg_attribute a
+                                ON a.attrelid = pr.prrelid AND a.attnum = u.attnum) AS cols
+                           """ : "NULL AS qual, NULL AS cols\n") + """
                     FROM pg_publication_rel pr
                     JOIN pg_class c ON c.oid = pr.prrelid
                     JOIN pg_namespace n ON n.oid = c.relnamespace AND n.nspname = ?
                     JOIN pg_publication p ON p.oid = pr.prpubid
-                    ORDER BY 1
+                    ORDER BY 1, 2
                     """)) {
                 ps.setString(1, ns);
                 try (ResultSet rs = ps.executeQuery()) {
@@ -1341,8 +2669,7 @@ public final class PgCatalog {
                         if (extMember(rs.getLong("oid"))) {
                             continue;
                         }
-                        define(new ObjectId(ObjectKind.OTHER, rs.getString("name")),
-                                "publication", Map.of());
+                        publicationBinding(rs, "TABLE", "table");
                     }
                 }
             }
@@ -1350,7 +2677,8 @@ public final class PgCatalog {
             // the publication to the schema itself (PostgreSQL 15+)
             if (serverMajor >= 15) {
                 try (PreparedStatement ps = conn.prepareStatement("""
-                        SELECT 'publication:' || p.pubname AS name
+                        SELECT p.pubname, NULL AS relname,
+                               NULL AS qual, NULL AS cols
                         FROM pg_publication_namespace pn
                         JOIN pg_namespace n ON n.oid = pn.pnnspid AND n.nspname = ?
                         JOIN pg_publication p ON p.oid = pn.pnpubid
@@ -1359,18 +2687,42 @@ public final class PgCatalog {
                     ps.setString(1, ns);
                     try (ResultSet rs = ps.executeQuery()) {
                         while (rs.next()) {
-                            define(new ObjectId(ObjectKind.OTHER, rs.getString("name")),
-                                    "publication", Map.of());
+                            publicationBinding(rs, "TABLES IN SCHEMA", "schema");
                         }
                     }
                 }
             }
             // casts have no namespace; they are visible through a namespace
             // source/target type or cast function (a cast between two foreign
-            // types has no namespace anchor and stays outside the model)
+            // types has no namespace anchor and stays outside the model).
+            // A cast anchored to a managed object becomes a managed CAST —
+            // its identity is the (source AS target) pair and foreign types
+            // or the cast function stay cluster/namespace references in the
+            // canonical; a cast anchored only to unmanaged objects stays
+            // cast: OTHER
             try (PreparedStatement ps = conn.prepareStatement("""
-                    SELECT c.oid, 'cast:' || format_type(c.castsource, NULL)
-                            || '->' || format_type(c.casttarget, NULL) AS name
+                    SELECT c.oid, c.castsource, c.casttarget, c.castfunc,
+                           'cast:' || format_type(c.castsource, NULL)
+                            || '->' || format_type(c.casttarget, NULL) AS name,
+                           format_type(c.castsource, NULL)
+                            || '->' || format_type(c.casttarget, NULL) AS bare,
+                           c.castcontext::text || ' ' || c.castmethod::text || ' '
+                               || CASE WHEN c.castfunc = 0 THEN 'none'
+                                       ELSE c.castfunc::regprocedure::text
+                                       END AS canon,
+                           'CREATE CAST (' || format_type(c.castsource, NULL)
+                               || ' AS ' || format_type(c.casttarget, NULL) || ') '
+                               || CASE c.castmethod
+                                      WHEN 'f' THEN 'WITH FUNCTION '
+                                              || c.castfunc::regprocedure::text
+                                      WHEN 'i' THEN 'WITH INOUT' END
+                               || CASE c.castcontext
+                                      WHEN 'a' THEN ' AS ASSIGNMENT'
+                                      WHEN 'i' THEN ' AS IMPLICIT'
+                                      ELSE '' END AS create_sql,
+                           'DROP CAST (' || format_type(c.castsource, NULL)
+                               || ' AS ' || format_type(c.casttarget, NULL)
+                               || ')' AS drop_sql
                     FROM pg_cast c
                     WHERE EXISTS (SELECT 1 FROM pg_type t
                                   JOIN pg_namespace n ON n.oid = t.typnamespace
@@ -1384,21 +2736,84 @@ public final class PgCatalog {
                 bindNamespace(ps, 2);
                 try (ResultSet rs = ps.executeQuery()) {
                     while (rs.next()) {
-                        if (extMember(rs.getLong("oid"))) {
+                        final var oid = rs.getLong("oid");
+                        if (extMember(oid)) {
                             continue;
                         }
-                        final var id = new ObjectId(ObjectKind.OTHER,
-                                rs.getString("name"));
-                        otherOid("pg_cast", rs.getLong("oid"), id);
-                        define(id, "cast", Map.of());
+                        if (autoCasts.containsKey(oid)) {
+                            // the range→multirange cast folds into the range
+                            // type — its oid remaps so dependents resolve
+                            otherOid("pg_cast", oid,
+                                    typeByOid.get(autoCasts.get(oid)));
+                            continue;
+                        }
+                        final var source = typeByOid.get(rs.getLong("castsource"));
+                        final var target = typeByOid.get(rs.getLong("casttarget"));
+                        final var func = procByOid.get(rs.getLong("castfunc"));
+                        // managed only when every anchor visible in the
+                        // namespace resolves managed — a cast on an
+                        // unsupported rowtype cannot be created, so it
+                        // stays OTHER instead of failing at apply
+                        final var managed = (managedAnchor(source)
+                                || managedAnchor(target) || managedAnchor(func))
+                                && !(otherAnchor(source) || otherAnchor(target)
+                                        || otherAnchor(func));
+                        if (!managed || rs.getString("create_sql") == null) {
+                            // unanchored, or a castmethod the profile cannot
+                            // render (binary casts were removed in PG10)
+                            final var id = new ObjectId(ObjectKind.OTHER,
+                                    rs.getString("name"));
+                            otherOid("pg_cast", oid, id);
+                            define(id, "cast", Map.of());
+                            continue;
+                        }
+                        final var id = new ObjectId(ObjectKind.CAST,
+                                rs.getString("bare"));
+                        otherOid("pg_cast", oid, id);
+                        dep(id, managedAnchor(source) ? source : null);
+                        dep(id, managedAnchor(target) ? target : null);
+                        dep(id, managedAnchor(func) ? func : null);
+                        define(id, rs.getString("canon"),
+                                Map.of(CREATE_SQL, rs.getString("create_sql"),
+                                        DROP_SQL, rs.getString("drop_sql")));
                     }
                 }
             }
             // transforms have no namespace; anchor on the type or the
-            // from/to-SQL functions
+            // from/to-SQL functions. A transform's only expressible anchor
+            // is the FOR type (3.2) — a transform on a managed type becomes
+            // a managed TRANSFORM, its identity the type/language pair and
+            // the language itself a cluster reference; anything else stays
+            // transform: OTHER
             try (PreparedStatement ps = conn.prepareStatement("""
-                    SELECT t.oid, 'transform:' || format_type(t.trftype, NULL)
-                            || '/' || l.lanname AS name
+                    SELECT t.oid, t.trftype, t.trffromsql, t.trftosql,
+                           'transform:' || format_type(t.trftype, NULL)
+                            || '/' || l.lanname AS name,
+                           format_type(t.trftype, NULL)
+                            || '/' || l.lanname AS bare,
+                           CASE WHEN t.trffromsql = 0 THEN 'none'
+                                ELSE t.trffromsql::regprocedure::text END || ' '
+                            || CASE WHEN t.trftosql = 0 THEN 'none'
+                                    ELSE t.trftosql::regprocedure::text
+                                    END AS canon,
+                           'CREATE TRANSFORM FOR '
+                            || format_type(t.trftype, NULL) || ' LANGUAGE '
+                            || quote_ident(l.lanname)
+                            || ' ('
+                            || CASE WHEN t.trffromsql = 0 THEN ''
+                                    ELSE 'FROM SQL WITH FUNCTION '
+                                         || t.trffromsql::regprocedure::text
+                                         || CASE WHEN t.trftosql <> 0
+                                                 THEN ', ' ELSE '' END
+                                    END
+                            || CASE WHEN t.trftosql = 0 THEN ''
+                                    ELSE 'TO SQL WITH FUNCTION '
+                                         || t.trftosql::regprocedure::text
+                                    END
+                            || ')' AS create_sql,
+                           'DROP TRANSFORM FOR '
+                            || format_type(t.trftype, NULL) || ' LANGUAGE '
+                            || quote_ident(l.lanname) AS drop_sql
                     FROM pg_transform t JOIN pg_language l ON l.oid = t.trflang
                     WHERE EXISTS (SELECT 1 FROM pg_type ty
                                   JOIN pg_namespace n ON n.oid = ty.typnamespace
@@ -1412,13 +2827,27 @@ public final class PgCatalog {
                 bindNamespace(ps, 2);
                 try (ResultSet rs = ps.executeQuery()) {
                     while (rs.next()) {
-                        if (extMember(rs.getLong("oid"))) {
+                        final var oid = rs.getLong("oid");
+                        if (extMember(oid)) {
                             continue;
                         }
-                        final var id = new ObjectId(ObjectKind.OTHER,
-                                rs.getString("name"));
-                        otherOid("pg_transform", rs.getLong("oid"), id);
-                        define(id, "transform", Map.of());
+                        final var type = typeByOid.get(rs.getLong("trftype"));
+                        if (!managedAnchor(type)) {
+                            final var id = new ObjectId(ObjectKind.OTHER,
+                                    rs.getString("name"));
+                            otherOid("pg_transform", oid, id);
+                            define(id, "transform", Map.of());
+                            continue;
+                        }
+                        final var id = new ObjectId(ObjectKind.TRANSFORM,
+                                rs.getString("bare"));
+                        otherOid("pg_transform", oid, id);
+                        dep(id, type);
+                        dep(id, procByOid.get(rs.getLong("trffromsql")));
+                        dep(id, procByOid.get(rs.getLong("trftosql")));
+                        define(id, rs.getString("canon"),
+                                Map.of(CREATE_SQL, rs.getString("create_sql"),
+                                        DROP_SQL, rs.getString("drop_sql")));
                     }
                 }
             }
@@ -1449,23 +2878,70 @@ public final class PgCatalog {
                 }
             }
             // sequence publication bindings — the pg_publication_sequences
-            // view exists from PostgreSQL 19 (pg_publication_rel covers tables)
+            // view exists from PostgreSQL 19 (pg_publication_rel covers
+            // tables) and also expands FOR ALL SEQUENCES flags, which have no
+            // per-sequence binding to reconcile — those pubs are filtered out
             if (serverMajor >= 19) {
                 try (PreparedStatement ps = conn.prepareStatement("""
-                        SELECT 'publication:' || v.pubname || ':' || v.sequencename AS name
+                        SELECT v.pubname, v.sequencename AS relname,
+                               NULL AS qual, NULL AS cols
                         FROM pg_publication_sequences v
-                        WHERE v.schemaname = ?
+                        JOIN pg_publication p ON p.pubname = v.pubname
+                         WHERE v.schemaname = ? AND NOT p.puballsequences
                         ORDER BY 1
                         """)) {
                     ps.setString(1, ns);
                     try (ResultSet rs = ps.executeQuery()) {
                         while (rs.next()) {
-                            define(new ObjectId(ObjectKind.OTHER, rs.getString("name")),
-                                    "publication", Map.of());
+                            publicationBinding(rs, "SEQUENCE", "sequence");
                         }
                     }
                 }
             }
+        }
+
+        /**
+         * One managed {@link ObjectKind#PUBLICATION} binding: name the
+         * publication (a cluster-object reference, 4.1), parent the bound
+         * relation, and render the {@code ALTER PUBLICATION} add/drop pair.
+         * {@code verb} is the statement's object word — {@code TABLE},
+         * {@code TABLES IN SCHEMA} or {@code SEQUENCE}; {@code shape} is the
+         * canonical's binding discriminator.
+         */
+        private void publicationBinding(ResultSet rs, String verb, String shape)
+                throws SQLException {
+            final var pub = rs.getString("pubname");
+            final var rel = rs.getString("relname");
+            final var qual = rs.getString("qual");
+            final var cols = rs.getString("cols");
+            final var id = rel == null
+                    ? new ObjectId(ObjectKind.PUBLICATION, pub)
+                    : new ObjectId(ObjectKind.PUBLICATION, pub, rel);
+            final var qpub = PgIdentifiers.quote(pub);
+            final var create = new StringBuilder("ALTER PUBLICATION ").append(qpub)
+                    .append(" ADD ").append(verb).append(' ');
+            if (rel == null) {
+                create.append("${namespace}");
+            } else {
+                create.append(tableRef(rel));
+            }
+            if (cols != null) {
+                create.append(" (").append(Arrays.stream(cols.split(","))
+                        .map(PgIdentifiers::quote)
+                        .collect(Collectors.joining(","))).append(')');
+            }
+            if (qual != null) {
+                create.append(" WHERE (").append(qual).append(')');
+            }
+            final var drop = new StringBuilder("ALTER PUBLICATION ").append(qpub)
+                    .append(" DROP ").append(verb).append(' ')
+                    .append(rel == null ? "${namespace}" : tableRef(rel));
+            define(id, "binding=" + shape
+                    + (qual != null ? ";filter=" + qual : "")
+                    + (cols != null ? ";columns=" + cols : ""),
+                    Map.of(
+                            CREATE_SQL, create.toString(),
+                            DROP_SQL, drop.toString()));
         }
 
         /**
@@ -1500,7 +2976,7 @@ public final class PgCatalog {
                             continue;
                         }
                         final var attname = rs.getString("attname");
-                        final var target = commentTarget(rs.getString("cls"),
+                        final var target = annotatedTarget(rs.getString("cls"),
                                 rs.getLong("objoid"), rs.getInt("objsubid"), attname);
                         if (target != null && target.kind() != ObjectKind.OTHER
                                 && objects.containsKey(target)) {
@@ -1536,9 +3012,120 @@ public final class PgCatalog {
                     : new ObjectId(ObjectKind.COMMENT, name);
         }
 
-        /** The managed object a description row annotates, or null when the
-         *  annotated catalog entry maps to no managed object. */
-        private ObjectId commentTarget(String cls, long objoid, int objsubid,
+        /** The mirrored SECURITY_LABEL id for a managed target and provider,
+         *  with the optional collision suffix. */
+        private static ObjectId seclabelId(ObjectId target, String provider, String suffix) {
+            final var name = provider + ":" + target.name() + suffix;
+            return target.parent().isPresent()
+                    ? new ObjectId(ObjectKind.SECURITY_LABEL, name, target.parent().get())
+                    : new ObjectId(ObjectKind.SECURITY_LABEL, name);
+        }
+
+        /** The mirrored OWNERSHIP id for a managed target, with the optional
+         *  collision suffix. */
+        private static ObjectId ownershipId(ObjectId target, String suffix) {
+            final var name = target.name() + suffix;
+            return target.parent().isPresent()
+                    ? new ObjectId(ObjectKind.OWNERSHIP, name, target.parent().get())
+                    : new ObjectId(ObjectKind.OWNERSHIP, name);
+        }
+
+        /** A managed namespace object an anchored catalog row can belong
+         *  to — a null or {@code OTHER} anchor leaves the row unsupported. */
+        private static boolean managedAnchor(ObjectId id) {
+            return id != null && id.kind() != ObjectKind.OTHER;
+        }
+
+        /** An in-namespace {@code OTHER} anchor — the row references an
+         *  unsupported object, so it can never be created. */
+        private static boolean otherAnchor(ObjectId id) {
+            return id != null && id.kind() == ObjectKind.OTHER;
+        }
+
+        /** The mirrored PRIVILEGES id for a managed target, with the optional
+         *  collision suffix. */
+        /**
+         * A column-level grant — {@code pg_attribute.attacl} on a relation in
+         * the namespace. On a managed relation it mirrors the column like a
+         * comment does ({@code PRIVILEGES <col>} parented on the relation)
+         * and renders through the same token diff, the column name
+         * parenthesized after the privilege word; on an unmanaged relation it
+         * stays {@code privileges:<rel>.<col>} OTHER, content-compared.
+         */
+        private void columnPrivileges(long relOid, String name, String attname,
+                                      String acl) {
+            final var rel = relByOid.get(relOid);
+            if (rel == null || rel.kind() == ObjectKind.OTHER
+                    || foldedMembers.contains(relOid)) {
+                define(new ObjectId(ObjectKind.OTHER, name), "privileges=" + acl,
+                        Map.of(Dialect.CONTENT_COMPARED_ATTRIBUTE, "true"));
+                return;
+            }
+            final var pid = new ObjectId(ObjectKind.PRIVILEGES, attname,
+                    rel.name());
+            final var attrs = new HashMap<String, String>();
+            attrs.put(GRANT_TARGET, grantTarget(rel));
+            attrs.put(GRANT_COLUMN, PgIdentifiers.quote(attname));
+            define(pid, "privileges=" + acl, attrs);
+            // order after the column when it is a modeled object (tables and
+            // partitions carry COLUMN objects; views and materialized views
+            // do not) — otherwise the relation itself suffices
+            final var column = new ObjectId(ObjectKind.COLUMN, attname,
+                    rel.name());
+            dep(pid, objects.containsKey(column) ? column : rel);
+        }
+
+        /**
+         * The GRANT object-class word of a {@code pg_default_acl} objtype —
+         * {@code r} tables, {@code S} sequences, {@code f} functions and
+         * procedures, {@code T} types. An unknown future objtype renders no
+         * statement and is skipped.
+         */
+        private static String defaultAclClass(String objtype) {
+            return switch (objtype) {
+                case "r" -> "TABLES";
+                case "S" -> "SEQUENCES";
+                case "f" -> "FUNCTIONS";
+                case "T" -> "TYPES";
+                default -> null;
+            };
+        }
+
+        private static ObjectId privilegesId(ObjectId target, String suffix) {
+            final var name = target.name() + suffix;
+            return target.parent().isPresent()
+                    ? new ObjectId(ObjectKind.PRIVILEGES, name, target.parent().get())
+                    : new ObjectId(ObjectKind.PRIVILEGES, name);
+        }
+
+        /**
+         * The {@code <KEYWORD> ${namespace}.<name>} target phrase of a
+         * {@code GRANT|REVOKE ... ON} statement for a managed target — the
+         * relation kinds grant through {@code TABLE} except foreign tables,
+         * which use their own keyword; routines reuse the annotation phrase
+         * ({@code FUNCTION|PROCEDURE name(sigargs)}).
+         */
+        private String grantTarget(ObjectId target) {
+            final var n = "${namespace}";
+            final var name = PgIdentifiers.quote(target.name());
+            return switch (target.kind()) {
+                case TABLE, PARTITION, VIEW, MATERIALIZED_VIEW ->
+                        "TABLE " + n + "." + name;
+                case FOREIGN_TABLE -> "FOREIGN TABLE " + n + "." + name;
+                case SEQUENCE -> "SEQUENCE " + n + "." + name;
+                case TYPE -> "TYPE " + n + "." + name;
+                case DOMAIN -> "DOMAIN " + n + "." + name;
+                case ROUTINE -> routineAnnotationTarget(target);
+                case AGGREGATE -> routineAnnotationTarget(target, "FUNCTION");
+                default -> throw new IllegalStateException(
+                        "no grant form for " + target.kind());
+            };
+        }
+
+        /** The managed object an annotation row (comment or security label)
+         *  targets, or null when the annotated catalog entry maps to no
+         *  managed object. */
+        private ObjectId annotatedTarget(String cls, long objoid, int objsubid,
                                        String attname) {
             switch (cls) {
                 case "pg_class":
@@ -1550,15 +3137,42 @@ public final class PgCatalog {
                             ? new ObjectId(ObjectKind.COLUMN, attname, rel.name())
                             : null;
                 case "pg_proc":
-                    return procByOid.get(objoid);
+                    // a folded constructor has no annotation target of its
+                    // own — a comment or label on it stays OTHER
+                    return foldedMembers.contains(objoid) ? null
+                            : procByOid.get(objoid);
                 case "pg_constraint":
                     return conByOid.get(objoid);
                 case "pg_policy":
                     return polByOid.get(objoid);
+                case "pg_statistic_ext":
+                    return stxByOid.get(objoid);
+                case "pg_rewrite":
+                    return ruleByOid.get(objoid);
+                case "pg_collation":
+                    return collByOid.get(objoid);
+                case "pg_conversion":
+                    return convByOid.get(objoid);
                 case "pg_type":
-                    return typeByOid.get(objoid);
+                    // a folded multirange likewise stays OTHER
+                    return foldedMembers.contains(objoid) ? null
+                            : typeByOid.get(objoid);
                 case "pg_trigger":
                     return tgByOid.get(objoid);
+                case "pg_ts_template":
+                    return tmplByOid.get(objoid);
+                case "pg_ts_parser":
+                    return prsByOid.get(objoid);
+                case "pg_ts_dict":
+                    return dictByOid.get(objoid);
+                case "pg_ts_config":
+                    return cfgByOid.get(objoid);
+                case "pg_operator":
+                    return oprByOid.get(objoid);
+                case "pg_opclass":
+                    return opcByOid.get(objoid);
+                case "pg_opfamily":
+                    return opfByOid.get(objoid);
                 default:
                     return null;
             }
@@ -1566,36 +3180,68 @@ public final class PgCatalog {
 
         /** The {@code COMMENT ON <target> IS 'text'} statement for a managed target. */
         private String commentSql(ObjectId target, String text) {
+            return "COMMENT ON " + annotationTarget(target) + " IS " + sqlLiteral(text);
+        }
+
+        /**
+         * The {@code <KEYWORD> <name>} target phrase shared by
+         * {@code COMMENT ON} and {@code SECURITY LABEL ... ON}.
+         */
+        private String annotationTarget(ObjectId target) {
             final var n = "${namespace}";
             final var name = PgIdentifiers.quote(target.name());
             final var parent = target.parent().orElse(null);
             final var qParent = parent == null
                     ? null : n + "." + PgIdentifiers.quote(parent);
-            final var prefix = switch (target.kind()) {
-                case TABLE -> "COMMENT ON TABLE " + n + "." + name;
-                case VIEW -> "COMMENT ON VIEW " + n + "." + name;
-                case MATERIALIZED_VIEW -> "COMMENT ON MATERIALIZED VIEW " + n + "." + name;
-                case SEQUENCE -> "COMMENT ON SEQUENCE " + n + "." + name;
-                case INDEX -> "COMMENT ON INDEX " + n + "." + name;
-                case COLUMN -> "COMMENT ON COLUMN " + qParent + "." + name;
-                case PRIMARY_KEY, UNIQUE, FOREIGN_KEY, CHECK ->
-                        "COMMENT ON CONSTRAINT " + name + " ON " + qParent;
-                case TRIGGER -> "COMMENT ON TRIGGER " + name + " ON " + qParent;
-                case POLICY -> "COMMENT ON POLICY " + name + " ON " + qParent;
-                case TYPE -> "COMMENT ON TYPE " + n + "." + name;
-                case DOMAIN -> "COMMENT ON DOMAIN " + n + "." + name;
-                case ROUTINE -> routineCommentSql(target);
+            return switch (target.kind()) {
+                case TABLE, PARTITION -> "TABLE " + n + "." + name;
+                case FOREIGN_TABLE -> "FOREIGN TABLE " + n + "." + name;
+                case VIEW -> "VIEW " + n + "." + name;
+                case MATERIALIZED_VIEW -> "MATERIALIZED VIEW " + n + "." + name;
+                case SEQUENCE -> "SEQUENCE " + n + "." + name;
+                case INDEX -> "INDEX " + n + "." + name;
+                case COLUMN -> "COLUMN " + qParent + "." + name;
+                case PRIMARY_KEY, UNIQUE, FOREIGN_KEY, CHECK, EXCLUSION ->
+                        "CONSTRAINT " + name + " ON " + qParent;
+                case TRIGGER -> "TRIGGER " + name + " ON " + qParent;
+                case POLICY -> "POLICY " + name + " ON " + qParent;
+                case STATISTICS -> "STATISTICS " + n + "." + name;
+                case RULE -> "RULE " + name + " ON " + qParent;
+                case COLLATION -> "COLLATION " + n + "." + name;
+                case CONVERSION -> "CONVERSION " + n + "." + name;
+                case TYPE -> "TYPE " + n + "." + name;
+                case DOMAIN -> "DOMAIN " + n + "." + name;
+                case ROUTINE -> routineAnnotationTarget(target);
+                case AGGREGATE -> routineAnnotationTarget(target, "AGGREGATE");
+                case TEXT_SEARCH_TEMPLATE ->
+                        "TEXT SEARCH TEMPLATE " + n + "." + name;
+                case TEXT_SEARCH_PARSER ->
+                        "TEXT SEARCH PARSER " + n + "." + name;
+                case TEXT_SEARCH_DICTIONARY ->
+                        "TEXT SEARCH DICTIONARY " + n + "." + name;
+                case TEXT_SEARCH_CONFIGURATION ->
+                        "TEXT SEARCH CONFIGURATION " + n + "." + name;
+                case OPERATOR -> "OPERATOR " + n + "." + name;
+                case OPERATOR_CLASS -> "OPERATOR CLASS " + n + "." + name;
+                case OPERATOR_FAMILY -> "OPERATOR FAMILY " + n + "." + name;
                 default -> throw new IllegalStateException(
-                        "no COMMENT ON form for " + target.kind());
+                        "no annotation form for " + target.kind());
             };
-            return prefix + " IS " + sqlLiteral(text);
         }
 
-        /** {@code COMMENT ON FUNCTION|PROCEDURE <name>(<sigargs>)}. */
-        private String routineCommentSql(ObjectId target) {
+        /** {@code FUNCTION|PROCEDURE <name>(<sigargs>)}. */
+        private String routineAnnotationTarget(ObjectId target) {
             final var o = objects.get(target);
             final var kind = o.attrs.getOrDefault(PROKIND, "f").equals("p")
                     ? "PROCEDURE" : "FUNCTION";
+            return routineAnnotationTarget(target, kind);
+        }
+
+        /** {@code <word> <name>(<sigargs>)} — {@code FUNCTION} for a grant
+         *  on an aggregate, {@code AGGREGATE} for its annotation/owner
+         *  forms. */
+        private String routineAnnotationTarget(ObjectId target, String kind) {
+            final var o = objects.get(target);
             // the id name was built as proname + "(" + sigargs + ")" — strip
             // that exact suffix so a quoted proname containing '(' survives
             final var sigargs = o.attrs.getOrDefault(SIG_ARGS, "");
@@ -1603,7 +3249,7 @@ public final class PgCatalog {
             final var fname = target.name().endsWith(suffix)
                     ? target.name().substring(0, target.name().length() - suffix.length())
                     : target.name();
-            return "COMMENT ON " + kind + " ${namespace}."
+            return kind + " ${namespace}."
                     + PgIdentifiers.quote(fname) + "(" + sigargs + ")";
         }
 
@@ -1634,7 +3280,9 @@ public final class PgCatalog {
                     SELECT DISTINCT v.oid AS viewer, d.refobjid AS dep
                     FROM pg_rewrite r
                     JOIN pg_depend d ON d.classid = 'pg_rewrite'::regclass AND d.objid = r.oid
-                        AND d.refclassid IN ('pg_proc'::regclass, 'pg_type'::regclass)
+                        AND d.refclassid IN ('pg_proc'::regclass, 'pg_type'::regclass,'pg_ts_config'::regclass,'pg_ts_dict'::regclass,
+                                           'pg_ts_parser'::regclass,'pg_ts_template'::regclass,
+                                           'pg_operator'::regclass,'pg_opclass'::regclass,'pg_opfamily'::regclass)
                     JOIN pg_class v ON v.oid = r.ev_class AND v.relkind IN ('v','m')
                     JOIN pg_namespace vn ON vn.oid = v.relnamespace AND vn.nspname = ?
                     WHERE r.rulename = '_RETURN'
@@ -1656,7 +3304,10 @@ public final class PgCatalog {
                     JOIN pg_namespace pn ON pn.oid = p.pronamespace AND pn.nspname = ?
                     WHERE d.classid = 'pg_proc'::regclass
                       AND d.refclassid IN ('pg_class'::regclass, 'pg_proc'::regclass,
-                                           'pg_type'::regclass, 'pg_language'::regclass)
+                                           'pg_type'::regclass, 'pg_language'::regclass,
+                                           'pg_ts_config'::regclass,'pg_ts_dict'::regclass,
+                                           'pg_ts_parser'::regclass,'pg_ts_template'::regclass,
+                                           'pg_operator'::regclass,'pg_opclass'::regclass,'pg_opfamily'::regclass)
                     """)) {
                 ps.setString(1, ns);
                 try (ResultSet rs = ps.executeQuery()) {
@@ -1702,7 +3353,10 @@ public final class PgCatalog {
                         AND NOT a.attisdropped
                     WHERE d.classid = 'pg_attrdef'::regclass AND d.deptype = 'n'
                       AND d.refclassid IN ('pg_class'::regclass, 'pg_proc'::regclass,
-                                           'pg_type'::regclass)
+                                           'pg_type'::regclass,
+                                           'pg_ts_config'::regclass,'pg_ts_dict'::regclass,
+                                           'pg_ts_parser'::regclass,'pg_ts_template'::regclass,
+                                           'pg_operator'::regclass,'pg_opclass'::regclass,'pg_opfamily'::regclass)
                     """)) {
                 ps.setString(1, ns);
                 try (ResultSet rs = ps.executeQuery()) {
@@ -1731,7 +3385,10 @@ public final class PgCatalog {
                     JOIN pg_namespace cn ON cn.oid = cr.relnamespace AND cn.nspname = ?
                     WHERE d.classid = 'pg_constraint'::regclass
                       AND d.refclassid IN ('pg_proc'::regclass, 'pg_type'::regclass,
-                                           'pg_class'::regclass, 'pg_constraint'::regclass)
+                                           'pg_class'::regclass, 'pg_constraint'::regclass,
+                                           'pg_ts_config'::regclass,'pg_ts_dict'::regclass,
+                                           'pg_ts_parser'::regclass,'pg_ts_template'::regclass,
+                                           'pg_operator'::regclass,'pg_opclass'::regclass,'pg_opfamily'::regclass)
                     """)) {
                 ps.setString(1, ns);
                 try (ResultSet rs = ps.executeQuery()) {
@@ -1750,15 +3407,18 @@ public final class PgCatalog {
                     }
                 }
             }
-            // domains -> their base type, and domain check constraints ->
-            // the routines, types and relations their expressions use
+            // domains and ranges -> their base/subtype, canonical and
+            // subtype-diff routines; domain check constraints -> the
+            // routines, types and relations their expressions use
             try (PreparedStatement ps = conn.prepareStatement("""
                     SELECT d.objid AS dom, d.refobjid AS dep
                     FROM pg_depend d
-                    JOIN pg_type t ON t.oid = d.objid AND t.typtype = 'd'
+                    JOIN pg_type t ON t.oid = d.objid AND t.typtype IN ('d','r')
                     JOIN pg_namespace n ON n.oid = t.typnamespace AND n.nspname = ?
                     WHERE d.classid = 'pg_type'::regclass
-                      AND d.refclassid IN ('pg_type'::regclass, 'pg_proc'::regclass)
+                      AND d.refclassid IN ('pg_type'::regclass, 'pg_proc'::regclass,'pg_ts_config'::regclass,'pg_ts_dict'::regclass,
+                                           'pg_ts_parser'::regclass,'pg_ts_template'::regclass,
+                                           'pg_operator'::regclass,'pg_opclass'::regclass,'pg_opfamily'::regclass)
                     UNION
                     SELECT c.contypid, d.refobjid
                     FROM pg_depend d
@@ -1767,7 +3427,10 @@ public final class PgCatalog {
                     JOIN pg_namespace n ON n.oid = t.typnamespace AND n.nspname = ?
                     WHERE d.classid = 'pg_constraint'::regclass
                       AND d.refclassid IN ('pg_proc'::regclass, 'pg_type'::regclass,
-                                           'pg_class'::regclass)
+                                           'pg_class'::regclass,
+                                           'pg_ts_config'::regclass,'pg_ts_dict'::regclass,
+                                           'pg_ts_parser'::regclass,'pg_ts_template'::regclass,
+                                           'pg_operator'::regclass,'pg_opclass'::regclass,'pg_opfamily'::regclass)
                     """)) {
                 ps.setString(1, ns);
                 ps.setString(2, ns);
@@ -1787,7 +3450,10 @@ public final class PgCatalog {
                     JOIN pg_namespace n ON n.oid = c.relnamespace AND n.nspname = ?
                     WHERE d.classid = 'pg_policy'::regclass
                       AND d.refclassid IN ('pg_proc'::regclass, 'pg_type'::regclass,
-                                           'pg_class'::regclass)
+                                           'pg_class'::regclass,
+                                           'pg_ts_config'::regclass,'pg_ts_dict'::regclass,
+                                           'pg_ts_parser'::regclass,'pg_ts_template'::regclass,
+                                           'pg_operator'::regclass,'pg_opclass'::regclass,'pg_opfamily'::regclass)
                     """)) {
                 ps.setString(1, ns);
                 try (ResultSet rs = ps.executeQuery()) {
@@ -1808,7 +3474,9 @@ public final class PgCatalog {
                     LEFT JOIN pg_attribute a ON a.attrelid = d.objid AND a.attnum = d.objsubid
                         AND NOT a.attisdropped
                     WHERE d.classid = 'pg_class'::regclass AND d.deptype = 'n'
-                      AND d.refclassid IN ('pg_type'::regclass, 'pg_collation'::regclass)
+                      AND d.refclassid IN ('pg_type'::regclass, 'pg_collation'::regclass,'pg_ts_config'::regclass,'pg_ts_dict'::regclass,
+                                           'pg_ts_parser'::regclass,'pg_ts_template'::regclass,
+                                           'pg_operator'::regclass,'pg_opclass'::regclass,'pg_opfamily'::regclass)
                     """)) {
                 ps.setString(1, ns);
                 try (ResultSet rs = ps.executeQuery()) {
@@ -1864,7 +3532,9 @@ public final class PgCatalog {
                                         'pg_ts_parser'::regclass,'pg_ts_template'::regclass)
                       AND d.refclassid IN ('pg_class'::regclass,'pg_proc'::regclass,
                                            'pg_type'::regclass,'pg_collation'::regclass,
-                                           'pg_language'::regclass,'pg_constraint'::regclass)
+                                           'pg_language'::regclass,'pg_constraint'::regclass,
+                                           'pg_ts_config'::regclass,'pg_ts_dict'::regclass,
+                                           'pg_ts_parser'::regclass,'pg_ts_template'::regclass)
                     """)) {
                 try (ResultSet rs = ps.executeQuery()) {
                     while (rs.next()) {
@@ -1877,6 +3547,10 @@ public final class PgCatalog {
                         final var to = switch (rs.getString("refcls")) {
                             case "pg_constraint" -> conByOid.get(ref);
                             case "pg_collation" -> collByOid.get(ref);
+                            case "pg_ts_config" -> cfgByOid.get(ref);
+                            case "pg_ts_dict" -> dictByOid.get(ref);
+                            case "pg_ts_parser" -> prsByOid.get(ref);
+                            case "pg_ts_template" -> tmplByOid.get(ref);
                             default -> byOid(ref);
                         };
                         dep(from, to);
@@ -2019,6 +3693,91 @@ public final class PgCatalog {
                       AND d.refclassid IN ('pg_proc'::regclass, 'pg_type'::regclass,
                                            'pg_class'::regclass)
                     UNION
+                    -- dependents in other namespaces on our text-search and
+                    -- operator objects — views, column defaults, and the
+                    -- families' own member rows (an external dictionary on our
+                    -- template, an external family member on our operator);
+                    -- no tgt join: byOid resolves in-namespace refs only
+                    SELECT DISTINCT d.refobjid, rn.nspname, rc.relname
+                    FROM pg_depend d
+                    JOIN pg_rewrite r ON r.oid = d.objid
+                    JOIN pg_class rc ON rc.oid = r.ev_class
+                    JOIN pg_namespace rn ON rn.oid = rc.relnamespace AND rn.nspname <> ?
+                    WHERE d.classid = 'pg_rewrite'::regclass
+                      AND d.refclassid IN ('pg_ts_config'::regclass,'pg_ts_dict'::regclass,
+                                           'pg_ts_parser'::regclass,'pg_ts_template'::regclass,
+                                           'pg_operator'::regclass,'pg_opclass'::regclass,
+                                           'pg_opfamily'::regclass)
+                    UNION
+                    SELECT DISTINCT d.refobjid, rn.nspname,
+                           rc.relname || '.' || a.attname
+                    FROM pg_depend d
+                    JOIN pg_attrdef ad ON ad.oid = d.objid
+                    JOIN pg_attribute a ON a.attrelid = ad.adrelid AND a.attnum = ad.adnum
+                        AND NOT a.attisdropped
+                    JOIN pg_class rc ON rc.oid = ad.adrelid
+                    JOIN pg_namespace rn ON rn.oid = rc.relnamespace AND rn.nspname <> ?
+                    WHERE d.classid = 'pg_attrdef'::regclass AND d.deptype = 'n'
+                      AND d.refclassid IN ('pg_ts_config'::regclass,'pg_ts_dict'::regclass,
+                                           'pg_ts_parser'::regclass,'pg_ts_template'::regclass,
+                                           'pg_operator'::regclass,'pg_opclass'::regclass,
+                                           'pg_opfamily'::regclass)
+                    UNION
+                    SELECT DISTINCT d.refobjid, tdn.nspname, td.dictname
+                    FROM pg_depend d
+                    JOIN pg_ts_dict td ON td.oid = d.objid
+                    JOIN pg_namespace tdn ON tdn.oid = td.dictnamespace AND tdn.nspname <> ?
+                    WHERE d.classid = 'pg_ts_dict'::regclass
+                      AND d.refclassid IN ('pg_ts_config'::regclass,'pg_ts_dict'::regclass,
+                                           'pg_ts_parser'::regclass,'pg_ts_template'::regclass)
+                    UNION
+                    -- config mappings record as pg_ts_config -> pg_ts_dict
+                    SELECT DISTINCT d.refobjid, cn.nspname, c.cfgname
+                    FROM pg_depend d
+                    JOIN pg_ts_config c ON c.oid = d.objid
+                    JOIN pg_namespace cn ON cn.oid = c.cfgnamespace AND cn.nspname <> ?
+                    WHERE d.classid = 'pg_ts_config'::regclass
+                      AND d.refclassid IN ('pg_ts_dict'::regclass,'pg_ts_parser'::regclass)
+                    UNION
+                    SELECT DISTINCT d.refobjid, ocn.nspname, oc.opcname
+                    FROM pg_depend d
+                    JOIN pg_opclass oc ON oc.oid = d.objid
+                    JOIN pg_namespace ocn ON ocn.oid = oc.opcnamespace AND ocn.nspname <> ?
+                    WHERE d.classid = 'pg_opclass'::regclass
+                      AND d.refclassid IN ('pg_opfamily'::regclass,'pg_operator'::regclass,
+                                           'pg_type'::regclass)
+                    UNION
+                    SELECT DISTINCT d.refobjid, fn.nspname, f.opfname
+                    FROM pg_depend d
+                    JOIN pg_amop m ON m.oid = d.objid
+                    JOIN pg_opfamily f ON f.oid = m.amopfamily
+                    JOIN pg_namespace fn ON fn.oid = f.opfnamespace AND fn.nspname <> ?
+                    WHERE d.classid = 'pg_amop'::regclass
+                      AND d.refclassid IN ('pg_opfamily'::regclass,'pg_operator'::regclass)
+                    UNION
+                    SELECT DISTINCT d.refobjid, fn.nspname, f.opfname
+                    FROM pg_depend d
+                    JOIN pg_amproc m ON m.oid = d.objid
+                    JOIN pg_opfamily f ON f.oid = m.amprocfamily
+                    JOIN pg_namespace fn ON fn.oid = f.opfnamespace AND fn.nspname <> ?
+                    WHERE d.classid = 'pg_amproc'::regclass
+                      AND d.refclassid IN ('pg_opfamily'::regclass,'pg_proc'::regclass)
+                    UNION
+                    SELECT DISTINCT d.refobjid, ons.nspname, o.oprname
+                    FROM pg_depend d
+                    JOIN pg_operator o ON o.oid = d.objid
+                    JOIN pg_namespace ons ON ons.oid = o.oprnamespace AND ons.nspname <> ?
+                    WHERE d.classid = 'pg_operator'::regclass
+                      AND d.refclassid IN ('pg_operator'::regclass,'pg_proc'::regclass,
+                                           'pg_type'::regclass)
+                    UNION
+                    SELECT DISTINCT d.refobjid, ofn.nspname, of.opfname
+                    FROM pg_depend d
+                    JOIN pg_opfamily of ON of.oid = d.objid
+                    JOIN pg_namespace ofn ON ofn.oid = of.opfnamespace AND ofn.nspname <> ?
+                    WHERE d.classid = 'pg_opfamily'::regclass
+                      AND d.refclassid = 'pg_opfamily'::regclass
+                    UNION
                     -- casts not anchored to this namespace (by function or by
                     -- either type — the loadOther anchor rule) that still use
                     -- our types or routines
@@ -2040,7 +3799,7 @@ public final class PgCatalog {
                       AND dtn.nspname IS DISTINCT FROM ?
                     """;
             try (PreparedStatement ps = conn.prepareStatement(sql)) {
-                for (var i = 1; i <= 19; i++) {
+                for (var i = 1; i <= 28; i++) {
                     ps.setString(i, ns);
                 }
                 try (ResultSet rs = ps.executeQuery()) {
@@ -2064,14 +3823,16 @@ public final class PgCatalog {
 
         /**
          * SQL for a deterministic rendering of an ACL column: one
-         * {@code grantor>grantee:PRIVILEGE[*]} token per entry (PUBLIC for
+         * {@code grantee:PRIVILEGE[*]} token per distinct entry (PUBLIC for
          * grantee 0, {@code <owner>} for the object's owner, {@code *} for
-         * grantable), sorted, so grant order cannot cause drift.
+         * grantable), sorted, so grant order cannot cause drift. The
+         * grantor is dropped — who made a grant is provenance, not desired
+         * state: a grant recorded under a different grantor is the same
+         * held privilege, and comparing it would drift forever (a
+         * REVOKE+GRANT pair cannot rename the grantor anyway).
          */
         private static String aclTokens(String acl, String owner) {
-            return "(SELECT string_agg(tok, ',' ORDER BY tok) FROM (SELECT"
-                    + " CASE WHEN a.grantor = " + owner + " THEN '<owner>'"
-                    + " ELSE a.grantor::regrole::text END || '>' ||"
+            return "(SELECT string_agg(tok, ',' ORDER BY tok) FROM (SELECT DISTINCT"
                     + " CASE WHEN a.grantee = 0 THEN 'PUBLIC'"
                     + " WHEN a.grantee = " + owner + " THEN '<owner>'"
                     + " ELSE a.grantee::regrole::text END || ':' || a.privilege_type ||"
@@ -2125,6 +3886,7 @@ public final class PgCatalog {
                 final var o = entry.getValue();
                 final var statements = switch (id.kind()) {
                     case TABLE -> tableDumpStatements(id, o);
+                    case FOREIGN_TABLE -> foreignTableDumpStatements(id, o);
                     case MATERIALIZED_VIEW -> {
                         final var create = o.attrs.get(CREATE_SQL);
                         yield create == null ? List.<String>of()
@@ -2140,12 +3902,75 @@ public final class PgCatalog {
                     case SEQUENCE -> foldedSequence(id)
                             ? List.<String>of()
                             : fragments(o, CREATE_SQL, OWNED_SQL);
+                    case PRIVILEGES -> privilegeDumpStatements(o);
                     default -> fragments(o, CREATE_SQL, POST_SQL, OWNED_SQL);
                 };
                 if (!statements.isEmpty()) {
                     o.attrs.put(DUMP_SQL, String.join("\0", statements));
                 }
             }
+        }
+
+        /**
+         * The CREATE FOREIGN TABLE fragment of
+         * {@code PgRender.createForeignTableStatements} in unbound token
+         * form: columns folded, then {@code SERVER}/{@code OPTIONS}.
+         */
+        private List<String> foreignTableDumpStatements(ObjectId id, Obj table) {
+            final var columns = objects.entrySet().stream()
+                    .filter(e -> e.getKey().kind() == ObjectKind.COLUMN
+                            && e.getKey().parent().orElse("").equals(id.name()))
+                    .sorted(Comparator.comparingInt(e -> Integer.parseInt(
+                            e.getValue().attrs.getOrDefault(ATTNUM, "0"))))
+                    .toList();
+            final var create = new StringBuilder("CREATE FOREIGN TABLE ")
+                    .append(tableRef(id.name())).append(" (\n")
+                    .append(columns.stream()
+                            .map(c -> "    " + c.getValue().attrs.get(COLUMN_SQL))
+                            .collect(Collectors.joining(",\n")))
+                    .append("\n) SERVER ")
+                    .append(PgIdentifiers.quote(table.attrs.get(FT_SERVER)));
+            final var options = table.attrs.getOrDefault(FT_OPTIONS, "");
+            if (!options.isEmpty()) {
+                create.append(" OPTIONS (").append(options).append(')');
+            }
+            return List.of(create.toString());
+        }
+
+        /**
+         * The GRANT list of a PRIVILEGES object: one statement per
+         * {@code grantee:PRIVILEGE[*]} token of the canonical — a bootstrap
+         * dump replays the grants the way the reconcile diff renders them.
+         * Implicit {@code <owner>} rights are not grants and are skipped.
+         */
+        private static List<String> privilegeDumpStatements(Obj o) {
+            final var target = o.attrs.get(GRANT_TARGET);
+            if (target == null) {
+                return List.of();
+            }
+            final var column = o.attrs.get(GRANT_COLUMN);
+            final var colClause = column == null ? "" : " (" + column + ")";
+            var c = o.def.canonical();
+            c = c.startsWith("privileges=")
+                    ? c.substring("privileges=".length()) : c;
+            final var grants = new ArrayList<String>();
+            if (!c.isEmpty()) {
+                for (final var tok : c.split(",")) {
+                    final var g = tok.substring(0, tok.lastIndexOf(':'));
+                    if (g.equals("<owner>")) {
+                        continue;
+                    }
+                    var p = tok.substring(tok.lastIndexOf(':') + 1);
+                    final var option = p.endsWith("*");
+                    if (option) {
+                        p = p.substring(0, p.length() - 1);
+                    }
+                    grants.add("GRANT " + p + colClause + " ON " + target + " TO "
+                            + (g.equals("PUBLIC") ? g : PgIdentifiers.quote(g))
+                            + (option ? " WITH GRANT OPTION" : ""));
+                }
+            }
+            return grants;
         }
 
         /** A sequence folded into its owner table's create fragment (A.5). */

@@ -43,7 +43,7 @@ import studio.epicquest.schema.reconciler.model.SchemaSnapshot;
 import studio.epicquest.schema.reconciler.spi.Dialect;
 
 /**
- * The dialect conformance suite of spec 9.2 — scenarios C-01 to C-48. A dialect
+ * The dialect conformance suite of spec 9.2 — scenarios C-01 to C-67. A dialect
  * is run by subclassing this class and providing a disposable database plus
  * per-test namespaces via the hooks below. Skips are permitted only for kinds
  * absent from {@code supportedKinds()} or undeclared capabilities, and every
@@ -142,6 +142,52 @@ public abstract class DialectConformanceTest {
      * {@code IF NOT EXISTS} clause then no-ops and no object materializes.
      */
     protected String extensionDdl() {
+        return null;
+    }
+
+    /**
+     * DDL that creates a foreign server named {@code tck_srv} usable from any
+     * namespace (C-55), or {@code null} to skip. The implementation may do its
+     * own setup (install the FDW, clean a stale server) before returning the
+     * statement; the statement itself is run on the target connection.
+     */
+    protected String foreignServerDdl() throws Exception {
+        return null;
+    }
+
+    /** Cleanup for {@link #foreignServerDdl()} — drops server {@code tck_srv}; {@code null} skips. */
+    protected String foreignServerTeardownDdl() throws Exception {
+        return null;
+    }
+
+    /**
+     * DDL that creates an empty publication named {@code tck_pub} (C-56), or
+     * {@code null} to skip. The publication is a cluster-level object — the
+     * desired script binds to it with {@code ALTER PUBLICATION}; it is never
+     * created or dropped by a reconciler plan.
+     */
+    protected String publicationDdl() throws Exception {
+        return null;
+    }
+
+    /** Cleanup for {@link #publicationDdl()} — drops publication {@code tck_pub}; {@code null} skips. */
+    protected String publicationTeardownDdl() throws Exception {
+        return null;
+    }
+
+    /**
+     * DDL that creates the cluster roles {@code tck_owner} and
+     * {@code tck_owner2} and grants the connecting role membership in both
+     * (C-57 — {@code ALTER ... OWNER TO} needs it), or {@code null} to skip.
+     * Roles are cluster-level objects (4.1): the desired script references
+     * them; it never creates them.
+     */
+    protected String ownershipRoleDdl() throws Exception {
+        return null;
+    }
+
+    /** Cleanup for {@link #ownershipRoleDdl()} — drops the {@code tck_owner*} roles; {@code null} skips. */
+    protected String ownershipRoleTeardownDdl() throws Exception {
         return null;
     }
 
@@ -290,6 +336,50 @@ public abstract class DialectConformanceTest {
 
     private static ObjectId policy(String parent, String name) {
         return new ObjectId(ObjectKind.POLICY, name, parent);
+    }
+
+    private static ObjectId exclusion(String parent, String name) {
+        return new ObjectId(ObjectKind.EXCLUSION, name, parent);
+    }
+
+    private static ObjectId statistics(String name) {
+        return new ObjectId(ObjectKind.STATISTICS, name);
+    }
+
+    private static ObjectId rule(String parent, String name) {
+        return new ObjectId(ObjectKind.RULE, name, parent);
+    }
+
+    private static ObjectId collation(String name) {
+        return new ObjectId(ObjectKind.COLLATION, name);
+    }
+
+    private static ObjectId conversion(String name) {
+        return new ObjectId(ObjectKind.CONVERSION, name);
+    }
+
+    private static ObjectId partition(String parent, String name) {
+        return new ObjectId(ObjectKind.PARTITION, name, parent);
+    }
+
+    private static ObjectId foreignTable(String name) {
+        return new ObjectId(ObjectKind.FOREIGN_TABLE, name);
+    }
+
+    private static ObjectId publication(String pub, String rel) {
+        return new ObjectId(ObjectKind.PUBLICATION, pub, rel);
+    }
+
+    private static ObjectId ownership(String target) {
+        return new ObjectId(ObjectKind.OWNERSHIP, target);
+    }
+
+    private static ObjectId privileges(String target) {
+        return new ObjectId(ObjectKind.PRIVILEGES, target);
+    }
+
+    private static ObjectId cast(String name) {
+        return new ObjectId(ObjectKind.CAST, name);
     }
 
     /** The row count of a relation in the test namespace — proves a
@@ -1228,5 +1318,770 @@ public abstract class DialectConformanceTest {
                 "dependents must follow their prerequisite: " + order);
         assertEquals(ReconcileOutcome.UP_TO_DATE,
                 reconciler(script).reconcile().outcome());
+    }
+
+    @Test
+    @DisplayName("C-49 exclusion constraint missing: ADDITIVE; drifted: REBUILD drop+create")
+    void c49ExclusionConstraint() throws Exception {
+        assumeKind(ObjectKind.EXCLUSION);
+        final var script = """
+                CREATE TABLE t (id bigint, span int4range,
+                    CONSTRAINT no_overlap EXCLUDE USING gist (span WITH &&))
+                """;
+        final var report = reconciler(script).reconcile();
+        assertEquals(ReconcileOutcome.RECONCILED, report.outcome());
+        assertTrue(report.applied().stream().anyMatch(c ->
+                        c.target().equals(exclusion("t", "no_overlap"))
+                                && c.safety() == ChangeSafety.ADDITIVE),
+                "expected an ADDITIVE create for the exclusion constraint: "
+                        + report.applied());
+        // the backing index is part of the constraint, not a separate INDEX
+        assertTrue(report.applied().stream()
+                        .noneMatch(c -> c.target().kind() == ObjectKind.INDEX),
+                "the exclusion's index must not surface as a separate change: "
+                        + report.applied());
+        assertEquals(ReconcileOutcome.UP_TO_DATE, reconciler(script).reconcile().outcome());
+        // a changed predicate drifts the constraint: drop + create in place
+        final var widened = """
+                CREATE TABLE t (id bigint, span int4range,
+                    CONSTRAINT no_overlap EXCLUDE USING gist (span WITH &&) WHERE (id > 0))
+                """;
+        final var drifted = reconciler(widened).reconcile();
+        assertEquals(ReconcileOutcome.RECONCILED, drifted.outcome());
+        assertTrue(drifted.applied().stream().anyMatch(c ->
+                        c.target().equals(exclusion("t", "no_overlap"))
+                                && c.safety() == ChangeSafety.REBUILD),
+                "expected a REBUILD recreate for the exclusion: " + drifted.applied());
+        assertEquals(ReconcileOutcome.UP_TO_DATE,
+                reconciler(widened).reconcile().outcome());
+    }
+
+    @Test
+    @DisplayName("C-50 statistics missing: ADDITIVE; drifted: REBUILD drop+create")
+    void c50Statistics() throws Exception {
+        assumeKind(ObjectKind.STATISTICS);
+        final var script = """
+                CREATE TABLE t (a int, b int);
+                CREATE STATISTICS st ON a, b FROM t
+                """;
+        final var report = reconciler(script).reconcile();
+        assertEquals(ReconcileOutcome.RECONCILED, report.outcome());
+        assertTrue(report.applied().stream().anyMatch(c ->
+                        c.target().equals(statistics("st"))
+                                && c.safety() == ChangeSafety.ADDITIVE),
+                "expected an ADDITIVE create for the statistics: " + report.applied());
+        assertEquals(ReconcileOutcome.UP_TO_DATE, reconciler(script).reconcile().outcome());
+        // a changed statistic-kind list drifts the object: drop + create
+        final var widened = """
+                CREATE TABLE t (a int, b int);
+                CREATE STATISTICS st (mcv) ON a, b FROM t
+                """;
+        final var drifted = reconciler(widened).reconcile();
+        assertEquals(ReconcileOutcome.RECONCILED, drifted.outcome());
+        assertTrue(drifted.applied().stream().anyMatch(c ->
+                        c.target().equals(statistics("st"))
+                                && c.safety() == ChangeSafety.REBUILD),
+                "expected a REBUILD recreate for the statistics: " + drifted.applied());
+        assertEquals(ReconcileOutcome.UP_TO_DATE,
+                reconciler(widened).reconcile().outcome());
+    }
+
+    @Test
+    @DisplayName("C-51 rule missing: ADDITIVE; drifted: REBUILD drop+create")
+    void c51Rule() throws Exception {
+        assumeKind(ObjectKind.RULE);
+        final var script = """
+                CREATE TABLE t (id bigint);
+                CREATE RULE rl AS ON INSERT TO t DO ALSO NOTHING
+                """;
+        final var report = reconciler(script).reconcile();
+        assertEquals(ReconcileOutcome.RECONCILED, report.outcome());
+        assertTrue(report.applied().stream().anyMatch(c ->
+                        c.target().equals(rule("t", "rl"))
+                                && c.safety() == ChangeSafety.ADDITIVE),
+                "expected an ADDITIVE create for the rule: " + report.applied());
+        assertEquals(ReconcileOutcome.UP_TO_DATE, reconciler(script).reconcile().outcome());
+        // a changed action drifts the rule: drop + create
+        final var changed = """
+                CREATE TABLE t (id bigint);
+                CREATE RULE rl AS ON INSERT TO t DO INSTEAD NOTHING
+                """;
+        final var drifted = reconciler(changed).reconcile();
+        assertEquals(ReconcileOutcome.RECONCILED, drifted.outcome());
+        assertTrue(drifted.applied().stream().anyMatch(c ->
+                        c.target().equals(rule("t", "rl"))
+                                && c.safety() == ChangeSafety.REBUILD),
+                "expected a REBUILD recreate for the rule: " + drifted.applied());
+        assertEquals(ReconcileOutcome.UP_TO_DATE,
+                reconciler(changed).reconcile().outcome());
+    }
+
+    @Test
+    @DisplayName("C-52 collation missing: ADDITIVE; drifted: REBUILD drop+create")
+    void c52Collation() throws Exception {
+        assumeKind(ObjectKind.COLLATION);
+        final var script = """
+                CREATE COLLATION coll (provider = libc, locale = 'C')
+                """;
+        final var report = reconciler(script).reconcile();
+        assertEquals(ReconcileOutcome.RECONCILED, report.outcome());
+        assertTrue(report.applied().stream().anyMatch(c ->
+                        c.target().equals(collation("coll"))
+                                && c.safety() == ChangeSafety.ADDITIVE),
+                "expected an ADDITIVE create for the collation: " + report.applied());
+        assertEquals(ReconcileOutcome.UP_TO_DATE, reconciler(script).reconcile().outcome());
+        // a changed locale drifts the collation: drop + create
+        final var changed = """
+                CREATE COLLATION coll (provider = libc, locale = 'POSIX')
+                """;
+        final var drifted = reconciler(changed).reconcile();
+        assertEquals(ReconcileOutcome.RECONCILED, drifted.outcome());
+        assertTrue(drifted.applied().stream().anyMatch(c ->
+                        c.target().equals(collation("coll"))
+                                && c.safety() == ChangeSafety.REBUILD),
+                "expected a REBUILD recreate for the collation: " + drifted.applied());
+        assertEquals(ReconcileOutcome.UP_TO_DATE,
+                reconciler(changed).reconcile().outcome());
+    }
+
+    @Test
+    @DisplayName("C-53 conversion missing: ADDITIVE; drifted: REBUILD drop+create")
+    void c53Conversion() throws Exception {
+        assumeKind(ObjectKind.CONVERSION);
+        final var script = """
+                CREATE CONVERSION cv FOR 'LATIN1' TO 'UTF8' FROM iso8859_1_to_utf8
+                """;
+        final var report = reconciler(script).reconcile();
+        assertEquals(ReconcileOutcome.RECONCILED, report.outcome());
+        assertTrue(report.applied().stream().anyMatch(c ->
+                        c.target().equals(conversion("cv"))
+                                && c.safety() == ChangeSafety.ADDITIVE),
+                "expected an ADDITIVE create for the conversion: " + report.applied());
+        assertEquals(ReconcileOutcome.UP_TO_DATE, reconciler(script).reconcile().outcome());
+        // a changed encoding pair drifts the conversion: drop + create
+        final var changed = """
+                CREATE CONVERSION cv FOR 'UTF8' TO 'LATIN1' FROM utf8_to_iso8859_1
+                """;
+        final var drifted = reconciler(changed).reconcile();
+        assertEquals(ReconcileOutcome.RECONCILED, drifted.outcome());
+        assertTrue(drifted.applied().stream().anyMatch(c ->
+                        c.target().equals(conversion("cv"))
+                                && c.safety() == ChangeSafety.REBUILD),
+                "expected a REBUILD recreate for the conversion: " + drifted.applied());
+        assertEquals(ReconcileOutcome.UP_TO_DATE,
+                reconciler(changed).reconcile().outcome());
+    }
+
+    @Test
+    @DisplayName("C-54 partitioned parent and children create ADDITIVE;"
+            + " bound drift: DESTRUCTIVE recreate")
+    void c54Partitions() throws Exception {
+        assumeKind(ObjectKind.PARTITION);
+        final var script = """
+                CREATE TABLE pt (k int) PARTITION BY RANGE (k);
+                CREATE TABLE pc PARTITION OF pt FOR VALUES FROM (0) TO (100)
+                """;
+        final var report = reconciler(script).reconcile();
+        assertEquals(ReconcileOutcome.RECONCILED, report.outcome());
+        assertTrue(report.applied().stream().anyMatch(c ->
+                        c.target().equals(table("pt"))
+                                && c.safety() == ChangeSafety.ADDITIVE),
+                "expected an ADDITIVE create for the parent: " + report.applied());
+        assertTrue(report.applied().stream().anyMatch(c ->
+                        c.target().equals(partition("pt", "pc"))
+                                && c.safety() == ChangeSafety.ADDITIVE),
+                "expected an ADDITIVE create for the partition: " + report.applied());
+        assertEquals(ReconcileOutcome.UP_TO_DATE, reconciler(script).reconcile().outcome());
+        // a moved bound re-homes rows: DESTRUCTIVE detach+attach recreate,
+        // refused by the default policy
+        final var changed = """
+                CREATE TABLE pt (k int) PARTITION BY RANGE (k);
+                CREATE TABLE pc PARTITION OF pt FOR VALUES FROM (0) TO (50)
+                """;
+        assertThrows(PolicyViolationException.class,
+                () -> reconciler(changed).reconcile());
+        final var drifted = reconciler(changed,
+                ReconcilePolicy.defaults().withDestructive(Decision.APPLY))
+                .reconcile();
+        assertEquals(ReconcileOutcome.RECONCILED, drifted.outcome());
+        assertTrue(drifted.applied().stream().anyMatch(c ->
+                        c.target().equals(partition("pt", "pc"))
+                                && c.safety() == ChangeSafety.DESTRUCTIVE),
+                "expected a DESTRUCTIVE recreate for the partition: " + drifted.applied());
+        assertEquals(ReconcileOutcome.UP_TO_DATE,
+                reconciler(changed).reconcile().outcome());
+    }
+
+    @Test
+    @DisplayName("C-55 foreign table create: ADDITIVE; options drift: drop+create REBUILD")
+    void c55ForeignTable() throws Exception {
+        assumeKind(ObjectKind.FOREIGN_TABLE);
+        final var server = foreignServerDdl();
+        assumeTrue(server != null, "skipped: dialect provides no foreign server hook");
+        execute(server);
+        try {
+            final var script = """
+                    CREATE FOREIGN TABLE ft (a int) SERVER tck_srv OPTIONS (fetch_size '100')
+                    """;
+            final var report = reconciler(script).reconcile();
+            assertEquals(ReconcileOutcome.RECONCILED, report.outcome());
+            assertTrue(report.applied().stream().anyMatch(c ->
+                            c.target().equals(foreignTable("ft"))
+                                    && c.safety() == ChangeSafety.ADDITIVE),
+                    "expected an ADDITIVE create for the foreign table: " + report.applied());
+            assertEquals(ReconcileOutcome.UP_TO_DATE,
+                    reconciler(script).reconcile().outcome());
+            // an options change carries no local data — plain drop+create
+            final var changed = """
+                    CREATE FOREIGN TABLE ft (a int) SERVER tck_srv OPTIONS (fetch_size '200')
+                    """;
+            final var drifted = reconciler(changed).reconcile();
+            assertEquals(ReconcileOutcome.RECONCILED, drifted.outcome());
+            assertTrue(drifted.applied().stream().anyMatch(c ->
+                            c.target().equals(foreignTable("ft"))
+                                    && c.safety() == ChangeSafety.REBUILD),
+                    "expected a REBUILD recreate for the foreign table: " + drifted.applied());
+            assertEquals(ReconcileOutcome.UP_TO_DATE,
+                    reconciler(changed).reconcile().outcome());
+        } finally {
+            final var teardown = foreignServerTeardownDdl();
+            if (teardown != null) {
+                execute(teardown);
+            }
+        }
+    }
+
+    @Test
+    @DisplayName("C-56 publication binding add: ADDITIVE; filter drift: drop+add REBUILD")
+    void c56PublicationBinding() throws Exception {
+        assumeKind(ObjectKind.PUBLICATION);
+        final var pub = publicationDdl();
+        assumeTrue(pub != null, "skipped: dialect provides no publication hook");
+        execute(pub);
+        try {
+            final var script = """
+                    CREATE TABLE t (a int);
+                    ALTER PUBLICATION tck_pub ADD TABLE t
+                    """;
+            final var report = reconciler(script).reconcile();
+            assertEquals(ReconcileOutcome.RECONCILED, report.outcome());
+            assertTrue(report.applied().stream().anyMatch(c ->
+                            c.target().equals(publication("tck_pub", "t"))
+                                    && c.safety() == ChangeSafety.ADDITIVE),
+                    "expected an ADDITIVE binding for the table: " + report.applied());
+            assertEquals(ReconcileOutcome.UP_TO_DATE,
+                    reconciler(script).reconcile().outcome());
+            // a row-filter change drops and re-adds the binding — REBUILD
+            final var changed = """
+                    CREATE TABLE t (a int);
+                    ALTER PUBLICATION tck_pub ADD TABLE t WHERE (a > 0)
+                    """;
+            final var drifted = reconciler(changed).reconcile();
+            assertEquals(ReconcileOutcome.RECONCILED, drifted.outcome());
+            assertTrue(drifted.applied().stream().anyMatch(c ->
+                            c.target().equals(publication("tck_pub", "t"))
+                                    && c.safety() == ChangeSafety.REBUILD),
+                    "expected a REBUILD recreate for the binding: " + drifted.applied());
+            assertEquals(ReconcileOutcome.UP_TO_DATE,
+                    reconciler(changed).reconcile().outcome());
+        } finally {
+            final var teardown = publicationTeardownDdl();
+            if (teardown != null) {
+                execute(teardown);
+            }
+        }
+    }
+
+    @Test
+    @DisplayName("C-57 ownership assign: REBUILD; owner drift: in-place REBUILD")
+    void c57Ownership() throws Exception {
+        assumeKind(ObjectKind.OWNERSHIP);
+        final var roles = ownershipRoleDdl();
+        assumeTrue(roles != null, "skipped: dialect provides no ownership-role hook");
+        execute(roles);
+        try {
+            final var script = """
+                    CREATE TABLE t (a int);
+                    ALTER TABLE t OWNER TO tck_owner
+                    """;
+            final var report = reconciler(script).reconcile();
+            assertEquals(ReconcileOutcome.RECONCILED, report.outcome());
+            assertTrue(report.applied().stream().anyMatch(c ->
+                            c.target().equals(ownership("t"))
+                                    && c.safety() == ChangeSafety.REBUILD),
+                    "expected a REBUILD owner assignment for t: " + report.applied());
+            assertEquals(ReconcileOutcome.UP_TO_DATE,
+                    reconciler(script).reconcile().outcome());
+            // a different desired role re-assigns in place — REBUILD
+            final var changed = """
+                    CREATE TABLE t (a int);
+                    ALTER TABLE t OWNER TO tck_owner2
+                    """;
+            final var drifted = reconciler(changed).reconcile();
+            assertEquals(ReconcileOutcome.RECONCILED, drifted.outcome());
+            assertTrue(drifted.applied().stream().anyMatch(c ->
+                            c.target().equals(ownership("t"))
+                                    && c.safety() == ChangeSafety.REBUILD),
+                    "expected a REBUILD owner change for t: " + drifted.applied());
+            assertEquals(ReconcileOutcome.UP_TO_DATE,
+                    reconciler(changed).reconcile().outcome());
+        } finally {
+            final var teardown = ownershipRoleTeardownDdl();
+            if (teardown != null) {
+                execute(teardown);
+            }
+        }
+    }
+
+    @Test
+    @DisplayName("C-58 privileges granted: REBUILD; grant drift: GRANT/REVOKE REBUILD")
+    void c58Privileges() throws Exception {
+        assumeKind(ObjectKind.PRIVILEGES);
+        final var roles = ownershipRoleDdl();
+        assumeTrue(roles != null, "skipped: dialect provides no grantee-role hook");
+        execute(roles);
+        try {
+            final var script = """
+                    CREATE TABLE t (a int);
+                    GRANT SELECT ON t TO tck_owner
+                    """;
+            final var report = reconciler(script).reconcile();
+            assertEquals(ReconcileOutcome.RECONCILED, report.outcome());
+            assertTrue(report.applied().stream().anyMatch(c ->
+                            c.target().equals(privileges("t"))
+                                    && c.safety() == ChangeSafety.REBUILD
+                                    && c.statements().stream()
+                                            .anyMatch(s -> s.startsWith("GRANT SELECT"))),
+                    "expected a REBUILD GRANT on t: " + report.applied());
+            assertEquals(ReconcileOutcome.UP_TO_DATE,
+                    reconciler(script).reconcile().outcome());
+            // a different desired grant converges the acl — revoke the old,
+            // grant the new, in one REBUILD change
+            final var changed = """
+                    CREATE TABLE t (a int);
+                    GRANT INSERT ON t TO tck_owner2
+                    """;
+            final var drifted = reconciler(changed).reconcile();
+            assertEquals(ReconcileOutcome.RECONCILED, drifted.outcome());
+            assertTrue(drifted.applied().stream().anyMatch(c ->
+                            c.target().equals(privileges("t"))
+                                    && c.safety() == ChangeSafety.REBUILD
+                                    && c.statements().stream()
+                                            .anyMatch(s -> s.startsWith("REVOKE"))
+                                    && c.statements().stream()
+                                            .anyMatch(s -> s.startsWith("GRANT INSERT"))),
+                    "expected a REBUILD GRANT+REVOKE on t: " + drifted.applied());
+            assertEquals(ReconcileOutcome.UP_TO_DATE,
+                    reconciler(changed).reconcile().outcome());
+        } finally {
+            final var teardown = ownershipRoleTeardownDdl();
+            if (teardown != null) {
+                execute(teardown);
+            }
+        }
+    }
+
+    @Test
+    @DisplayName("C-59 cast missing: ADDITIVE; cast context drift: drop+create REBUILD")
+    void c59Cast() throws Exception {
+        assumeKind(ObjectKind.CAST);
+        final var script = """
+                CREATE DOMAIN d AS integer CHECK (VALUE > 0);
+                CREATE FUNCTION dtotext(d) RETURNS text
+                    LANGUAGE sql IMMUTABLE RETURN $1::text;
+                CREATE CAST (d AS text) WITH FUNCTION dtotext(d)
+                """;
+        final var report = reconciler(script).reconcile();
+        assertEquals(ReconcileOutcome.RECONCILED, report.outcome());
+        assertTrue(report.applied().stream().anyMatch(c ->
+                        c.target().equals(cast("d->text"))
+                                && c.safety() == ChangeSafety.ADDITIVE),
+                "expected an ADDITIVE create for the cast: " + report.applied());
+        assertEquals(ReconcileOutcome.UP_TO_DATE,
+                reconciler(script).reconcile().outcome());
+        // a context change drops and recreates the cast
+        final var changed = """
+                CREATE DOMAIN d AS integer CHECK (VALUE > 0);
+                CREATE FUNCTION dtotext(d) RETURNS text
+                    LANGUAGE sql IMMUTABLE RETURN $1::text;
+                CREATE CAST (d AS text) WITH FUNCTION dtotext(d) AS IMPLICIT
+                """;
+        final var drifted = reconciler(changed).reconcile();
+        assertEquals(ReconcileOutcome.RECONCILED, drifted.outcome());
+        assertTrue(drifted.applied().stream().anyMatch(c ->
+                        c.target().equals(cast("d->text"))
+                                && c.safety() == ChangeSafety.REBUILD),
+                "expected a drop+create REBUILD for the cast: " + drifted.applied());
+        assertEquals(ReconcileOutcome.UP_TO_DATE,
+                reconciler(changed).reconcile().outcome());
+    }
+
+    @Test
+    @DisplayName("C-60 composite type missing: ADDITIVE; attribute drift: drop+create REBUILD")
+    void c60CompositeType() throws Exception {
+        assumeKind(ObjectKind.TYPE);
+        final var script = """
+                CREATE TYPE cmp AS (a integer, b text)
+                """;
+        final var report = reconciler(script).reconcile();
+        assertEquals(ReconcileOutcome.RECONCILED, report.outcome());
+        assertTrue(report.applied().stream().anyMatch(c ->
+                        c.target().equals(type("cmp"))
+                                && c.safety() == ChangeSafety.ADDITIVE
+                                && c.statements().stream()
+                                        .anyMatch(s -> s.startsWith("CREATE TYPE"))),
+                "expected an ADDITIVE CREATE TYPE for the composite: "
+                        + report.applied());
+        assertEquals(ReconcileOutcome.UP_TO_DATE,
+                reconciler(script).reconcile().outcome());
+        // attribute drift drops and recreates the type — a composite still
+        // referenced by a column blocks the drop like every other recreate
+        final var changed = """
+                CREATE TYPE cmp AS (a integer, b text, c numeric)
+                """;
+        final var drifted = reconciler(changed).reconcile();
+        assertEquals(ReconcileOutcome.RECONCILED, drifted.outcome());
+        assertTrue(drifted.applied().stream().anyMatch(c ->
+                        c.target().equals(type("cmp"))
+                                && c.safety() == ChangeSafety.REBUILD
+                                && c.statements().stream()
+                                        .anyMatch(s -> s.startsWith("DROP TYPE"))),
+                "expected a drop+create REBUILD for the composite: "
+                        + drifted.applied());
+        assertEquals(ReconcileOutcome.UP_TO_DATE,
+                reconciler(changed).reconcile().outcome());
+    }
+
+    @Test
+    @DisplayName("C-61 range type missing: ADDITIVE; pg_range drift: drop+create REBUILD")
+    void c61RangeType() throws Exception {
+        assumeKind(ObjectKind.TYPE);
+        // the generated family — multirange, constructor routines and the
+        // range→multirange cast — folds into the range: only the TYPE
+        // object is created, and a routine calling the folded constructor
+        // still orders after it
+        final var script = """
+                CREATE TYPE r AS RANGE (subtype = integer);
+                CREATE FUNCTION mk(x r) RETURNS r_multirange
+                    LANGUAGE sql IMMUTABLE AS 'SELECT r_multirange(x)'
+                """;
+        final var report = reconciler(script).reconcile();
+        assertEquals(ReconcileOutcome.RECONCILED, report.outcome());
+        assertTrue(report.applied().stream().anyMatch(c ->
+                        c.target().equals(type("r"))
+                                && c.safety() == ChangeSafety.ADDITIVE
+                                && c.statements().stream()
+                                        .anyMatch(s -> s.contains("AS RANGE"))),
+                "expected an ADDITIVE CREATE TYPE ... AS RANGE: "
+                        + report.applied());
+        assertEquals(ReconcileOutcome.UP_TO_DATE,
+                reconciler(script).reconcile().outcome());
+        // the dependent routine would block DROP TYPE (no CASCADE) — the
+        // drift phase recreates a bare range
+        execute("DROP FUNCTION " + qualified("mk") + "(" + qualified("r") + ")");
+        // a pg_range option change drops and recreates the type
+        final var changed = """
+                CREATE TYPE r AS RANGE (subtype = text, collation = "C")
+                """;
+        final var drifted = reconciler(changed).reconcile();
+        assertEquals(ReconcileOutcome.RECONCILED, drifted.outcome());
+        assertTrue(drifted.applied().stream().anyMatch(c ->
+                        c.target().equals(type("r"))
+                                && c.safety() == ChangeSafety.REBUILD
+                                && c.statements().stream()
+                                        .anyMatch(s -> s.startsWith("DROP TYPE"))),
+                "expected a drop+create REBUILD for the range: "
+                        + drifted.applied());
+        assertEquals(ReconcileOutcome.UP_TO_DATE,
+                reconciler(changed).reconcile().outcome());
+    }
+
+    @Test
+    @DisplayName("C-62 aggregate missing: ADDITIVE; option drift: drop+create REBUILD")
+    void c62Aggregate() throws Exception {
+        assumeKind(ObjectKind.AGGREGATE);
+        // pg_get_functiondef refuses aggregates — the canonical is the
+        // pg_aggregate option list, so any option change recreates
+        final var script = """
+                CREATE FUNCTION tfn(state int, x int)
+                    RETURNS int LANGUAGE sql IMMUTABLE AS 'SELECT state + x';
+                CREATE AGGREGATE a1(int) (SFUNC = tfn, STYPE = int, INITCOND = '0')
+                """;
+        final var report = reconciler(script).reconcile();
+        assertEquals(ReconcileOutcome.RECONCILED, report.outcome());
+        assertTrue(report.applied().stream().anyMatch(c ->
+                        c.target().kind() == ObjectKind.AGGREGATE
+                                && c.target().name().equals("a1(integer)")
+                                && c.safety() == ChangeSafety.ADDITIVE
+                                && c.statements().stream()
+                                        .anyMatch(s -> s.startsWith("CREATE AGGREGATE"))),
+                "expected an ADDITIVE CREATE AGGREGATE: " + report.applied());
+        assertEquals(ReconcileOutcome.UP_TO_DATE,
+                reconciler(script).reconcile().outcome());
+        final var changed = """
+                CREATE FUNCTION tfn(state int, x int)
+                    RETURNS int LANGUAGE sql IMMUTABLE AS 'SELECT state + x';
+                CREATE AGGREGATE a1(int) (SFUNC = tfn, STYPE = int)
+                """;
+        final var drifted = reconciler(changed).reconcile();
+        assertEquals(ReconcileOutcome.RECONCILED, drifted.outcome());
+        assertTrue(drifted.applied().stream().anyMatch(c ->
+                        c.target().kind() == ObjectKind.AGGREGATE
+                                && c.safety() == ChangeSafety.REBUILD
+                                && c.statements().stream()
+                                        .anyMatch(s -> s.startsWith("DROP AGGREGATE"))),
+                "expected a drop+create REBUILD for the aggregate: "
+                        + drifted.applied());
+        assertEquals(ReconcileOutcome.UP_TO_DATE,
+                reconciler(changed).reconcile().outcome());
+    }
+
+    @Test
+    @DisplayName("C-63 column privilege granted: REBUILD; column grant drift:"
+            + " GRANT/REVOKE REBUILD")
+    void c63ColumnPrivileges() throws Exception {
+        assumeKind(ObjectKind.PRIVILEGES);
+        final var roles = ownershipRoleDdl();
+        assumeTrue(roles != null, "skipped: dialect provides no grantee-role hook");
+        execute(roles);
+        final var columnGrant = new ObjectId(ObjectKind.PRIVILEGES, "a", "t");
+        try {
+            final var script = """
+                    CREATE TABLE t (a int, b int);
+                    GRANT SELECT (a) ON t TO tck_owner
+                    """;
+            final var report = reconciler(script).reconcile();
+            assertEquals(ReconcileOutcome.RECONCILED, report.outcome());
+            assertTrue(report.applied().stream().anyMatch(c ->
+                            c.target().equals(columnGrant)
+                                    && c.safety() == ChangeSafety.REBUILD
+                                    && c.statements().stream()
+                                            .anyMatch(s -> s.contains("SELECT"))),
+                    "expected a REBUILD column GRANT on t.a: " + report.applied());
+            assertEquals(ReconcileOutcome.UP_TO_DATE,
+                    reconciler(script).reconcile().outcome());
+            // a different desired column grant converges the acl — revoke the
+            // old, grant the new, in one REBUILD change
+            final var changed = """
+                    CREATE TABLE t (a int, b int);
+                    GRANT UPDATE (a) ON t TO tck_owner
+                    """;
+            final var drifted = reconciler(changed).reconcile();
+            assertEquals(ReconcileOutcome.RECONCILED, drifted.outcome());
+            assertTrue(drifted.applied().stream().anyMatch(c ->
+                            c.target().equals(columnGrant)
+                                    && c.safety() == ChangeSafety.REBUILD
+                                    && c.statements().stream()
+                                            .anyMatch(s -> s.startsWith("REVOKE"))
+                                    && c.statements().stream()
+                                            .anyMatch(s -> s.contains("UPDATE"))),
+                    "expected a REBUILD column GRANT+REVOKE on t.a: "
+                            + drifted.applied());
+            assertEquals(ReconcileOutcome.UP_TO_DATE,
+                    reconciler(changed).reconcile().outcome());
+        } finally {
+            final var teardown = ownershipRoleTeardownDdl();
+            if (teardown != null) {
+                execute(teardown);
+            }
+        }
+    }
+
+    @Test
+    @DisplayName("C-64 default privileges granted: REBUILD; drift:"
+            + " GRANT/REVOKE REBUILD")
+    void c64DefaultPrivileges() throws Exception {
+        assumeKind(ObjectKind.DEFAULT_PRIVILEGES);
+        final var roles = ownershipRoleDdl();
+        assumeTrue(roles != null, "skipped: dialect provides no grantee-role hook");
+        execute(roles);
+        final var defPrivs = new ObjectId(ObjectKind.DEFAULT_PRIVILEGES,
+                "TABLES for tck_owner");
+        try {
+            final var script = """
+                    ALTER DEFAULT PRIVILEGES FOR ROLE tck_owner
+                        IN SCHEMA ${namespace} GRANT SELECT ON TABLES TO tck_owner2
+                    """;
+            final var report = reconciler(script).reconcile();
+            assertEquals(ReconcileOutcome.RECONCILED, report.outcome());
+            assertTrue(report.applied().stream().anyMatch(c ->
+                            c.target().equals(defPrivs)
+                                    && c.safety() == ChangeSafety.REBUILD
+                                    && c.statements().stream()
+                                            .anyMatch(s -> s.startsWith(
+                                                    "ALTER DEFAULT PRIVILEGES"))),
+                    "expected a REBUILD default-privileges GRANT: "
+                            + report.applied());
+            assertEquals(ReconcileOutcome.UP_TO_DATE,
+                    reconciler(script).reconcile().outcome());
+            // a different desired grant converges the acl — revoke the old,
+            // grant the new, in one REBUILD change
+            final var changed = """
+                    ALTER DEFAULT PRIVILEGES FOR ROLE tck_owner
+                        IN SCHEMA ${namespace} GRANT UPDATE ON TABLES TO tck_owner2
+                    """;
+            final var drifted = reconciler(changed).reconcile();
+            assertEquals(ReconcileOutcome.RECONCILED, drifted.outcome());
+            assertTrue(drifted.applied().stream().anyMatch(c ->
+                            c.target().equals(defPrivs)
+                                    && c.safety() == ChangeSafety.REBUILD
+                                    && c.statements().stream()
+                                            .anyMatch(s -> s.contains("REVOKE"))
+                                    && c.statements().stream()
+                                            .anyMatch(s -> s.contains("UPDATE"))),
+                    "expected a REBUILD GRANT+REVOKE on default privileges: "
+                            + drifted.applied());
+            assertEquals(ReconcileOutcome.UP_TO_DATE,
+                    reconciler(changed).reconcile().outcome());
+        } finally {
+            // the pg_default_acl rows drop with the namespace and the roles
+            final var teardown = ownershipRoleTeardownDdl();
+            if (teardown != null) {
+                execute(teardown);
+            }
+        }
+    }
+
+    @Test
+    @DisplayName("C-65 window function missing: ADDITIVE; body drift:"
+            + " in-place CREATE OR REPLACE REBUILD")
+    void c65WindowFunction() throws Exception {
+        assumeKind(ObjectKind.ROUTINE);
+        final var script = """
+                CREATE FUNCTION wf(x int) RETURNS int
+                    LANGUAGE sql WINDOW AS 'SELECT x'
+                """;
+        final var report = reconciler(script).reconcile();
+        assertEquals(ReconcileOutcome.RECONCILED, report.outcome());
+        assertTrue(report.applied().stream().anyMatch(c ->
+                        c.target().kind() == ObjectKind.ROUTINE
+                                && c.target().name().equals("wf(integer)")
+                                && c.safety() == ChangeSafety.ADDITIVE),
+                "expected an ADDITIVE window function: " + report.applied());
+        assertEquals(ReconcileOutcome.UP_TO_DATE,
+                reconciler(script).reconcile().outcome());
+        // a body drift keeps the return type — an in-place replace
+        final var changed = """
+                CREATE FUNCTION wf(x int) RETURNS int
+                    LANGUAGE sql WINDOW AS 'SELECT x + 1'
+                """;
+        final var drifted = reconciler(changed).reconcile();
+        assertEquals(ReconcileOutcome.RECONCILED, drifted.outcome());
+        assertTrue(drifted.applied().stream().anyMatch(c ->
+                        c.target().kind() == ObjectKind.ROUTINE
+                                && c.target().name().equals("wf(integer)")
+                                && c.safety() == ChangeSafety.REBUILD
+                                && c.statements().stream()
+                                        .anyMatch(s -> s.startsWith(
+                                                "CREATE OR REPLACE FUNCTION"))),
+                "expected an in-place replace for the window function: "
+                        + drifted.applied());
+        assertEquals(ReconcileOutcome.UP_TO_DATE,
+                reconciler(changed).reconcile().outcome());
+    }
+
+    @Test
+    @DisplayName("C-66 text-search dictionary/config with mapping: ADDITIVE;"
+            + " option drift: DROP+CREATE REBUILD")
+    void c66TextSearchObjects() throws Exception {
+        assumeKind(ObjectKind.TEXT_SEARCH_DICTIONARY);
+        assumeKind(ObjectKind.TEXT_SEARCH_CONFIGURATION);
+        final var script = """
+                CREATE TEXT SEARCH DICTIONARY mydict
+                    (template = pg_catalog.simple, stopwords = 'english');
+                CREATE TEXT SEARCH CONFIGURATION mycfg (parser = pg_catalog.default);
+                ALTER TEXT SEARCH CONFIGURATION mycfg
+                    ADD MAPPING FOR asciiword WITH mydict
+                """;
+        final var report = reconciler(script).reconcile();
+        assertEquals(ReconcileOutcome.RECONCILED, report.outcome());
+        assertTrue(report.applied().stream().anyMatch(c ->
+                        c.target().kind() == ObjectKind.TEXT_SEARCH_DICTIONARY
+                                && c.target().name().equals("mydict")
+                                && c.safety() == ChangeSafety.ADDITIVE),
+                "expected an ADDITIVE dictionary: " + report.applied());
+        assertTrue(report.applied().stream().anyMatch(c ->
+                        c.target().kind() == ObjectKind.TEXT_SEARCH_CONFIGURATION
+                                && c.target().name().equals("mycfg")
+                                && c.safety() == ChangeSafety.ADDITIVE
+                                && c.statements().stream().anyMatch(s ->
+                                        s.contains("ADD MAPPING"))),
+                "expected the mapping fragment on the configuration: "
+                        + report.applied());
+        assertEquals(ReconcileOutcome.UP_TO_DATE,
+                reconciler(script).reconcile().outcome());
+        // an option drift recreates — no OR REPLACE form exists
+        final var changed = """
+                CREATE TEXT SEARCH DICTIONARY mydict
+                    (template = pg_catalog.simple, stopwords = 'german');
+                CREATE TEXT SEARCH CONFIGURATION mycfg (parser = pg_catalog.default);
+                ALTER TEXT SEARCH CONFIGURATION mycfg
+                    ADD MAPPING FOR asciiword WITH mydict
+                """;
+        final var drifted = reconciler(changed).reconcile();
+        assertEquals(ReconcileOutcome.RECONCILED, drifted.outcome());
+        assertTrue(drifted.applied().stream().anyMatch(c ->
+                        c.target().kind() == ObjectKind.TEXT_SEARCH_DICTIONARY
+                                && c.target().name().equals("mydict")
+                                && c.safety() == ChangeSafety.REBUILD
+                                && c.statements().stream().anyMatch(s ->
+                                        s.startsWith(
+                                                "DROP TEXT SEARCH DICTIONARY"))),
+                "expected a drop+create for the drifted dictionary: "
+                        + drifted.applied());
+        assertEquals(ReconcileOutcome.UP_TO_DATE,
+                reconciler(changed).reconcile().outcome());
+    }
+
+    @Test
+    @DisplayName("C-67 operator, family and class missing: ADDITIVE;"
+            + " class option drift: DROP+CREATE REBUILD")
+    void c67OperatorObjects() throws Exception {
+        assumeKind(ObjectKind.OPERATOR);
+        assumeKind(ObjectKind.OPERATOR_CLASS);
+        assumeKind(ObjectKind.OPERATOR_FAMILY);
+        final var script = """
+                CREATE OPERATOR ===
+                    (leftarg = int, rightarg = int, function = int4eq,
+                     restrict = eqsel, join = eqjoinsel, hashes, merges);
+                CREATE OPERATOR FAMILY fam USING btree;
+                CREATE OPERATOR CLASS oc FOR TYPE int USING btree FAMILY fam
+                    AS OPERATOR 1 ===
+                """;
+        final var report = reconciler(script).reconcile();
+        assertEquals(ReconcileOutcome.RECONCILED, report.outcome());
+        assertTrue(report.applied().stream().anyMatch(c ->
+                        c.target().kind() == ObjectKind.OPERATOR
+                                && c.target().name().equals("===(integer,integer)")
+                                && c.safety() == ChangeSafety.ADDITIVE),
+                "expected an ADDITIVE operator: " + report.applied());
+        assertTrue(report.applied().stream().anyMatch(c ->
+                        c.target().kind() == ObjectKind.OPERATOR_CLASS
+                                && c.safety() == ChangeSafety.ADDITIVE
+                                && c.statements().stream().anyMatch(s ->
+                                        s.contains("OPERATOR 1"))),
+                "expected member specs on the class create: " + report.applied());
+        assertEquals(ReconcileOutcome.UP_TO_DATE,
+                reconciler(script).reconcile().outcome());
+        // an option drift recreates — no OR REPLACE form exists
+        final var changed = """
+                CREATE OPERATOR ===
+                    (leftarg = int, rightarg = int, function = int4eq,
+                     restrict = eqsel, join = eqjoinsel, hashes, merges);
+                CREATE OPERATOR FAMILY fam USING btree;
+                CREATE OPERATOR CLASS oc FOR TYPE int USING btree FAMILY fam
+                    AS OPERATOR 1 ===, FUNCTION 1 btint4cmp(int,int)
+                """;
+        final var drifted = reconciler(changed).reconcile();
+        assertEquals(ReconcileOutcome.RECONCILED, drifted.outcome());
+        assertTrue(drifted.applied().stream().anyMatch(c ->
+                        c.target().kind() == ObjectKind.OPERATOR_CLASS
+                                && c.safety() == ChangeSafety.REBUILD
+                                && c.statements().stream().anyMatch(s ->
+                                        s.startsWith("DROP OPERATOR CLASS"))),
+                "expected a drop+create for the drifted class: "
+                        + drifted.applied());
+        assertEquals(ReconcileOutcome.UP_TO_DATE,
+                reconciler(changed).reconcile().outcome());
     }
 }

@@ -236,6 +236,30 @@ class PostgreSqlDependenciesTest {
     }
 
     @Test
+    @DisplayName("an external dictionary dependent on our template blocks its drop (5.8.3)")
+    void externalDictOnDroppedTemplate() throws Exception {
+        final var ns = namespace();
+        final var dict = "ext_d_" + Long.toHexString(SEQUENCE.incrementAndGet());
+        try {
+            PgTestDatabase.execute(ds, "CREATE TEXT SEARCH TEMPLATE "
+                    + dialect.quoteIdentifier(ns) + ".tmpl (LEXIZE = dsimple_lexize)");
+            PgTestDatabase.execute(ds, "CREATE TEXT SEARCH DICTIONARY public." + dict
+                    + " (TEMPLATE = " + dialect.quoteIdentifier(ns) + ".tmpl)");
+            // the desired state drifts the template's lexize: it must be
+            // dropped and recreated, which the external dictionary blocks
+            final var r = reconciler(ns, """
+                    CREATE TEXT SEARCH TEMPLATE ${namespace}.tmpl
+                        (LEXIZE = dsnowball_lexize);
+                    """);
+            final var e = assertThrows(PlanningException.class, r::plan);
+            assertTrue(e.getMessage().contains("public." + dict), e.getMessage());
+        } finally {
+            PgTestDatabase.execute(ds, "DROP TEXT SEARCH DICTIONARY IF EXISTS public." + dict);
+            drop(ns);
+        }
+    }
+
+    @Test
     @DisplayName("an unsupported cast dependent on a recreated routine fails planning (5.8.3)")
     void otherDependentOnRecreatedRoutine() throws Exception {
         final var ns = namespace();
@@ -257,7 +281,7 @@ class PostgreSqlDependenciesTest {
                         LANGUAGE sql IMMUTABLE AS $$SELECT 7$$;
                     """);
             final var e = assertThrows(PlanningException.class, r::plan);
-            assertTrue(e.getMessage().contains("cast:integer->mood"), e.getMessage());
+            assertTrue(e.getMessage().contains("integer->mood"), e.getMessage());
         } finally {
             drop(ns);
         }
@@ -277,10 +301,9 @@ class PostgreSqlDependenciesTest {
                     CREATE TABLE ${namespace}.i (x int) INHERITS (${namespace}.t);
                     CREATE TYPE ${namespace}.mood AS ENUM ('ok');
                     CREATE TYPE ${namespace}.span AS RANGE (subtype = int4);
-                    CREATE FUNCTION ${namespace}.mood_text(m ${namespace}.mood)
-                        RETURNS text LANGUAGE sql AS $$ SELECT $1::text $$;
-                    CREATE CAST (${namespace}.mood AS text)
-                        WITH FUNCTION ${namespace}.mood_text(${namespace}.mood);
+                    CREATE TABLE ${namespace}.cap (a int);
+                    CREATE TABLE ${namespace}.cac () INHERITS (${namespace}.cap);
+                    CREATE CAST (${namespace}.cac AS ${namespace}.cap) WITH INOUT;
                     CREATE STATISTICS ${namespace}.st ON a, b FROM ${namespace}.t;
                     COMMENT ON TABLE ${namespace}.i IS 'noted';
                     CREATE RULE r1 AS ON INSERT TO ${namespace}.t DO INSTEAD NOTHING;
@@ -293,12 +316,14 @@ class PostgreSqlDependenciesTest {
                     .map(d -> d.id().name()).toList();
             for (final var expected : new String[]{
                     "i",                     // inherited table
-                    "type:span", "cast:",    // enums are managed TYPE; ranges stay OTHER
-                    "statistics:t.st", "comment:i", "rule:t.r1",
-                    "constraint:t.ex", "ownership:t", "privileges:i"}) {
+                    "cast:",                 // enums and ranges are managed
+                    "comment:i", "privileges:i"}) {
                 assertTrue(names.stream().anyMatch(n -> n.contains(expected)),
                         expected + " missing from " + names);
             }
+            // the OWNERSHIP change actually assigned t to the role — shed
+            // its objects before dropping it
+            PgTestDatabase.execute(ds, "DROP OWNED BY rcl_tmp_role");
             PgTestDatabase.execute(ds, "DROP ROLE IF EXISTS rcl_tmp_role");
         } finally {
             drop(ns);
@@ -316,12 +341,14 @@ class PostgreSqlDependenciesTest {
         final var ns = namespace();
         try {
             PgTestDatabase.execute(ds, "CREATE SEQUENCE " + dialect.quoteIdentifier(ns) + ".sq");
-            PgTestDatabase.execute(ds, "CREATE PUBLICATION dep_pub FOR ALL SEQUENCES");
+            PgTestDatabase.execute(ds, "CREATE PUBLICATION dep_pub FOR SEQUENCE "
+                    + dialect.quoteIdentifier(ns) + ".sq");
             try (var conn = ds.getConnection()) {
                 conn.setAutoCommit(false);
                 final var snapshot = dialect.readSnapshot(conn, ns);
                 assertTrue(snapshot.objects().keySet().stream()
-                                .anyMatch(id -> id.name().contains("publication:dep_pub:")),
+                                .anyMatch(id -> id.kind() == ObjectKind.PUBLICATION
+                                        && id.name().equals("dep_pub")),
                         "sequence publication binding missing: "
                                 + snapshot.objects().keySet());
             }
@@ -347,7 +374,8 @@ class PostgreSqlDependenciesTest {
                 conn.setAutoCommit(false);
                 final var snapshot = dialect.readSnapshot(conn, ns);
                 assertTrue(snapshot.objects().keySet().stream()
-                                .anyMatch(id -> id.name().equals("publication:dep_pub_ns")),
+                                .anyMatch(id -> id.kind() == ObjectKind.PUBLICATION
+                                        && id.name().equals("dep_pub_ns")),
                         "schema publication binding missing: "
                                 + snapshot.objects().keySet());
             }
@@ -403,10 +431,13 @@ class PostgreSqlDependenciesTest {
             final var policy = ReconcilePolicy.defaults()
                     .withUnsupported(Decision.REPORT);
             final var report = reconciler(ns, """
-                    CREATE TYPE ${namespace}.span AS RANGE (subtype = int4);
-                    CREATE TABLE ${namespace}.t (x ${namespace}.span);
+                    CREATE TABLE ${namespace}.cap (a int);
+                    CREATE TABLE ${namespace}.cac () INHERITS (${namespace}.cap);
+                    CREATE TABLE ${namespace}.t (x ${namespace}.cac);
                     """, policy).reconcile();
-            assertEquals(ReconcileOutcome.REPORTED_ONLY, report.outcome());
+            // cap applies; the table typed on the unsupported inherited
+            // child's rowtype demotes
+            assertEquals(ReconcileOutcome.RECONCILED, report.outcome());
             assertTrue(report.reported().stream()
                     .anyMatch(c -> c.target().name().equals("t")),
                     "the table change must be demoted, not attempted: "

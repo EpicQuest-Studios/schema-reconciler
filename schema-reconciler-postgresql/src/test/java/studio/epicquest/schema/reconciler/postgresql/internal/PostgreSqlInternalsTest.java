@@ -201,7 +201,8 @@ class PostgreSqlInternalsTest {
         assertThrows(DesiredStateException.class,
                 () -> PgScriptCheck.check("REINDEX SYSTEM db"));
         PgScriptCheck.check("REINDEX TABLE t");
-        PgScriptCheck.check("REINDEX (TABLESPACE ts) INDEX i");
+        assertThrows(DesiredStateException.class,
+                () -> PgScriptCheck.check("REINDEX (TABLESPACE ts) INDEX i"));
         assertThrows(DesiredStateException.class,
                 () -> PgScriptCheck.check("CREATE SCHEMA foo"));
         assertThrows(DesiredStateException.class,
@@ -326,7 +327,8 @@ class PostgreSqlInternalsTest {
         PgScriptCheck.check("CREATE TABLE " + scratch + ".t (a int)", scratch);
         PgScriptCheck.check("CREATE OR REPLACE FUNCTION " + scratch
                 + ".f() RETURNS int LANGUAGE sql AS $$ SELECT 1 $$", scratch);
-        PgScriptCheck.check("GRANT USAGE ON SCHEMA " + scratch + " TO r", scratch);
+        assertThrows(DesiredStateException.class,
+                () -> PgScriptCheck.check("GRANT USAGE ON SCHEMA " + scratch + " TO r", scratch));
         PgScriptCheck.check("GRANT SELECT ON TABLE " + scratch + ".t TO r", scratch);
         PgScriptCheck.check("COMMENT ON TABLE " + scratch + ".t IS 'x'", scratch);
         PgScriptCheck.check("COMMENT ON COLUMN t.c IS 'x'", scratch);
@@ -392,7 +394,7 @@ class PostgreSqlInternalsTest {
         // an exclusion constraint names both its pg_constraint row and its
         // backing pg_class index — a create must collide with either
         assertEquals(Set.of("constraint:t.ex", "relation:ex"),
-                PgRender.nameScopes(new ObjectId(ObjectKind.OTHER, "constraint:t.ex")));
+                PgRender.nameScopes(new ObjectId(ObjectKind.EXCLUSION, "ex", "t")));
         // an unsupported aggregate/window occupies the routine signature space
         assertEquals(Set.of("routine:f(integer)"),
                 PgRender.nameScopes(new ObjectId(ObjectKind.OTHER, "routine:f(integer)")));

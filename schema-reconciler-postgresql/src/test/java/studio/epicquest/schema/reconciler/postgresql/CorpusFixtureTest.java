@@ -181,24 +181,25 @@ class CorpusFixtureTest {
         if (PgTestDatabase.serverMajor(dataSource) < 15) {
             script = preFifteenCompat(script);
         }
-        // privileges:* acl rows are unsupported by design (spec: unsupported
-        // constructs are reported, not applied); a corpus file whose GRANTs
-        // leave unrendered acl drift must run under unsupported=REPORT and
-        // keeps reporting it on every run.
+        // a corpus file whose GRANTs land on unmanaged targets still has
+        // privileges:* acl rows — unsupported by design (5.4): those files
+        // run under unsupported=REPORT and the unsupported set is stable
+        // across runs (OTHER objects are presence-only and never applied).
         final var expectUnsupported = raw.contains("GRANT");
 
         final var first = reconciler(script, expectUnsupported).reconcile();
         assertEquals(ReconcileOutcome.RECONCILED, first.outcome(),
                 () -> "reported: " + first.reported()
                         + " unsupported: " + first.unsupported());
-        assertEquals(expectUnsupported, !first.unsupported().isEmpty(),
-                "unsupported diffs: " + first.unsupported());
 
         final var second = reconciler(script, expectUnsupported).reconcile();
         assertEquals(ReconcileOutcome.UP_TO_DATE, second.outcome());
         if (expectUnsupported) {
-            assertTrue(!second.unsupported().isEmpty(),
-                    "policy objects must keep reporting as unsupported");
+            assertEquals(first.unsupported().stream().map(d -> d.id().name())
+                            .sorted().toList(),
+                    second.unsupported().stream().map(d -> d.id().name())
+                            .sorted().toList(),
+                    "unsupported objects must report identically on every run");
         } else {
             assertTrue(second.unsupported().isEmpty(),
                     "unsupported diffs appeared on the idempotent re-run: "
