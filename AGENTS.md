@@ -5,13 +5,13 @@ Vendor-neutral, declarative, data-safe schema reconciler (spec: `SPEC.md`) with 
 ## Layout
 
 - `java/` — Maven aggregator: `schema-reconciler-core` (API `studio.epicquest.schema.reconciler`, model records, `Dialect` SPI, engine internals in `internal`, not exported), `schema-reconciler-postgresql` (PostgreSQL 14+ reference dialect, internals in `.internal`), `schema-reconciler-tck` (`DialectConformanceTest`, C-01…C-67, automatic module).
-- `typescript/` — npm workspaces mirroring the same three packages as `@epicquest-studios/schema-reconciler-{core,postgresql,tck}` under the TypeScript binding of SPEC.md. `pg` is a test-only devDep — runtime deps are zero. Packages publish to GitHub Packages (`npm.pkg.github.com`; the scope must match the GitHub owner).
+- `typescript/` — npm workspaces mirroring the same three packages as `@epicquest-studios/schema-reconciler-{core,postgresql,tck}` under the TypeScript binding of SPEC.md. `pg` is a test-only devDep — runtime deps are zero. Packages publish to a static npm registry on the `gh-pages` branch (`npm/` dir — packument JSON + tarballs served anonymously like the Maven repo; `typescript/scripts/publish-pages.ts` writes the layout).
 - `java/fixtures/` — shared `corpus/corpus-*.sql` + `deployment/schema.sql` read by both test suites.
 - `SPEC.md` — the single contract; Java- and TypeScript-specific API surface lives in its binding sections.
 
 ## Build (TypeScript)
 
-Node ≥ 22.18, npm workspaces. Sources are `.ts` run directly (native type stripping, erasable syntax only — no enums, parameter properties, or namespaces). Per package: `npm run typecheck` (`tsc --noEmit`), `node --test` runs `test/**/*.test.ts` recursively. `node --test --test-name-pattern "C-32"` filters.
+Node ≥ 22.18, npm workspaces. Sources are `.ts` run directly (native type stripping, erasable syntax only — no enums, parameter properties, or namespaces). Package `exports` resolve to `dist/` (compiled ESM + `.d.ts` — Node can't type-strip inside `node_modules`, so consumers get compiled output); `npm run build` emits all three in dependency order and root `test`/`typecheck` build first. Per package: `npm run build` (`tsc -p tsconfig.build.json`), `npm run typecheck` (`tsc --noEmit`), `node --test` runs `test/**/*.test.ts` recursively. `node --test --test-name-pattern "C-32"` filters.
 
 ## Tests (TypeScript)
 

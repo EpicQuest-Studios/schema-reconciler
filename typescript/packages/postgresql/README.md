@@ -81,5 +81,5 @@ GRANT USAGE, CREATE ON SCHEMA svc TO app_reconciler;
 GRANT CREATE ON DATABASE appdb TO app_reconciler;
 ```
 
-Requires Node ≥ 22.18. Depends only on `@epicquest-studios/schema-reconciler-core`;
+Requires Node ≥ 22.18 (compiled ESM + `.d.ts`). Depends only on `@epicquest-studios/schema-reconciler-core`;
 `pg` is a peer concern of the application's adapter.

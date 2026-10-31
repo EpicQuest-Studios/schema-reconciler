@@ -12,25 +12,21 @@ schema reconciliation is and how the engine works.
 | `@epicquest-studios/schema-reconciler-postgresql` | PostgreSQL dialect |
 | `@epicquest-studios/schema-reconciler-tck` | Dialect conformance suite (`node:test`) |
 
-Zero runtime dependencies. Packages ship `.ts` sources and run on
-Node's native type stripping — **Node ≥ 22.18** required.
+Zero runtime dependencies. Packages publish compiled ESM (`dist/*.js`)
+plus declaration files — plain JavaScript, loadable on any modern Node
+(Node cannot type-strip `.ts` inside `node_modules`, so sources are
+dev-only; **Node ≥ 22.18** is required for working in this repo).
 
 ## Getting started
 
-Packages publish to **GitHub Packages** (`npm.pkg.github.com`) under
-the `EpicQuest-Studios` org — the scope must match the GitHub owner,
-hence `@epicquest-studios/*`. Point your project at that registry and
-authenticate (GitHub Packages requires a token even for public
-packages):
+Packages publish to a **static npm registry on GitHub Pages** — the
+same mechanism as the Maven repository, so installs are anonymous HTTPS
+with no token for anyone. Point your project at it:
 
 ```ini
 # .npmrc (in the consuming project)
-@epicquest-studios:registry=https://npm.pkg.github.com
-//npm.pkg.github.com/:_authToken=${GITHUB_TOKEN}
+@epicquest-studios:registry=https://epicquest-studios.github.io/schema-reconciler/npm
 ```
-
-Any token with `read:packages` works — a personal access token, or
-`GITHUB_TOKEN` inside Actions.
 
 ```bash
 npm install @epicquest-studios/schema-reconciler-postgresql   # brings -core transitively
@@ -43,16 +39,22 @@ conformance suite against it.
 
 ### Publishing
 
-Each package's `publishConfig.registry` already targets
-`npm.pkg.github.com`. From a package directory:
+`npm publish` does not apply — the registry is static files. A script
+packs the tarballs, merges each version into the packument JSON
+(keeping prior versions installable), and writes the registry layout
+into a checkout of the `gh-pages` branch:
 
 ```bash
-npm publish            # needs a PAT with write:packages in ~/.npmrc
+npm run build
+node scripts/publish-pages.ts --pages <checkout-of-gh-pages>
+# then commit + push gh-pages — removal works the same as Maven:
+# git rm the packument/tarball and push
 ```
 
-or in CI with `NODE_AUTH_TOKEN`/`_authToken` wired to `GITHUB_TOKEN`
-(`permissions: packages: write`). GitHub Packages binds each published
-version to the repository it was pushed from.
+The layout it writes: `npm/tarballs/*.tgz`, plus each packument twice —
+`npm/@epicquest-studios/<name>` and `npm/@epicquest-studios%2f<name>` —
+because whether `%2f` decodes to a path segment depends on the CDN.
+It also creates `.nojekyll` so Pages serves files raw.
 
 ## Usage
 
@@ -129,9 +131,15 @@ see [packages/postgresql/README.md](packages/postgresql/README.md).
 npm workspaces. From this directory:
 
 ```bash
-npm run typecheck   # tsc --noEmit across all packages
-npm test            # every workspace test (node:test)
+npm run build       # tsc emit to each package's dist/ (needed first —
+                    # package imports resolve through it)
+npm run typecheck   # build + tsc --noEmit across all packages
+npm test            # build + every workspace test (node:test)
 ```
+
+Package `exports` resolve to `dist/` — the compiled artifact consumers
+install — so tests and typecheck build first automatically. Working on
+`src/` runs under native type stripping; publishing ships `dist/` only.
 
 Core tests run against an in-memory fake database (`FakeDb`) — no real DB needed. The PostgreSQL tests use the `pg` driver against a PostgreSQL 14+ database and skip when none answers. Point them at one via env vars:
 

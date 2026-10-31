@@ -39,5 +39,6 @@ adapter for its driver (see `@epicquest-studios/schema-reconciler-postgresql` fo
 Dialect authors implement the `Dialect` SPI and validate against
 `@epicquest-studios/schema-reconciler-tck` (scenarios C-01…C-67).
 
-Requires Node ≥ 22.18 (packages ship TypeScript sources; Node strips
-the types at load). Zero runtime dependencies.
+Requires Node ≥ 22.18 (packages ship compiled ESM + `.d.ts`; the
+workspace itself runs sources under native type stripping).
+Zero runtime dependencies.

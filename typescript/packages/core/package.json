@@ -1,23 +1,27 @@
 {
     "name": "@epicquest-studios/schema-reconciler-core",
     "version": "0.9.0",
-    "description": "Vendor-neutral, declarative, data-safe schema reconciliation — API, SPI and engine (TypeScript binding of SPEC.md).",
+    "description": "Vendor-neutral, declarative, data-safe schema reconciliation \u2014 API, SPI and engine (TypeScript binding of SPEC.md).",
     "license": "Apache-2.0",
     "type": "module",
     "exports": {
-        ".": "./src/index.ts"
+        ".": {
+            "types": "./dist/index.d.ts",
+            "default": "./dist/index.js"
+        }
     },
     "files": [
-        "src"
+        "dist"
     ],
     "publishConfig": {
         "access": "public",
-        "registry": "https://npm.pkg.github.com"
+        "registry": "https://epicquest-studios.github.io/schema-reconciler/npm"
     },
     "engines": {
         "node": ">=22.18"
     },
     "scripts": {
+        "build": "tsc -p tsconfig.build.json",
         "test": "node --test",
         "typecheck": "tsc --noEmit -p tsconfig.json"
     },

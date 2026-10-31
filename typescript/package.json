@@ -10,8 +10,9 @@
         "node": ">=22.18"
     },
     "scripts": {
-        "test": "npm test --workspaces --if-present",
-        "typecheck": "npm run typecheck --workspaces --if-present"
+        "build": "npm run build -w @epicquest-studios/schema-reconciler-core && npm run build -w @epicquest-studios/schema-reconciler-tck && npm run build -w @epicquest-studios/schema-reconciler-postgresql",
+        "test": "npm run build && npm test --workspaces --if-present",
+        "typecheck": "npm run build && npm run typecheck --workspaces --if-present"
     },
     "devDependencies": {
         "@types/node": "^26.6.6",

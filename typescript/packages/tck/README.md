@@ -32,4 +32,4 @@ needs it (the only permitted deviation, SPEC.md 9.1). See
 contract and `@epicquest-studios/schema-reconciler-postgresql`'s own test suite for the
 reference wiring.
 
-Requires Node ≥ 22.18. Depends only on `@epicquest-studios/schema-reconciler-core`.
+Requires Node ≥ 22.18 (compiled ESM + `.d.ts`). Depends only on `@epicquest-studios/schema-reconciler-core`.
