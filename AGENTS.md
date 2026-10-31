@@ -1,18 +1,30 @@
 # Schema Reconciler
 
-Vendor-neutral, declarative, data-safe schema reconciler for Java (spec: `SPEC.md`).
+Vendor-neutral, declarative, data-safe schema reconciler (spec: `SPEC.md`) with Java and TypeScript implementations sharing one contract.
 
-## Modules
+## Layout
 
-- `schema-reconciler-core` — API (`studio.epicquest.schema.reconciler`), model records, `Dialect` SPI, engine internals (`internal` package, not exported).
-- `schema-reconciler-postgresql` — PostgreSQL 14+ reference dialect (`studio.epicquest.schema.reconciler.postgresql`, internals in `.internal`).
-- `schema-reconciler-tck` — dialect conformance suite (`DialectConformanceTest`, C-01…C-67) for third-party dialects.
+- `java/` — Maven aggregator: `schema-reconciler-core` (API `studio.epicquest.schema.reconciler`, model records, `Dialect` SPI, engine internals in `internal`, not exported), `schema-reconciler-postgresql` (PostgreSQL 14+ reference dialect, internals in `.internal`), `schema-reconciler-tck` (`DialectConformanceTest`, C-01…C-67, automatic module).
+- `typescript/` — npm workspaces mirroring the same three packages as `@schema-reconciler/{core,postgresql,tck}` under the TypeScript binding of SPEC.md. `pg` is a test-only devDep — runtime deps are zero.
+- `fixtures/` — shared `corpus/corpus-*.sql` + `deployment/schema.sql` read by both test suites.
+- `SPEC.md` — the single contract; Java- and TypeScript-specific API surface lives in its binding sections.
 
-## Build
+## Build (TypeScript)
 
-Java 25, Maven 3.9+. `mvn verify` builds all three modules and runs every test. Core and the PostgreSQL dialect are JPMS-modular; the TCK ships as an automatic module (`Automatic-Module-Name`).
+Node ≥ 24, npm workspaces. Sources are `.ts` run directly (native type stripping, erasable syntax only — no enums, parameter properties, or namespaces). Per package: `npm run typecheck` (`tsc --noEmit`), `node --test` runs `test/**/*.test.ts` recursively. `node --test --test-name-pattern "C-32"` filters.
 
-## Tests
+## Tests (TypeScript)
+
+- Core: `node --test` in `packages/core` — `FakeDb`/`FakeDialect` in-memory fakes, no DB.
+- PostgreSQL: needs PostgreSQL 14+. Env `RECONCILER_TEST_URL` (a `postgresql://` URI; `RECONCILER_TEST_USER`/`RECONCILER_TEST_PASSWORD` optional overrides) — default fallback is the `reconciler-tck` container on `localhost:55999`; tests skip when unreachable (no Testcontainers analog). `PgTestDataSource`/`PgTestConnection` adapt `pg.Client` to the SPI (`int8` returns as string — keep it as a string when the value flows into rendered SQL; `Number()` loses precision and re-formats).
+- `dialectConformanceSuite(hooks)` registers C-01…C-67 under `node:test`; `PostgreSqlConformance.test.ts` wires it (pool whose `close()` keeps sessions open for `assertCleanSession`). TCK hooks that consult the DB (roles, extensions, servers) are async and `t.skip()` when unmet.
+- `CorpusFixture.test.ts`/`DeploymentFixture.test.ts` read `fixtures/` by path and apply the same A.7 transform + `ensureUuidv7`/pre-15 downgrade.
+
+## Build (Java)
+
+Java 25, Maven 3.9+. `mvn -f java/pom.xml verify` builds all three modules and runs every test. Core and the PostgreSQL dialect are JPMS-modular; the TCK ships as an automatic module (`Automatic-Module-Name`).
+
+## Tests (Java)
 
 - Core: pure unit tests over an in-memory fake JDBC database (`FakeDb`) + `FakeDialect` — no real DB needed.
 - PostgreSQL: needs a PostgreSQL 14+ database. Point tests at one via env vars:
