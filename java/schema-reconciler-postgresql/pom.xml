@@ -8,7 +8,7 @@
         <groupId>studio.epicquest.schema</groupId>
         <artifactId>schema-reconciler-parent</artifactId>
         <version>0.9.0</version>
-        <relativePath>../../pom.xml</relativePath>
+        <relativePath>../pom.xml</relativePath>
     </parent>
 
     <artifactId>schema-reconciler-postgresql</artifactId>

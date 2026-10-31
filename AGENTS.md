@@ -28,7 +28,7 @@ Java 25, Maven 3.9+. `mvn -f java/pom.xml verify` builds all three modules and r
 
 - Core: pure unit tests over an in-memory fake JDBC database (`FakeDb`) + `FakeDialect` — no real DB needed.
 - PostgreSQL: needs a PostgreSQL 14+ database. Point tests at one via env vars:
-  `RECONCILER_TEST_URL=jdbc:postgresql://localhost:55999/rcl RECONCILER_TEST_USER=rcl RECONCILER_TEST_PASSWORD=rcl mvn verify`
+  `RECONCILER_TEST_URL=jdbc:postgresql://localhost:55999/rcl RECONCILER_TEST_USER=rcl RECONCILER_TEST_PASSWORD=rcl mvn -f java/pom.xml verify`
   Without env vars, `PgTestDatabase` falls back to a Testcontainers `postgres:18` container (requires Docker reachable by Testcontainers; with Docker Desktop on macOS `DOCKER_HOST=unix://$HOME/.docker/run/docker.sock` may be needed, or run a dedicated container: `docker run -d --name reconciler-tck -e POSTGRES_USER=rcl -e POSTGRES_PASSWORD=rcl -e POSTGRES_DB=rcl -p 55999:5432 postgres:18`).
 - `DeploymentFixtureTest` migrates `fixtures/deployment/schema.sql` (shared with the TypeScript port) per spec A.7 at test time and reconciles it end to end.
 - `CorpusFixtureTest` reconciles the obfuscated schema corpus `fixtures/corpus/corpus-*.sql` (shared with the TypeScript port) (same A.7 transform). corpus-01 declares `vector`/`pg_trgm` — on a plain `postgres:18` image it skips; full coverage needs `pgvector/pgvector:pg18` (or pg14/pg15/pg16/pg17/pg19 equivalents). Fixtures use the v18 `uuidv7()` builtin — `PgTestDatabase.ensureUuidv7` installs a pg_catalog stand-in on pre-18 servers — and v15 syntax (NULLS NOT DISTINCT, security_invoker) is downgraded by a test-only transform on pre-15 servers. Any new `corpus-NN.sql` file is picked up automatically.
@@ -39,7 +39,7 @@ Java 25, Maven 3.9+. `mvn -f java/pom.xml verify` builds all three modules and r
 
 Artifacts are published as a Maven repository on the `gh-pages` branch (GitHub Pages) — anonymous HTTPS access, no credentials for consumers.
 
-- Publish: `mvn -DskipTests deploy -DaltDeploymentRepository=pages::default::file:///<checkout-of-gh-pages>/maven`, then commit + push `gh-pages`.
+- Publish: `mvn -f java/pom.xml -DskipTests deploy -DaltDeploymentRepository=pages::default::file:///<checkout-of-gh-pages>/maven`, then commit + push `gh-pages`.
 - Delete a version or artifact: `git rm` it on `gh-pages` and push — removal takes effect immediately.
 - Consumer repo URL: `https://epicquest-studios.github.io/schema-reconciler/maven`.
 

@@ -53,7 +53,7 @@ Each kind promotion follows the same recipe, commit-per-kind:
 5. `SPEC.md` — §3/§4 behavior, A.5 managed/unsupported rows, A.6 fragments, Appendix C.
 6. TCK — new `DialectConformanceTest` scenario (C-49+); `ProfileRulesTest` count bump.
 7. `AppendixCoverageTest` — remove the construct from the `OTHER` list once managed.
-8. `mvn verify` green before commit.
+8. `mvn -f java/pom.xml verify` green before commit.
 
 ## Phase 1 — high-frequency gaps (mechanical)
 
