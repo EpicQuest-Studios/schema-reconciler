@@ -116,11 +116,11 @@ function identitySqlOptions(row: Row): string {
     if (row.seqincrement == null) {
         return "";
     }
-    return "INCREMENT BY " + num(row.seqincrement)
-            + " MINVALUE " + num(row.seqmin)
-            + " MAXVALUE " + num(row.seqmax)
-            + " START WITH " + num(row.seqstart)
-            + " CACHE " + num(row.seqcache)
+    return "INCREMENT BY " + str(row.seqincrement)
+            + " MINVALUE " + str(row.seqmin)
+            + " MAXVALUE " + str(row.seqmax)
+            + " START WITH " + str(row.seqstart)
+            + " CACHE " + str(row.seqcache)
             + (bool(row.seqcycle) ? " CYCLE" : " NO CYCLE");
 }
 
@@ -129,11 +129,11 @@ function identityCanonical(row: Row): string {
         return "";
     }
     return "type=" + str(row.idtype)
-            + ";increment=" + num(row.seqincrement)
-            + ";min=" + num(row.seqmin)
-            + ";max=" + num(row.seqmax)
-            + ";start=" + num(row.seqstart)
-            + ";cache=" + num(row.seqcache)
+            + ";increment=" + str(row.seqincrement)
+            + ";min=" + str(row.seqmin)
+            + ";max=" + str(row.seqmax)
+            + ";start=" + str(row.seqstart)
+            + ";cache=" + str(row.seqcache)
             + ";cycle=" + bool(row.seqcycle);
 }
 
@@ -1057,11 +1057,11 @@ class Data {
             const name = str(row.relname);
             const id = new ObjectId(ObjectKind.SEQUENCE, name);
             const stype = str(row.stype);
-            const inc = num(row.seqincrement);
-            const min = num(row.seqmin);
-            const max = num(row.seqmax);
-            const start = num(row.seqstart);
-            const cache = num(row.seqcache);
+            const inc = str(row.seqincrement);
+            const min = str(row.seqmin);
+            const max = str(row.seqmax);
+            const start = str(row.seqstart);
+            const cache = str(row.seqcache);
             const cycle = bool(row.seqcycle);
             const options = "AS " + stype + " INCREMENT BY " + inc
                     + " MINVALUE " + min + " MAXVALUE " + max
