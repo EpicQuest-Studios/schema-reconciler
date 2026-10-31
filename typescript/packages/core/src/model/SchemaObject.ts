@@ -32,7 +32,7 @@ export class SchemaObject {
         }
         this.id = id;
         this.definition = definition;
-        this.dependsOn = dependsOn instanceof ObjectSet ? dependsOn : new ObjectSet(dependsOn);
+        this.dependsOn = new ObjectSet(dependsOn);
         this.attributes = new Map(attributes);
         Object.freeze(this);
     }

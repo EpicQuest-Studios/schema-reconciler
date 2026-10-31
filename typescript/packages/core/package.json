@@ -35,5 +35,6 @@
         "database",
         "engine"
     ],
-    "homepage": "https://github.com/EpicQuest-Studios/schema-reconciler#readme"
+    "homepage": "https://github.com/EpicQuest-Studios/schema-reconciler#readme",
+    "sideEffects": false
 }
