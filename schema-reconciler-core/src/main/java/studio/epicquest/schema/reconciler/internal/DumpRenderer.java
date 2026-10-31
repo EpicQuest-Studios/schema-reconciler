@@ -91,15 +91,18 @@ final class DumpRenderer {
     /**
      * An object whose creation is folded into another object's fragment and
      * therefore renders no statement of its own (spec 3.1 {@code -- folded}):
-     * a column of a managed table, or a sequence owned by a table column —
+     * a column of a managed relation (table, partition, foreign table), or a
+     * sequence owned by a table column —
      * detected as a {@code dependsOn} edge to a snapshot TABLE.
      */
     private static boolean folded(SchemaObject object, SchemaSnapshot snapshot) {
         final var id = object.id();
         if (id.kind() == ObjectKind.COLUMN) {
             return id.parent()
-                    .map(parent -> new ObjectId(ObjectKind.TABLE, parent))
-                    .map(snapshot.objects()::containsKey)
+                    .map(parent -> snapshot.objects().keySet().stream().anyMatch(o ->
+                            o.name().equals(parent) && (o.kind() == ObjectKind.TABLE
+                                    || o.kind() == ObjectKind.PARTITION
+                                    || o.kind() == ObjectKind.FOREIGN_TABLE)))
                     .orElse(false);
         }
         if (id.kind() == ObjectKind.SEQUENCE) {

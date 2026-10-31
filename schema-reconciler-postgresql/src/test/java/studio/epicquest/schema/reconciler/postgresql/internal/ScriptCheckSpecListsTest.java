@@ -52,12 +52,27 @@ class ScriptCheckSpecListsTest {
                 // name lists, and database-wide COMMENT/SECURITY LABEL targets
                 "CREATE TABLE other.t (a int)", "DROP TABLE other.t",
                 "CREATE INDEX i ON other.t (a)", "COMMENT ON TABLE other.t IS 'x'",
+                // a keyword-named column does not end the target scan —
+                // the qualifier must still be checked
+                "COMMENT ON COLUMN other.t.is IS 'x'",
+                "COMMENT ON COLUMN other.t.on IS 'x'",
+                // a rule/provider named after the anchor keyword does not
+                // shift the real anchor
+                "CREATE RULE to AS ON INSERT TO other.t DO NOTHING",
+                "SECURITY LABEL FOR on ON DATABASE d IS 'x'",
+                "SECURITY LABEL FOR on ON TABLE other.t IS 'x'",
                 "GRANT SELECT ON other.t TO PUBLIC", "GRANT USAGE ON SCHEMA other TO PUBLIC",
                 "CREATE TABLE \"Other\".t (a int)", "CREATE TABLE \"SCR\".t (a int)",
                 "DROP TABLE t1, other.t2", "DROP RULE r ON other.t",
                 "CREATE RULE r AS ON SELECT TO other.t DO INSTEAD NOTHING",
                 "GRANT SELECT ON TABLE a, other.b TO PUBLIC",
                 "GRANT SELECT ON FOREIGN TABLE other.ft TO PUBLIC",
+                // a column named after a keyword folds to the delimiter
+                // token — the real ON target must still be checked
+                "GRANT SELECT (on) ON TABLE other.t TO r",
+                "GRANT SELECT (a, on) ON TABLE other.t TO r",
+                "CREATE TRIGGER g AFTER UPDATE OF a, on ON other.t EXECUTE FUNCTION f()",
+                "IMPORT FOREIGN SCHEMA r LIMIT TO (into) FROM SERVER s INTO other",
                 "GRANT USAGE ON FOREIGN SERVER s TO PUBLIC",
                 "GRANT USAGE ON SCHEMA scr, other TO PUBLIC",
                 "GRANT SELECT ON ALL TABLES IN SCHEMA scr, other TO r",
@@ -266,6 +281,13 @@ class ScriptCheckSpecListsTest {
                 "DROP RULE r ON scr.t",
                 "GRANT SELECT ON TABLE scr.a, scr.b TO PUBLIC",
                 "GRANT SELECT ON FOREIGN TABLE scr.ft TO PUBLIC",
+                // keyword-named columns are legal names, not delimiters —
+                // the scratch-qualified target is what matters
+                "GRANT SELECT (on) ON TABLE scr.t TO r",
+                "GRANT SELECT (a, schema) ON TABLE scr.t TO r",
+                "GRANT SELECT (a, schema) ON ALL TABLES IN SCHEMA scr TO r",
+                "CREATE TRIGGER g AFTER UPDATE OF a, on ON scr.t EXECUTE FUNCTION f()",
+                "IMPORT FOREIGN SCHEMA r LIMIT TO (into) FROM SERVER s INTO scr",
                 "GRANT SELECT ON ALL TABLES IN SCHEMA scr TO r1, r2",
                 "CREATE TABLE exists (a int)",
                 "CREATE TEXT SEARCH CONFIGURATION cfg ()",

@@ -12,6 +12,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.function.Predicate;
 import javax.sql.DataSource;
 import studio.epicquest.schema.reconciler.ApplyException;
 import studio.epicquest.schema.reconciler.ConfigurationException;
@@ -104,6 +105,7 @@ public final class Engine {
     private final Duration lockTimeout;
     private final Duration statementTimeout;
     private final ReconcileListener listener;
+    private final Predicate<ObjectId> objectFilter;
     private final DialectResolver resolver;
     private final Map<IdentityKey, PlanMeta> planMeta = new HashMap<>();
     private final ReferenceQueue<ReconcilePlan> collectedPlans = new ReferenceQueue<>();
@@ -111,7 +113,7 @@ public final class Engine {
     public Engine(DataSource dataSource, DataSource scratchDataSource, String namespace,
                   DesiredState desiredState, Dialect dialect, ReconcilePolicy policy,
                   Duration lockTimeout, Duration statementTimeout,
-                  ReconcileListener listener) {
+                  ReconcileListener listener, Predicate<ObjectId> objectFilter) {
         this.dataSource = dataSource;
         this.scratchDataSource = scratchDataSource;
         this.namespace = namespace;
@@ -120,6 +122,7 @@ public final class Engine {
         this.lockTimeout = lockTimeout;
         this.statementTimeout = statementTimeout;
         this.listener = listener;
+        this.objectFilter = objectFilter;
         this.resolver = new DialectResolver(dialect);
     }
 
@@ -271,7 +274,8 @@ public final class Engine {
                     Optional.ofNullable(metaOf(plan))
                             .map(PlanMeta::coveredByParent)
                             .orElseGet(() -> PlanBuilder.coverageOf(
-                                    session.dialect, namespace, plan.differences(), desired));
+                                    session.dialect, namespace, plan.differences(),
+                                    plan.changes(), desired));
             final var outcome = applyAndVerify(session, plan, evaluation, desired, covered, clock);
             session.commit();
             final var unexpected = unexpected(plan);
@@ -529,7 +533,8 @@ public final class Engine {
                     throw new DesiredStateException("namespace '" + namespace
                             + "': the desired-state script failed: " + e.getMessage(), e);
                 }
-                return session.dialect.readSnapshot(scratch, scratchNamespace);
+                return ObjectFilter.apply(
+                        session.dialect.readSnapshot(scratch, scratchNamespace), objectFilter);
             } finally {
                 try {
                     session.dialect.dropScratchNamespace(scratch, scratchNamespace);
@@ -690,7 +695,8 @@ public final class Engine {
 
         SchemaSnapshot readActual() {
             try {
-                return dialect.readSnapshot(conn, namespace);
+                return ObjectFilter.apply(dialect.readSnapshot(conn, namespace),
+                        objectFilter);
             } catch (SQLException e) {
                 throw new SchemaReconcilerException(
                         "namespace '" + namespace + "': could not read the catalog snapshot", e);

@@ -70,7 +70,7 @@ final class PlanBuilder {
         changes.addAll(tableShapeConflicts(differences));
         changes.removeIf(c -> covered.contains(c.target()));
 
-        addDependentRebuilds(changes);
+        addDependentRebuilds(changes, coveredByParent);
         validatePairs(changes);
         checkNameCollisions(changes);
         final var ordered = orderChanges(changes);
@@ -111,12 +111,20 @@ final class PlanBuilder {
     }
 
     /**
-     * The covered-children map of 5.8.4 for a given difference list and desired
-     * snapshot; used both at plan time and by {@code apply()} when the plan was
-     * issued by another engine instance.
+     * The covered-children map of 5.8.4 for a given difference list, change
+     * list and desired snapshot; used both at plan time and by {@code apply()}
+     * when the plan was issued by another engine instance. A recreated
+     * object's CREATE half covers the same children a MISSING create does.
      */
     static Map<ObjectId, Map<ObjectId, Definition>> coverageOf(Dialect dialect,
-            String targetNamespace, List<Difference> differences, SchemaSnapshot desired) {
+            String targetNamespace, List<Difference> differences,
+            SchemaSnapshot desired) {
+        return coverageOf(dialect, targetNamespace, differences, List.of(), desired);
+    }
+
+    static Map<ObjectId, Map<ObjectId, Definition>> coverageOf(Dialect dialect,
+            String targetNamespace, List<Difference> differences,
+            List<PlannedChange> changes, SchemaSnapshot desired) {
         final var covered = new LinkedHashMap<ObjectId, Map<ObjectId, Definition>>();
         for (final var d : differences) {
             if (d.type() != DifferenceType.MISSING) {
@@ -137,7 +145,31 @@ final class PlanBuilder {
                         .put(child, object.definition());
             }
         }
+        for (final var c : changes) {
+            if (c.action() == ChangeAction.DROP
+                    && desired.objects().containsKey(c.target())) {
+                coverRecreatedChildren(dialect, c.target(), desired, covered);
+            }
+        }
         return covered;
+    }
+
+    /**
+     * Records the children a recreated object's CREATE fragment re-materializes
+     * into {@code coveredByParent} — a partition's columns come back with its
+     * {@code CREATE}, exactly as a MISSING create's covered children do.
+     */
+    private static void coverRecreatedChildren(Dialect dialect, ObjectId dropped,
+            SchemaSnapshot desired, Map<ObjectId, Map<ObjectId, Definition>> coveredByParent) {
+        for (final var child : dialect.coveredChildren(
+                new Difference(dropped, DifferenceType.MISSING,
+                        Optional.empty(), Optional.empty()), desired)) {
+            final var object = desired.objects().get(child);
+            if (object != null) {
+                coveredByParent.computeIfAbsent(dropped, k -> new LinkedHashMap<>())
+                        .put(child, object.definition());
+            }
+        }
     }
 
     /** 5.5: an unexpected COLUMN on an expected table is a table-shape conflict. */
@@ -160,7 +192,8 @@ final class PlanBuilder {
      * recreated via a synthetic DRIFTED render; dependents outside the desired
      * and actual snapshots, or UNEXPECTED ones, fail planning.
      */
-    private void addDependentRebuilds(List<PlannedChange> changes) {
+    private void addDependentRebuilds(List<PlannedChange> changes,
+                                      Map<ObjectId, Map<ObjectId, Definition>> coveredByParent) {
         final var actualDeps = Dependencies.prerequisitesOf(dialect, actual);
         final var dependents = Dependencies.reverse(actualDeps);
 
@@ -172,6 +205,17 @@ final class PlanBuilder {
                 continue;
             }
             final var dropped = change.target();
+            // a DROP is always half of a recreate: the object's CREATE
+            // fragment re-materializes its covered children, so those
+            // dependents need no rebuild of their own — they verify through
+            // the parent's covered-children expectations
+            if (desired.objects().containsKey(dropped)) {
+                coverRecreatedChildren(dialect, dropped, desired, coveredByParent);
+                final var covered = coveredByParent.get(dropped);
+                if (covered != null) {
+                    targets.addAll(covered.keySet());
+                }
+            }
             for (final var dependent : Dependencies.reachable(dropped, dependents)) {
                 if (dependent.equals(dropped) || targets.contains(dependent)) {
                     continue;

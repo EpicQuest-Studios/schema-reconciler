@@ -217,8 +217,13 @@ public final class PgRender {
     private static List<PlannedChange> missingColumn(ObjectId id, SchemaObject want,
                                                      SchemaSnapshot desired, String ns) {
         final var parent = id.parent().orElse("");
+        // a partition column is inherited — ADD COLUMN runs on the
+        // partitioned root and propagates; IF NOT EXISTS absorbs the
+        // parent's own identical change
+        final var routed = partitionParent(parent, desired);
         final var alter = "ALTER TABLE " + PgIdentifiers.quote(ns) + "."
-                + PgIdentifiers.quote(parent) + " ADD COLUMN "
+                + PgIdentifiers.quote(routed != null ? routed : parent)
+                + " ADD COLUMN IF NOT EXISTS "
                 + want.attributes().get(PgCatalog.COLUMN_SQL);
         final var notnull = Boolean.parseBoolean(want.attributes().get(PgCatalog.NOTNULL));
         if (!notnull) {
@@ -432,7 +437,7 @@ public final class PgRender {
                                                Difference difference, SchemaSnapshot desired,
                                                String ns) {
         return switch (id.kind()) {
-            case COLUMN -> driftedColumn(id, want, difference, ns);
+            case COLUMN -> driftedColumn(id, want, difference, desired, ns);
             case TABLE -> driftedTable(id, want, difference, ns);
             case PRIMARY_KEY, UNIQUE, FOREIGN_KEY, CHECK, EXCLUSION, INDEX, VIEW,
                     TRIGGER, POLICY, STATISTICS, RULE, COLLATION, CONVERSION,
@@ -642,7 +647,8 @@ public final class PgRender {
      * and non-widening type changes stay manual (no statements).
      */
     private static List<PlannedChange> driftedColumn(ObjectId id, SchemaObject want,
-                                                     Difference difference, String ns) {
+                                                     Difference difference,
+                                                     SchemaSnapshot desired, String ns) {
         final var haveCanonical = difference.actual()
                 .map(d -> d.canonical()).orElse(null);
         if (haveCanonical == null) {
@@ -667,7 +673,13 @@ public final class PgRender {
                         + haveFields.get("type") + " -> " + wantType
                         + " is not a widening)");
             }
-            safe.add(alter + "TYPE " + wantType);
+            // an inherited column's TYPE runs on the partitioned root and
+            // propagates — the parent's own identical change does it first
+            final var routed = partitionParent(id.parent().orElse(""), desired);
+            safe.add(routed == null ? alter + "TYPE " + wantType
+                    : "ALTER TABLE " + TOKEN + "." + PgIdentifiers.quote(routed)
+                            + " ALTER COLUMN " + PgIdentifiers.quote(id.name())
+                            + " TYPE " + wantType);
         }
         final var wantDefault = wantFields.get("default");
         if (!Objects.equals(wantDefault, haveFields.get("default"))) {
@@ -729,6 +741,25 @@ public final class PgRender {
         return merged.entrySet().stream()
                 .map(e -> e.getKey() + "=" + e.getValue())
                 .collect(Collectors.joining(";"));
+    }
+
+    /**
+     * The name of the topmost partitioned ancestor a column's parent inherits
+     * from — {@code null} when the parent is not a managed partition. PG
+     * rejects inherited column alterations on every partition, including
+     * intermediate ones in a multi-level hierarchy, so the ALTER runs on the
+     * partitioned root and propagates down to every level.
+     */
+    private static String partitionParent(String parent, SchemaSnapshot desired) {
+        final var partitions = desired.objects().keySet().stream()
+                .filter(o -> o.kind() == ObjectKind.PARTITION)
+                .collect(Collectors.toMap(ObjectId::name, o -> o.parent().orElse("")));
+        final var seen = new LinkedHashSet<String>();
+        String current = parent;
+        while (seen.add(current) && partitions.containsKey(current)) {
+            current = partitions.get(current);
+        }
+        return current.equals(parent) ? null : current;
     }
 
     private static List<PlannedChange> manualColumn(ObjectId id, String reason) {
@@ -932,10 +963,15 @@ public final class PgRender {
                     if (RELATION_NAMESPACE_OTHERS.contains(category)) {
                         yield Set.of("relation:" + stripped);
                     }
-                    // aggregates and window functions share pg_proc with
-                    // managed routines, keyed by name plus signature
+                    // unsupported routines share pg_proc with managed
+                    // routines, keyed by name plus signature
                     if (category.equals("routine")) {
                         yield Set.of("routine:" + stripped);
+                    }
+                    // an unsupported constraint (a constraint trigger) is
+                    // named "<parent>.<name>" like a managed one
+                    if (category.equals("constraint")) {
+                        yield Set.of("constraint:" + stripped);
                     }
                 }
                 yield Set.of("relation:" + name);

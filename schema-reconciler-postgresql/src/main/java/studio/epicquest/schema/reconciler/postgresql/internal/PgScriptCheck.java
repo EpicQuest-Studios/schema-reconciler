@@ -260,7 +260,7 @@ public final class PgScriptCheck {
                         first + " is session state and must not appear in the script");
             }
             if (first.equals("IMPORT") && scratchNamespace != null) {
-                final var into = t.indexOf("INTO");
+                final var into = indexAtDepthZero(t, "INTO");
                 if (into >= 0) {
                     checkSchemaName(statement, into + 1, scratchNamespace);
                 }
@@ -534,10 +534,26 @@ public final class PgScriptCheck {
         final var name = nameIndex(t);
         checkNameAt(statement, name, scratchNamespace);
         if (ON_ANCHORED.contains(object)) {
-            checkOnTarget(statement, t.indexOf("ON"), scratchNamespace);
+            // the anchor ON follows the object name — an object named like
+            // the keyword or a modifier (… on ON t, … exists ON t), or an
+            // UPDATE OF column, is itself an ON token or shifts the name
+            // index, so every depth-0 ON is examined
+            var d = 0;
+            for (var i = 1; i < t.size(); i++) {
+                final var w = t.get(i);
+                if (w.equals("(")) {
+                    d++;
+                } else if (w.equals(")")) {
+                    d--;
+                } else if (d == 0 && w.equals("ON")) {
+                    checkOnTarget(statement, i, scratchNamespace);
+                }
+            }
         }
         if (first.equals("CREATE") && object.equals("RULE")) {
-            checkOnTarget(statement, t.indexOf("TO"), scratchNamespace);
+            // the target TO follows the rule name — a rule named after the
+            // keyword (… AS ON INSERT TO t) must not shift the anchor
+            checkOnTarget(statement, indexAtDepthZero(t, "TO", name + 1), scratchNamespace);
         }
         if (object.equals("CAST")) {
             // (source AS target) is the cast's name — a qualified type
@@ -576,7 +592,7 @@ public final class PgScriptCheck {
                 throw rejected(statement, first + " EXTENSION mutates a database-wide"
                         + " object that cannot be represented in a namespace snapshot");
             }
-            final var schema = t.indexOf("SCHEMA");
+            final var schema = indexAtDepthZero(t, "SCHEMA", name + 1);
             if (schema >= 0) {
                 checkSchemaName(statement, schema + 1, scratchNamespace);
             }
@@ -1137,8 +1153,8 @@ public final class PgScriptCheck {
                             depth++;
                         } else if (w.equals(")")) {
                             depth--;
-                        } else if (depth == 0 && (w.equals("WITH")
-                                || w.equals("REPLACE"))) {
+                        } else if (depth == 0 && scratchNamespace != null
+                                && (w.equals("WITH") || w.equals("REPLACE"))) {
                             checkQualifierAt(statement, i + 1, scratchNamespace);
                             checkNameList(statement, i + 1, scratchNamespace);
                         }
@@ -1212,7 +1228,7 @@ public final class PgScriptCheck {
     private static void checkGrantTarget(PgSql.StatementTokens statement,
                                          String scratchNamespace) {
         final var t = statement.tokens();
-        final var on = t.indexOf("ON");
+        final var on = indexAtDepthZero(t, "ON");
         var i = on + 1;
         if (i >= t.size()) {
             return;
@@ -1227,7 +1243,7 @@ public final class PgScriptCheck {
                     + " is a database-wide grant and cannot be represented in a snapshot");
         }
         if (w.equals("ALL")) {
-            final var schema = t.indexOf("SCHEMA");
+            final var schema = indexAtDepthZero(t, "SCHEMA");
             if (schema >= 0) {
                 checkSchemaList(statement, schema + 1, scratchNamespace);
             }
@@ -1279,7 +1295,10 @@ public final class PgScriptCheck {
                                       String scratchNamespace) {
         final var t = statement.tokens();
         var depth = 0;
-        for (var i = fromIndex + 1; i < t.size(); i++) {
+        // the scan includes fromIndex itself: a modifier-word name (…
+        // exists, s.t) makes the name index land on the first list comma,
+        // and the name after it still has to be checked
+        for (var i = fromIndex; i < t.size(); i++) {
             final var w = t.get(i);
             if (w.equals("(")) {
                 depth++;
@@ -1302,8 +1321,18 @@ public final class PgScriptCheck {
     private static void checkCommentTarget(PgSql.StatementTokens statement,
                                            String scratchNamespace) {
         final var t = statement.tokens();
-        final var on = t.indexOf("ON");
-        final var is = t.indexOf("IS");
+        // the target ON is fixed per leading form: COMMENT takes it at the
+        // head; SECURITY LABEL takes it after FOR <provider> — a provider
+        // named after a keyword must not shift the anchor, and an object
+        // named for must not fake the provider form (FOR sits at index 2)
+        final var on = t.get(0).equals("SECURITY") && t.size() > 2
+                && t.get(2).equals("FOR")
+                ? 4
+                : indexAtDepthZero(t, "ON");
+        // the keyword IS is the last "IS" token — an earlier one can be a
+        // keyword-named identifier (a column named "is"), which would
+        // truncate the target scan and let a foreign qualifier through
+        final var is = t.lastIndexOf("IS");
         if (on < 0 || is < 0 || on + 1 >= t.size()) {
             return;
         }
@@ -1388,8 +1417,13 @@ public final class PgScriptCheck {
 
     /** The index of {@code word} at parenthesis depth 0, or -1. */
     private static int indexAtDepthZero(List<String> tokens, String word) {
+        return indexAtDepthZero(tokens, word, 0);
+    }
+
+    /** The index of {@code word} at parenthesis depth 0 at or after {@code from}, or -1. */
+    private static int indexAtDepthZero(List<String> tokens, String word, int from) {
         var depth = 0;
-        for (var i = 0; i < tokens.size(); i++) {
+        for (var i = from; i < tokens.size(); i++) {
             final var w = tokens.get(i);
             if (w.equals("(")) {
                 depth++;

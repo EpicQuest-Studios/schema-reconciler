@@ -72,6 +72,46 @@ class ReconcileEngineTest {
     }
 
     @Test
+    void filterHidesExcludedObjectsAndTheirChildren() {
+        db.executeDirect(NS,
+                "CREATE TABLE keep DEF keep_v1; CREATE TABLE skip DEF skip_v1;"
+                        + " CREATE COLUMN skip.c DEF c_v1");
+        final var script =
+                "CREATE TABLE keep DEF keep_v1; CREATE TABLE skip DEF skip_v2;"
+                        + " CREATE COLUMN skip.c DEF c_v1";
+
+        final var report = SchemaReconciler.builder()
+                .dataSource(db.dataSource())
+                .namespace(NS)
+                .desiredState(DesiredState.ofScript(script))
+                .dialect(dialect)
+                .filter(id -> !(id.kind() == ObjectKind.TABLE && id.name().equals("skip")))
+                .build().reconcile();
+
+        assertEquals(ReconcileOutcome.UP_TO_DATE, report.outcome());
+        assertTrue(report.plan().changes().isEmpty(),
+                "the excluded subtree is invisible: " + report.plan().changes());
+        assertTrue(report.unexpected().isEmpty());
+        assertTrue(report.unsupported().isEmpty());
+        // the excluded objects still exist, untouched
+        assertTrue(db.objectsIn(NS).containsKey(new ObjectId(ObjectKind.TABLE, "skip")));
+    }
+
+    @Test
+    void filterSuppressesUnsupportedObjects() {
+        final var report = SchemaReconciler.builder()
+                .dataSource(db.dataSource())
+                .namespace(NS)
+                .desiredState(DesiredState.ofScript(
+                        "CREATE TABLE t DEF t_v1; CREATE OTHER skip:note DEF n"))
+                .dialect(dialect)
+                .filter(id -> id.kind() != ObjectKind.OTHER)
+                .build().reconcile();
+        assertEquals(ReconcileOutcome.RECONCILED, report.outcome());
+        assertTrue(report.unsupported().isEmpty());
+    }
+
+    @Test
     void matchingTargetRunsNoStatements() {
         final var script = "CREATE TABLE users DEF users_v1; CREATE COLUMN users.id DEF id_v1";
         db.executeDirect(NS, script);

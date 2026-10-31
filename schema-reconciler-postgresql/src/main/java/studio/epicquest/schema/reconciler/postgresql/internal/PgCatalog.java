@@ -402,7 +402,15 @@ public final class PgCatalog {
                             case "S" -> new ObjectId(ObjectKind.SEQUENCE, name);
                             // managed: canonical definition lands in loadViews
                             case "m" -> new ObjectId(ObjectKind.MATERIALIZED_VIEW, name);
-                            case "p" -> new ObjectId(ObjectKind.TABLE, name);
+                            // a 'p' under a 'p' parent is a partition that is
+                            // itself partitioned — a PARTITION whose create
+                            // carries both the bound and the sub-partition key
+                            case "p" -> !inherited ? new ObjectId(ObjectKind.TABLE, name)
+                                    : parentkinds.contains("p")
+                                            ? new ObjectId(ObjectKind.PARTITION, name,
+                                                    rs.getString("pparent"))
+                                            : new ObjectId(ObjectKind.OTHER,
+                                                    "inherited:" + name);
                             case "f" -> new ObjectId(ObjectKind.FOREIGN_TABLE, name);
                             // a documented category prefix per relkind (3.3):
                             // tolerating one non-managed relation kind must
@@ -450,13 +458,20 @@ public final class PgCatalog {
                                     attrs);
                         } else if (id.kind() == ObjectKind.PARTITION) {
                             final var bound = rs.getString("partbound");
+                            final var partkey = rs.getString("partkey");
                             final var qName = tableRef(name);
-                            define(id, "bound=" + bound,
+                            define(id, "bound=" + bound
+                                            + (partkey != null
+                                                    ? ";partkey=" + partkey : ""),
                                     Map.of(
                                             CREATE_SQL, "CREATE TABLE " + qName
                                                     + " PARTITION OF "
                                                     + tableRef(id.parent().get())
-                                                    + " " + bound,
+                                                    + " " + bound
+                                                    + (partkey != null
+                                                            ? " PARTITION BY "
+                                                                    + partkey
+                                                            : ""),
                                             DROP_SQL, "DROP TABLE " + qName));
                         } else if (id.kind() == ObjectKind.FOREIGN_TABLE) {
                             // the server name is a cluster object reference
@@ -837,7 +852,8 @@ public final class PgCatalog {
             }
             // serial-style ownership (deptype 'a')
             try (PreparedStatement ps = conn.prepareStatement("""
-                    SELECT dep.objid AS seq_oid, rc.relname AS tbl, ra.attname AS col,
+                    SELECT dep.objid AS seq_oid, dep.refobjid AS tbl_oid,
+                           rc.relname AS tbl, ra.attname AS col,
                            rn.nspname AS tblns
                     FROM pg_depend dep
                     JOIN pg_class sq ON sq.oid = dep.objid AND sq.relkind = 'S'
@@ -863,7 +879,11 @@ public final class PgCatalog {
                                 + "." + PgIdentifiers.quote(tbl) + "." + PgIdentifiers.quote(col);
                         seqOwnedBy.put(seq, ownedBy);
                         if (sameNs) {
-                            dep(seq, new ObjectId(ObjectKind.TABLE, tbl));
+                            // the owner may be a PARTITION or an
+                            // inherited: OTHER, not always a TABLE
+                            dep(seq, relByOid.getOrDefault(
+                                    rs.getLong("tbl_oid"),
+                                    new ObjectId(ObjectKind.TABLE, tbl)));
                         }
                     }
                 }
@@ -949,7 +969,7 @@ public final class PgCatalog {
          * {@code CREATE OR REPLACE} form. Ordered-set and hypothetical-set
          * aggregates ride the same path — {@code ORDER BY} inside the
          * signature and the {@code HYPOTHETICAL} flag carry their
-         * difference. Window functions ({@code 'w'}) stay {@code OTHER}.
+         * difference.
          */
         void loadAggregates(Connection conn) throws SQLException {
             try (PreparedStatement ps = conn.prepareStatement("""
@@ -961,22 +981,22 @@ public final class PgCatalog {
                            CASE WHEN a.aggtranstype = 0 THEN 'internal'
                                 ELSE format_type(a.aggtranstype, NULL) END AS stype,
                            NULLIF(a.aggtransspace, 0) AS sspace,
-                           NULLIF(a.aggfinalfn::text, '-')::regprocedure::text AS ffunc,
+                           NULLIF(a.aggfinalfn, 0)::regprocedure::text AS ffunc,
                            a.aggfinalextra, a.aggfinalmodify,
-                           NULLIF(a.aggcombinefn::text, '-')::regprocedure::text AS combine,
-                           NULLIF(a.aggserialfn::text, '-')::regprocedure::text AS serial,
-                           NULLIF(a.aggdeserialfn::text, '-')::regprocedure::text AS deserial,
+                           NULLIF(a.aggcombinefn, 0)::regprocedure::text AS combine,
+                           NULLIF(a.aggserialfn, 0)::regprocedure::text AS serial,
+                           NULLIF(a.aggdeserialfn, 0)::regprocedure::text AS deserial,
                            a.agginitval,
-                           NULLIF(a.aggmtransfn::text, '-')::regprocedure::text AS msfunc,
-                           NULLIF(a.aggminvtransfn::text, '-')::regprocedure::text AS minv,
+                           NULLIF(a.aggmtransfn, 0)::regprocedure::text AS msfunc,
+                           NULLIF(a.aggminvtransfn, 0)::regprocedure::text AS minv,
                            CASE WHEN a.aggmtransfn::text = '-' THEN NULL
                                 WHEN a.aggmtranstype = 0 THEN 'internal'
                                 ELSE format_type(a.aggmtranstype, NULL) END AS mstype,
                            NULLIF(a.aggmtransspace, 0) AS msspace,
-                           NULLIF(a.aggmfinalfn::text, '-')::regprocedure::text AS mffunc,
+                           NULLIF(a.aggmfinalfn, 0)::regprocedure::text AS mffunc,
                            a.aggmfinalextra, a.aggmfinalmodify,
                            a.aggminitval,
-                           NULLIF(a.aggsortop, 0)::regoperator::text AS sortop
+                           NULLIF(a.aggsortop, 0)::regoper::text AS sortop
                     FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
                     JOIN pg_aggregate a ON a.aggfnoid = p.oid
                     WHERE n.nspname = ? AND p.prokind = 'a'
@@ -2419,6 +2439,39 @@ public final class PgCatalog {
                     }
                 }
             }
+            // constraint rows the managed loader did not claim and which are
+            // not followers of another object surface as OTHER — a contype
+            // this build does not model cannot silently disappear. Trigger
+            // constraints ('t') back a managed pg_trigger row and column
+            // NOT NULL constraints ('n') fold into their COLUMN; non-local
+            // rows are partition/inheritance copies of the parent.
+            try (PreparedStatement ps = conn.prepareStatement("""
+                    SELECT c.oid, rel.relname AS parent, c.conname
+                    FROM pg_constraint c
+                    JOIN pg_class rel ON rel.oid = c.conrelid
+                    JOIN pg_namespace n ON n.oid = rel.relnamespace
+                    WHERE n.nspname = ? AND c.conislocal
+                      AND c.contype NOT IN ('p','u','f','c','x','n')
+                      AND NOT EXISTS (SELECT 1 FROM pg_trigger t
+                                      WHERE t.tgconstraint = c.oid)
+                    ORDER BY c.oid
+                    """)) {
+                ps.setString(1, ns);
+                try (ResultSet rs = ps.executeQuery()) {
+                    while (rs.next()) {
+                        final var oid = rs.getLong("oid");
+                        if (extMember(oid)) {
+                            continue;
+                        }
+                        final var id = new ObjectId(ObjectKind.OTHER,
+                                "constraint:" + rs.getString("parent")
+                                        + "." + rs.getString("conname"));
+                        conByOid.put(oid, id);
+                        otherOid("pg_constraint", oid, id);
+                        define(id, "constraint", Map.of());
+                    }
+                }
+            }
             // collations the managed loader cannot express (default provider,
             // bound encoding) stay OTHER
             try (PreparedStatement ps = conn.prepareStatement("""
@@ -3042,8 +3095,6 @@ public final class PgCatalog {
             return id != null && id.kind() == ObjectKind.OTHER;
         }
 
-        /** The mirrored PRIVILEGES id for a managed target, with the optional
-         *  collision suffix. */
         /**
          * A column-level grant — {@code pg_attribute.attacl} on a relation in
          * the namespace. On a managed relation it mirrors the column like a
@@ -3091,6 +3142,8 @@ public final class PgCatalog {
             };
         }
 
+        /** The mirrored PRIVILEGES id for a managed target, with the optional
+         *  collision suffix. */
         private static ObjectId privilegesId(ObjectId target, String suffix) {
             final var name = target.name() + suffix;
             return target.parent().isPresent()
@@ -3132,8 +3185,14 @@ public final class PgCatalog {
                     if (objsubid == 0) {
                         return relByOid.get(objoid);
                     }
+                    // column annotations resolve where columns are managed
+                    // objects — tables, partitions and foreign tables all
+                    // carry them parented on the relation
                     final var rel = relByOid.get(objoid);
-                    return rel != null && rel.kind() == ObjectKind.TABLE
+                    return attname != null && rel != null
+                            && (rel.kind() == ObjectKind.TABLE
+                                    || rel.kind() == ObjectKind.PARTITION
+                                    || rel.kind() == ObjectKind.FOREIGN_TABLE)
                             ? new ObjectId(ObjectKind.COLUMN, attname, rel.name())
                             : null;
                 case "pg_proc":
@@ -3221,9 +3280,18 @@ public final class PgCatalog {
                         "TEXT SEARCH DICTIONARY " + n + "." + name;
                 case TEXT_SEARCH_CONFIGURATION ->
                         "TEXT SEARCH CONFIGURATION " + n + "." + name;
-                case OPERATOR -> "OPERATOR " + n + "." + name;
-                case OPERATOR_CLASS -> "OPERATOR CLASS " + n + "." + name;
-                case OPERATOR_FAMILY -> "OPERATOR FAMILY " + n + "." + name;
+                // an operator name is a symbol plus signature — never an
+                // identifier to quote: OPERATOR ns.=(integer,integer)
+                case OPERATOR -> "OPERATOR " + n + "." + target.name();
+                // the id name is "<name> USING <am>" — only the name
+                // part is schema-qualified and quoted
+                case OPERATOR_CLASS, OPERATOR_FAMILY -> {
+                    final var i = target.name().indexOf(" USING ");
+                    yield (target.kind() == ObjectKind.OPERATOR_CLASS
+                            ? "OPERATOR CLASS " : "OPERATOR FAMILY ")
+                            + n + "." + PgIdentifiers.quote(target.name().substring(0, i))
+                            + target.name().substring(i);
+                }
                 default -> throw new IllegalStateException(
                         "no annotation form for " + target.kind());
             };
@@ -3950,6 +4018,8 @@ public final class PgCatalog {
             }
             final var column = o.attrs.get(GRANT_COLUMN);
             final var colClause = column == null ? "" : " (" + column + ")";
+            final var prefix = o.attrs.get(GRANT_PREFIX);
+            final var pfx = prefix == null ? "" : prefix + " ";
             var c = o.def.canonical();
             c = c.startsWith("privileges=")
                     ? c.substring("privileges=".length()) : c;
@@ -3965,7 +4035,7 @@ public final class PgCatalog {
                     if (option) {
                         p = p.substring(0, p.length() - 1);
                     }
-                    grants.add("GRANT " + p + colClause + " ON " + target + " TO "
+                    grants.add(pfx + "GRANT " + p + colClause + " ON " + target + " TO "
                             + (g.equals("PUBLIC") ? g : PgIdentifiers.quote(g))
                             + (option ? " WITH GRANT OPTION" : ""));
                 }

@@ -197,9 +197,9 @@ none affect correctness or coverage completeness:
 - Machine-readable plan export — `ReconcilePlan.toSql()` is human text;
   a serialized plan + `apply(serialized)` would enable cross-process
   plan/apply split (fingerprint already guarantees freshness).
-- Object filtering — `unsupportedCategories` is the only selector; an
-  include/exclude predicate (kind + name pattern) matches pgschema's
-  ignore config and multi-tenant "subset" use cases.
+- ~~Object filtering~~ — **done**: `Builder.filter(Predicate<ObjectId>)`
+  excludes objects from both snapshots with subtree cascade (children,
+  mirrored annotations, annotation OTHERs) and rescoped staleness.
 - Multi-namespace convenience — one namespace per reconcile today; a
   batch facade or multi-ns desired-script support for multi-schema apps.
 - `nspacl`/`nspowner` — the target namespace's own grants/owner as a

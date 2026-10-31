@@ -227,10 +227,13 @@ public final class SchemaReconciler {
         public Builder lockTimeout(Duration timeout) { ... }              // default 60 s
         public Builder statementTimeout(Duration timeout) { ... }         // optional, unbounded by default
         public Builder listener(ReconcileListener listener) { ... }       // optional
+        public Builder filter(Predicate<ObjectId> include) { ... }        // optional, default includes all objects
         public SchemaReconciler build() { ... }
     }
 }
 ```
+
+`filter` excludes objects from both snapshots — actual and desired alike — before comparison: an object the predicate rejects produces no difference, no change and no unexpected-object report, and its children (`ObjectId.parent`), mirrored annotations — managed or `OTHER`-prefixed — (comments, security labels, ownership, privileges, publication bindings, `constraint:<target>.<member>` shadows) and follower objects it covers (a serial `SEQUENCE`'s `OWNED BY` dependency) are invisible with it. Dependency edges an excluded object records are invisible too, and the staleness fingerprint (5.7) covers only visible objects. Filtering is how a caller coexists with objects another tool manages; it is not a safety valve — an excluded object that should have been reconciled is simply never seen.
 
 `build()` must fail with `ConfigurationException` if a required property is missing, if `lockTimeout` or `statementTimeout` is zero or negative, or — when no dialect is set — if no `Dialect` provider is discoverable via `ServiceLoader` at all. An empty namespace counts as missing. `desiredState` is required for `plan()`, `reconcile()` and `apply()` but may be omitted when the reconciler is built for `dump()` alone; those methods then fail with `ConfigurationException` naming the missing property. `build()` must not open a connection: the `supports(DatabaseMetaData)` check of 3.4 needs one, so final dialect selection is deferred to the first use of the reconciler.
 
@@ -283,7 +286,7 @@ public record ReconcilePolicy(
 
 The compact constructor must reject `unsupported == APPLY` and any `unsupportedCategories` value of `APPLY` with `IllegalArgumentException`. The safety classes are defined in section 5.6.
 
-`unsupportedCategories` overrides `unsupported` per *difference category*. The category of an `UNSUPPORTED` difference is, for an `ObjectKind.OTHER` object, the dialect's documented name prefix before `:` (for example `privileges`, `comment`, `rule`, `composite`, `partition`; an `OTHER` name without a prefix is `relation`), and for any other kind the lowercased `ObjectKind` name (for example `table`, `routine`). A policy can therefore tolerate objects it deliberately leaves to other tooling — grants or rules, for example — while still failing on unsupported constructs that carry reconciliation risk, such as foreign tables or partitions. Categories are stable identifiers, never free-text matching: a category not present in the map falls back to `unsupported`, which defaults to `FAIL` — unknown or unclassified objects fail closed. The decision for a difference is `unsupportedCategories.getOrDefault(category, unsupported)`. The PostgreSQL prefix list is in A.5.
+`unsupportedCategories` overrides `unsupported` per *difference category*. The category of an `UNSUPPORTED` difference is, for an `ObjectKind.OTHER` object, the dialect's documented name prefix before `:` (for example `privileges`, `comment`, `constraint`, `cast`, `inherited`; an `OTHER` name without a prefix is `relation`), and for any other kind the lowercased `ObjectKind` name (for example `table`, `routine`). A policy can therefore tolerate objects it deliberately leaves to other tooling — grants or comments, for example — while still failing on unsupported constructs that carry reconciliation risk, such as inheritance children or uncreatable types. Categories are stable identifiers, never free-text matching: a category not present in the map falls back to `unsupported`, which defaults to `FAIL` — unknown or unclassified objects fail closed. The decision for a difference is `unsupportedCategories.getOrDefault(category, unsupported)`. The PostgreSQL prefix list is in A.5.
 
 `additive`, `rebuild` and `destructive` govern *changes* by their `ChangeSafety`. `unsupported` governs *differences*: an `UNSUPPORTED` difference (5.4) never produces a `PlannedChange`, so it is evaluated against `plan.differences()`, not `plan.changes()`. Semantics of each decision:
 
@@ -897,10 +900,13 @@ backing relation of a managed composite `TYPE`), base types
 (`pg_type` `typtype` `b` with no array element), collations the
 dialect cannot recreate (database-default provider or
 bound encoding — `pg_collation`),
-`DEFAULT CONVERSION` rows (`pg_conversion`), security labels on unmanaged
+`DEFAULT CONVERSION` rows (`pg_conversion`), constraint rows in contypes the
+dialect does not model (`pg_constraint` — a safety net so an unclaimed
+`conislocal` row cannot disappear silently; `contype` `t` backs a managed
+`TRIGGER` and `n` folds into its `COLUMN`),
+security labels on unmanaged
 targets (`pg_seclabel`), comments on unmanaged or
-otherwise unrepresentable targets (`pg_description`), security labels
-(`pg_seclabel`), granted privileges on unmanaged targets (non-null `relacl`, `proacl`, `typacl`, `attacl`; compared by content: the ACL entries as the same sorted `grantee:PRIVILEGE[*]` token form `PRIVILEGES` uses — on a managed target the same rows become `PRIVILEGES`) and ownership of unmanaged targets
+otherwise unrepresentable targets (`pg_description`), granted privileges on unmanaged targets (non-null `relacl`, `proacl`, `typacl`, `attacl`; compared by content: the ACL entries as the same sorted `grantee:PRIVILEGE[*]` token form `PRIVILEGES` uses — on a managed target the same rows become `PRIVILEGES`) and ownership of unmanaged targets
 (`relowner`, `proowner`, `typowner` — on a managed target the same rows become `OWNERSHIP`). Three catalog object kinds have no namespace of their
 own but are detected through a namespace anchor instead: `pg_cast` rows
 whose only anchors are unmanaged objects (a managed anchor turns the row
@@ -914,7 +920,8 @@ before the first `:` of the `ObjectId` name, used by
 `unsupportedCategories` (3.3): `partindex`,
 `toast`, `inherited` and `relation` (any other
 non-managed `relkind`), `type` (base types),
-`collation`, `conversion`, `comment` (unmanaged target), `seclabel`, `privileges`
+`collation`, `conversion`, `constraint` (unmodelled contype),
+`comment` (unmanaged target), `seclabel`, `privileges`
 (unmanaged target),
 `ownership` (unmanaged target), `cast` and `transform` (unmanaged anchor),
 and `language`. Extension *member* objects (`pg_depend`
@@ -1102,7 +1109,7 @@ Coverage of the PostgreSQL SQL command set by the reference dialect, measured ag
 | `COMMENT ON` | `COMMENT` objects on managed targets (`TABLE`, `COLUMN`, `VIEW`, `MATERIALIZED_VIEW`, `SEQUENCE`, `INDEX`, constraint kinds, `ROUTINE`, `TRIGGER`, `TYPE`, `DOMAIN`, `POLICY`, `STATISTICS`, `RULE`, `COLLATION`, `CONVERSION`, `SECURITY_LABEL`); on any other target it is detected as `OTHER` — see below. `COMMENT ON EXTENSION` stays rejected: an extension's shipped description is database-wide metadata anchored to the extension row, which already reports |
 | `CREATE SEQUENCE` / `ALTER SEQUENCE` | `SEQUENCE` objects; serial-owned and identity sequences folded per A.5 |
 | `CREATE FUNCTION` / `CREATE PROCEDURE` | `ROUTINE` objects (`prokind` `f`, `p`) |
-| `CREATE TRIGGER` | `TRIGGER` objects incl. `tgenabled` state; constraint triggers are excluded by `tgisinternal` |
+| `CREATE TRIGGER` | `TRIGGER` objects incl. `tgenabled` state; constraint triggers load with their `CREATE CONSTRAINT TRIGGER` definition (the backing `pg_constraint` row is a follower), system-generated triggers are excluded by `tgisinternal` |
 | `CREATE STATISTICS` | `STATISTICS` objects (`pg_statistic_ext`), incl. expression statistics |
 | `CREATE RULE` | `RULE` objects (`pg_rewrite`, excluding `_RETURN` — part of its view), incl. `ev_enabled` state |
 | `CREATE COLLATION` | `COLLATION` objects (`pg_collation` provider `libc`/`icu`, encoding `-1` or the database's; `collversion` excluded) |
@@ -1117,7 +1124,7 @@ Coverage of the PostgreSQL SQL command set by the reference dialect, measured ag
 
 ### Detected but unsupported (`OTHER` → `UNSUPPORTED` per 5.4)
 
-`CREATE TYPE` for base types (a multirange cannot be created standalone — it arrives with its range), indexes on partitioned tables (`relkind` `I` — auto-cloned per child, never standalone), classic-inheritance children, `CREATE DEFAULT CONVERSION`, `CREATE TEXT SEARCH CONFIGURATION|DICTIONARY|PARSER|TEMPLATE`, `CREATE OPERATOR`, `CREATE OPERATOR CLASS`, `CREATE OPERATOR FAMILY`, `CREATE CAST`/`CREATE TRANSFORM` anchored only to unmanaged objects, `COMMENT ON` an unmanaged target, `SECURITY LABEL`, granted privileges on an unmanaged target, ownership reassignment on an unmanaged target and `CREATE PUBLICATION` (the publication itself is a cluster-level object, 4.1 — only its `ALTER PUBLICATION` binding forms are namespace-anchored).
+`CREATE TYPE` for base types (a multirange cannot be created standalone — it arrives with its range), indexes on partitioned tables (`relkind` `I` — auto-cloned per child, never standalone), classic-inheritance children, `CREATE DEFAULT CONVERSION`, unrecreatable collations (the default provider or an encoding bound to a different database encoding), constraints in contypes the dialect does not model (`pg_constraint` — `contype` `t` is managed via its `TRIGGER`, `n` folds into its `COLUMN`), `CREATE CAST`/`CREATE TRANSFORM` anchored only to unmanaged objects, `COMMENT ON` an unmanaged target, `SECURITY LABEL` on an unmanaged target, granted privileges on an unmanaged target, ownership reassignment on an unmanaged target and `CREATE PUBLICATION` (the publication itself is a cluster-level object, 4.1 — only its `ALTER PUBLICATION` binding forms are namespace-anchored).
 
 ### Out of scope (cluster-level or statement-only, per 1.5/3.2)
 

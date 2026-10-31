@@ -23,7 +23,7 @@ public record ObjectId(ObjectKind kind, String name, Optional<String> parent) {
     /** Kinds whose parent mirrors their target's parent: optional, never a bare parent of its own. */
     private static final Set<ObjectKind> PARENT_MIRRORED = Set.of(
             ObjectKind.COMMENT, ObjectKind.PUBLICATION, ObjectKind.OWNERSHIP,
-            ObjectKind.PRIVILEGES);
+            ObjectKind.PRIVILEGES, ObjectKind.SECURITY_LABEL);
 
     public ObjectId {
         Objects.requireNonNull(kind, "kind");

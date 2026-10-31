@@ -22,7 +22,8 @@ final class Dependencies {
 
     private static final Set<ObjectKind> PARENTABLE = Set.of(
             ObjectKind.TABLE, ObjectKind.VIEW, ObjectKind.MATERIALIZED_VIEW,
-            ObjectKind.SEQUENCE, ObjectKind.INDEX, ObjectKind.OTHER);
+            ObjectKind.SEQUENCE, ObjectKind.INDEX, ObjectKind.OTHER,
+            ObjectKind.PARTITION, ObjectKind.FOREIGN_TABLE);
 
     private Dependencies() {
     }

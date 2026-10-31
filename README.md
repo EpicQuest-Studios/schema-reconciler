@@ -112,6 +112,19 @@ GRANT CREATE ON DATABASE appdb TO app_reconciler;  -- scratch replay only; see S
 
 Environments that cannot grant `CREATE ON DATABASE` point `scratchDataSource` at a separate scratch database instead.
 
+Objects managed by another tool can be left out of the reconcile entirely:
+
+```java
+var scoped = SchemaReconciler.builder()
+        .dataSource(dataSource)
+        .namespace("svc")
+        .desiredState(desired)
+        .filter(id -> !id.name().startsWith("staging_"))
+        .build();
+```
+
+`filter` hides the rejected objects — plus their children, mirrored annotations and followers — from both snapshots, so an externally-managed object produces no difference, no change and no unexpected report, and plan staleness is scoped to what remains visible.
+
 ## Build
 
 Requires Java 25 and Maven 3.9+. `mvn verify` builds all three modules and runs every test. Core and the PostgreSQL dialect are JPMS-modular; the TCK ships as an automatic module.

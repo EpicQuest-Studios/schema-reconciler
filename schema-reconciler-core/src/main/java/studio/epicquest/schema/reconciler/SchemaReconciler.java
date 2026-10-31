@@ -3,8 +3,10 @@ package studio.epicquest.schema.reconciler;
 import java.time.Duration;
 import java.util.Objects;
 import java.util.ServiceLoader;
+import java.util.function.Predicate;
 import javax.sql.DataSource;
 import studio.epicquest.schema.reconciler.internal.Engine;
+import studio.epicquest.schema.reconciler.model.ObjectId;
 import studio.epicquest.schema.reconciler.model.ReconcilePlan;
 import studio.epicquest.schema.reconciler.spi.Dialect;
 
@@ -65,6 +67,7 @@ public final class SchemaReconciler {
         private Duration lockTimeout = Duration.ofSeconds(60);
         private Duration statementTimeout;
         private ReconcileListener listener = ReconcileListener.NONE;
+        private Predicate<ObjectId> objectFilter = id -> true;
 
         private Builder() {
         }
@@ -126,6 +129,26 @@ public final class SchemaReconciler {
         }
 
         /**
+         * Limits which catalog objects participate in reconciliation, in both
+         * the desired and the actual snapshot. An object the predicate
+         * rejects is invisible to the diff — it produces no {@code MISSING},
+         * {@code DRIFTED}, {@code UNEXPECTED} or {@code UNSUPPORTED}
+         * difference and no change — and its children and mirrored
+         * annotations (comments, security labels, ownership, privileges and
+         * publication bindings) are invisible with it. Dependencies an
+         * invisible object records are invisible too: excluding a parent can
+         * therefore unblock a change a detected dependent would otherwise
+         * hold back, and a plan's staleness check no longer sees the excluded
+         * objects (spec 5.7). Use it to ignore objects another tool manages —
+         * staging tables, externally attached partitions. The default filter
+         * includes every object.
+         */
+        public Builder filter(Predicate<ObjectId> include) {
+            this.objectFilter = Objects.requireNonNull(include, "include");
+            return this;
+        }
+
+        /**
          * Validates required properties and, when no dialect is set, that at
          * least one {@code Dialect} provider is discoverable. Opens no
          * connection: dialect selection happens on first use (spec 3.1, 3.4).
@@ -151,7 +174,8 @@ public final class SchemaReconciler {
             }
             return new SchemaReconciler(new Engine(
                     dataSource, scratchDataSource, targetNamespace, desiredState,
-                    dialect, policy, lockTimeout, statementTimeout, listener));
+                    dialect, policy, lockTimeout, statementTimeout, listener,
+                    objectFilter));
         }
     }
 }

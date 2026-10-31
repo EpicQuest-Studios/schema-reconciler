@@ -448,10 +448,172 @@ class PostgreSqlConformanceTest extends DialectConformanceTest {
     }
 
     @Test
+    @DisplayName("partition column drift propagates through the parent's ALTER")
+    void partitionColumnDrift() throws Exception {
+        reconciler("CREATE TABLE pp (k int, j int) PARTITION BY RANGE (k);"
+                + " CREATE TABLE pc PARTITION OF pp FOR VALUES FROM (0) TO (100)")
+                .reconcile();
+        // a type change on an inherited column runs on the partitioned
+        // parent and propagates — no ALTER against the partition itself
+        final var report = reconciler(
+                "CREATE TABLE pp (k int, j bigint) PARTITION BY RANGE (k);"
+                        + " CREATE TABLE pc PARTITION OF pp FOR VALUES FROM (0) TO (100)")
+                .reconcile();
+        assertEquals(ReconcileOutcome.RECONCILED, report.outcome());
+        assertTrue(report.applied().stream().noneMatch(c ->
+                        c.statements().stream().anyMatch(s -> s.contains(" pc")
+                                || s.contains("\"pc\""))),
+                "no statement may target the partition: " + report.applied());
+        assertEquals(ReconcileOutcome.UP_TO_DATE, reconciler(
+                "CREATE TABLE pp (k int, j bigint) PARTITION BY RANGE (k);"
+                        + " CREATE TABLE pc PARTITION OF pp FOR VALUES FROM (0) TO (100)")
+                .reconcile().outcome());
+    }
+
+    @Test
+    @DisplayName("multi-level partition column drift runs on the partitioned root")
+    void partitionColumnDriftMultiLevel() throws Exception {
+        reconciler("CREATE TABLE rt (k int, s int, j int) PARTITION BY RANGE (k);"
+                + " CREATE TABLE md PARTITION OF rt FOR VALUES FROM (0) TO (500)"
+                + " PARTITION BY RANGE (s);"
+                + " CREATE TABLE lf PARTITION OF md FOR VALUES FROM (0) TO (250)")
+                .reconcile();
+        // ALTER on an intermediate partition is rejected too — the change
+        // must run on the root and propagate down both levels
+        final var report = reconciler(
+                "CREATE TABLE rt (k int, s int, j bigint) PARTITION BY RANGE (k);"
+                        + " CREATE TABLE md PARTITION OF rt FOR VALUES FROM (0) TO (500)"
+                        + " PARTITION BY RANGE (s);"
+                        + " CREATE TABLE lf PARTITION OF md FOR VALUES FROM (0) TO (250)")
+                .reconcile();
+        assertEquals(ReconcileOutcome.RECONCILED, report.outcome());
+        assertTrue(report.applied().stream().noneMatch(c ->
+                        c.statements().stream().anyMatch(s -> s.contains(" md")
+                                || s.contains(" lf")
+                                || s.contains("\"md\"") || s.contains("\"lf\""))),
+                "no statement may target a partition: " + report.applied());
+        assertEquals(ReconcileOutcome.UP_TO_DATE, reconciler(
+                "CREATE TABLE rt (k int, s int, j bigint) PARTITION BY RANGE (k);"
+                        + " CREATE TABLE md PARTITION OF rt FOR VALUES FROM (0) TO (500)"
+                        + " PARTITION BY RANGE (s);"
+                        + " CREATE TABLE lf PARTITION OF md FOR VALUES FROM (0) TO (250)")
+                .reconcile().outcome());
+    }
+
+    @Test
+    @DisplayName("a detached partitioned table fails closed instead of silently converging")
+    void partitionDetachedFailsClosed() throws Exception {
+        // a standalone partitioned table where the desired declares
+        // PARTITION OF: under the old relkind-'p' classification the bound
+        // was invisible to the TABLE canonical and this never drifted. As a
+        // PARTITION the create collides with the UNEXPECTED table — a
+        // PlanningException (5.8.7), not a silent divergence.
+        execute("CREATE TABLE " + qualified("rt")
+                + " (k int, s int) PARTITION BY RANGE (k)");
+        execute("CREATE TABLE " + qualified("md")
+                + " (k int, s int) PARTITION BY RANGE (s)");
+        assertThrows(PlanningException.class, () -> reconciler(
+                "CREATE TABLE rt (k int, s int) PARTITION BY RANGE (k);"
+                        + " CREATE TABLE md PARTITION OF rt FOR VALUES FROM (0) TO (500)"
+                        + " PARTITION BY RANGE (s)")
+                .reconcile());
+    }
+
+    @Test
+    @DisplayName("Builder.filter hides an object subtree from the diff")
+    void objectFilter() throws Exception {
+        execute("CREATE TABLE " + qualified("keep") + " (id int)");
+        execute("CREATE TABLE " + qualified("skip") + " (id int, extra text)");
+        execute("COMMENT ON TABLE " + qualified("skip") + " IS 'external'");
+        final var script = "CREATE TABLE keep (id int);"
+                + " CREATE TABLE skip (id int);"
+                + " COMMENT ON TABLE skip IS 'external'";
+        final var report = SchemaReconciler.builder()
+                .dataSource(dataSource())
+                .namespace(namespace())
+                .desiredState(DesiredState.ofScript(script))
+                .dialect(dialect())
+                .filter(id -> !(id.kind() == ObjectKind.TABLE
+                        && id.name().equals("skip")))
+                .build().reconcile();
+        assertEquals(ReconcileOutcome.UP_TO_DATE, report.outcome());
+        assertTrue(report.plan().changes().isEmpty(),
+                "excluded subtree is invisible: " + report.plan().changes());
+        assertTrue(report.unexpected().isEmpty());
+        assertTrue(report.unsupported().isEmpty());
+    }
+
+    @Test
+    @DisplayName("PG18 virtual generated columns and WITHOUT OVERLAPS reconcile")
+    void pg18Features() throws Exception {
+        assumeTrue(PgTestDatabase.serverMajor(dataSource()) >= 18,
+                "virtual generated columns need PostgreSQL 18");
+        // btree_gist provides the GiST opclass a WITHOUT OVERLAPS key needs;
+        // anchored to pg_catalog it is global and outside the snapshot
+        execute("CREATE EXTENSION IF NOT EXISTS btree_gist"
+                + " WITH SCHEMA pg_catalog");
+        execute("ALTER EXTENSION btree_gist SET SCHEMA pg_catalog");
+        execute("CREATE TABLE " + qualified("gen") + " (a int,"
+                + " b int GENERATED ALWAYS AS (a * 2) VIRTUAL,"
+                + " c int GENERATED ALWAYS AS (a * 3) STORED)");
+        execute("CREATE TABLE " + qualified("bk") + " (id int, per daterange,"
+                + " PRIMARY KEY (id, per WITHOUT OVERLAPS))");
+        final var report = reconciler(
+                "CREATE TABLE gen (a int,"
+                        + " b int GENERATED ALWAYS AS (a * 2) VIRTUAL,"
+                        + " c int GENERATED ALWAYS AS (a * 3) STORED);"
+                        + " CREATE TABLE bk (id int, per daterange,"
+                        + " PRIMARY KEY (id, per WITHOUT OVERLAPS))")
+                .reconcile();
+        assertEquals(ReconcileOutcome.UP_TO_DATE, report.outcome(),
+                () -> report.plan().changes() + " / " + report.unsupported()
+                        + " / " + report.unexpected());
+    }
+
+    @Test
+    @DisplayName("aggregate option functions round-trip and recreate")
+    void aggregateOptionFunctions() throws Exception {
+        execute("CREATE FUNCTION " + qualified("asfn") + "(a int, b int)"
+                + " RETURNS int LANGUAGE sql IMMUTABLE AS 'SELECT a + b'");
+        execute("CREATE FUNCTION " + qualified("affn") + "(a int)"
+                + " RETURNS int LANGUAGE sql IMMUTABLE AS 'SELECT a * 2'");
+        execute("CREATE AGGREGATE " + qualified("a1") + "(int)"
+                + " (SFUNC = " + qualified("asfn") + ", STYPE = int,"
+                + "  COMBINEFUNC = " + qualified("asfn")
+                + ",  FINALFUNC = " + qualified("affn")
+                + ", SORTOP = OPERATOR(<))");
+        final var script = "CREATE FUNCTION asfn(a int, b int)"
+                + " RETURNS int LANGUAGE sql IMMUTABLE AS 'SELECT a + b';"
+                + " CREATE FUNCTION affn(a int)"
+                + " RETURNS int LANGUAGE sql IMMUTABLE AS 'SELECT a * 2';"
+                + " CREATE AGGREGATE a1(int) (SFUNC = asfn, STYPE = int,"
+                + " COMBINEFUNC = asfn, FINALFUNC = affn,"
+                + " SORTOP = OPERATOR(<))";
+        assertEquals(ReconcileOutcome.UP_TO_DATE,
+                reconciler(script).reconcile().outcome());
+        // drift INITCOND in the actual object → DROP+CREATE recreate, which
+        // exercises the emitted CREATE AGGREGATE (regproc/regoper forms)
+        execute("DROP AGGREGATE " + qualified("a1") + "(int)");
+        execute("CREATE AGGREGATE " + qualified("a1") + "(int)"
+                + " (SFUNC = " + qualified("asfn") + ", STYPE = int,"
+                + "  COMBINEFUNC = " + qualified("asfn")
+                + ",  FINALFUNC = " + qualified("affn")
+                + ", SORTOP = OPERATOR(<), INITCOND = '1')");
+        final var drifted = reconciler(script).reconcile();
+        assertEquals(ReconcileOutcome.RECONCILED, drifted.outcome(),
+                () -> drifted.plan().changes().toString());
+        assertEquals(ReconcileOutcome.UP_TO_DATE,
+                reconciler(script).reconcile().outcome());
+    }
+
+    @Test
     @DisplayName("environmental objects report as UNEXPECTED without blocking")
     void environmentalObjectsReportUnexpected() throws Exception {
         execute("CREATE TABLE " + qualified("t") + " (id bigint)");
-        execute("CREATE EXTENSION IF NOT EXISTS pg_trgm WITH SCHEMA " + q(namespace()));
+        // an extension anchors to exactly one namespace globally — relocate
+        // it in case a prior run left it elsewhere (pg_catalog, say)
+        execute("CREATE EXTENSION IF NOT EXISTS pg_trgm WITH SCHEMA pg_catalog");
+        execute("ALTER EXTENSION pg_trgm SET SCHEMA " + q(namespace()));
         execute("CREATE POLICY p_sel ON " + qualified("t") + " FOR SELECT USING (true)");
         execute("COMMENT ON TABLE " + qualified("t") + " IS 'managed'");
         execute("CREATE MATERIALIZED VIEW " + qualified("mv") + " AS SELECT id FROM "

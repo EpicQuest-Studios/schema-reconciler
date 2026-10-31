@@ -6,6 +6,7 @@ import java.sql.SQLException;
 import java.util.concurrent.atomic.AtomicLong;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.Test;
+import studio.epicquest.schema.reconciler.model.ObjectId;
 import studio.epicquest.schema.reconciler.model.ObjectKind;
 
 /**
@@ -122,6 +123,71 @@ class AppendixCoverageTest {
                                 .anyMatch(d -> d.kind() == ObjectKind.TABLE
                                         && d.name().equals("lt")),
                         "expected a dependency on TABLE lt");
+            } finally {
+                c.rollback();
+            }
+        }
+    }
+
+    @Test
+    void labelOnColumnIsManagedAndParented() throws Exception {
+        // superuser-only catalog row like above — a column label mirrors
+        // the column: parented SECURITY_LABEL (spec 4.1)
+        final var ds = PgTestDatabase.dataSource();
+        final var schema = "cov_" + Long.toHexString(System.nanoTime())
+                + "_" + SEQUENCE.incrementAndGet();
+        final var quoted = dialect.quoteIdentifier(schema);
+        try (var c = ds.getConnection(); var s = c.createStatement()) {
+            c.setAutoCommit(false);
+            org.junit.jupiter.api.Assumptions.assumeTrue(superuser(s));
+            try {
+                s.execute("CREATE SCHEMA " + quoted);
+                s.execute("SET LOCAL search_path = " + quoted);
+                s.execute("CREATE TABLE lt (id int)");
+                s.execute("INSERT INTO pg_seclabel (objoid, classoid, objsubid, provider, label)"
+                        + " VALUES ('lt'::regclass::oid, 'pg_class'::regclass::oid, 1,"
+                        + " 'dummy', 'y')");
+                final var snapshot = dialect.readSnapshot(c, schema);
+                final var label = snapshot.objects().keySet().stream()
+                        .filter(id -> id.kind() == ObjectKind.SECURITY_LABEL)
+                        .findFirst().orElseThrow(() -> new AssertionError(
+                                "no SECURITY_LABEL in " + snapshot.objects().keySet()));
+                assertTrue(label.name().equals("dummy:id") && label.parent().orElse("").equals("lt"),
+                        "expected parented dummy:id, got " + label);
+            } finally {
+                c.rollback();
+            }
+        }
+    }
+
+    @Test
+    void commentOnPartitionAndForeignTableColumnIsManaged() throws Exception {
+        // partition and foreign-table columns are managed COLUMN objects —
+        // their comments mirror like a table column's (A.5)
+        final var ds = PgTestDatabase.dataSource();
+        final var schema = "cov_" + Long.toHexString(System.nanoTime())
+                + "_" + SEQUENCE.incrementAndGet();
+        final var quoted = dialect.quoteIdentifier(schema);
+        try (var c = ds.getConnection(); var s = c.createStatement()) {
+            c.setAutoCommit(false);
+            try {
+                s.execute("CREATE SCHEMA " + quoted);
+                s.execute("SET LOCAL search_path = " + quoted);
+                s.execute("CREATE EXTENSION IF NOT EXISTS postgres_fdw");
+                s.execute("CREATE TABLE pp (id int) PARTITION BY RANGE (id);"
+                        + " CREATE TABLE pc PARTITION OF pp FOR VALUES FROM (0) TO (100);"
+                        + " COMMENT ON COLUMN pc.id IS 'pc-col';"
+                        + " CREATE SERVER fsrv FOREIGN DATA WRAPPER postgres_fdw;"
+                        + " CREATE FOREIGN TABLE ft (id int) SERVER fsrv;"
+                        + " COMMENT ON COLUMN ft.id IS 'ft-col'");
+                final var snapshot = dialect.readSnapshot(c, schema);
+                final var comments = snapshot.objects().keySet().stream()
+                        .filter(id -> id.kind() == ObjectKind.COMMENT)
+                        .map(ObjectId::toString).toList();
+                assertTrue(comments.stream().anyMatch(c2 -> c2.equals("COMMENT pc.id")),
+                        "expected COMMENT pc.id in " + comments);
+                assertTrue(comments.stream().anyMatch(c2 -> c2.equals("COMMENT ft.id")),
+                        "expected COMMENT ft.id in " + comments);
             } finally {
                 c.rollback();
             }

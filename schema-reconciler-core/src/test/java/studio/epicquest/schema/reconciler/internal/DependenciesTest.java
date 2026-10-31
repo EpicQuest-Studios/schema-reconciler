@@ -77,6 +77,22 @@ class DependenciesTest {
     }
 
     @Test
+    void partitionAndForeignTableAreParentable() {
+        // a partition and a foreign table carry COLUMN children like a
+        // table — the implicit parent edge must resolve for them too
+        final var pp = new ObjectId(ObjectKind.TABLE, "pp");
+        final var part = new ObjectId(ObjectKind.PARTITION, "pt", "pp");
+        final var col = new ObjectId(ObjectKind.COLUMN, "c", "pt");
+        final var prereqs = prereqsOf(snapshot(object(pp), object(part), object(col)));
+        assertEquals(Set.of(part), prereqs.get(col));
+        assertEquals(Set.of(pp), prereqs.get(part));
+        final var ft = new ObjectId(ObjectKind.FOREIGN_TABLE, "ft");
+        final var fcol = new ObjectId(ObjectKind.COLUMN, "c", "ft");
+        final var prereqs2 = prereqsOf(snapshot(object(ft), object(fcol)));
+        assertEquals(Set.of(ft), prereqs2.get(fcol));
+    }
+
+    @Test
     void selfEdgesAndNullParentsAreIgnored() {
         final var t = new ObjectId(ObjectKind.TABLE, "t");
         final var prereqs = prereqsOf(snapshot(object(t, t)));
