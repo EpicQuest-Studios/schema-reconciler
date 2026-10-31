@@ -2,7 +2,7 @@
 
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 
-Declarative, data-safe schema reconciliation for relational databases in Java. Brings a database to the state declared in a SQL script: plans, applies and verifies changes, and never drops data by default.
+Declarative, data-safe schema reconciliation for relational databases. Brings a database to the state declared in a SQL script: plans, applies and verifies changes, and never drops data by default.
 
 Inspired by the Kubernetes model: a manifest is the single source of truth and a reconciler drives actual state toward it. Here the manifest is `schema.sql` and the state is the database catalog — reconciled on demand, at startup or deploy time.
 
@@ -21,8 +21,8 @@ What is missing is an embeddable library where the *desired state is declared on
 
 This repository contains two things:
 
-1. **A specification** ([SPEC.md](SPEC.md)) that defines a vendor-neutral reconciliation contract: a Java API for applications, a `Dialect` SPI implemented once per database product, the reconciliation algorithm shared by all dialects, a 67-scenario conformance suite (TCK) every dialect must pass, and a PostgreSQL profile. The specification exists so the same contract can be implemented for other relational databases — dialects are discovered via `ServiceLoader` and selected per data source.
-2. **Two implementations** of that specification: the Java reference implementation (`java/`) and an independent TypeScript port (`typescript/`) following the Appendix D binding.
+1. **A specification** ([SPEC.md](SPEC.md)) that defines a vendor-neutral reconciliation contract: an API for applications, a `Dialect` SPI implemented once per database product, the reconciliation algorithm shared by all dialects, a 67-scenario conformance suite (TCK) every dialect must pass, and a PostgreSQL profile. The specification exists so the same contract can be implemented for other relational databases and other languages.
+2. **Two implementations** of that specification: the Java reference implementation ([java/](java/)) and an independent TypeScript port ([typescript/](typescript/)) following the Appendix D binding.
 
 ## How it works
 
@@ -32,124 +32,18 @@ This repository contains two things:
 - **Never lose data by default.** Destructive changes are rejected unless opted in; unexpected objects are reported, never dropped; external dependents are detected before apply, not discovered as mid-apply errors.
 - **Converge and verify.** After applying, the catalog is re-read and every applied object is proven to match its desired definition; re-running on a converged schema reports `UP_TO_DATE`.
 
-## Modules
+## Repository layout
 
-**Java** (`java/`):
-
-| Artifact | Contents |
+| Path | Contents |
 |---|---|
-| `studio.epicquest.schema:schema-reconciler-core` | API, SPI, core algorithm (Java SE only) |
-| `studio.epicquest.schema:schema-reconciler-postgresql` | PostgreSQL dialect (reference implementation) |
-| `studio.epicquest.schema:schema-reconciler-tck` | Dialect conformance suite |
+| [SPEC.md](SPEC.md) | The vendor-neutral contract (normative; Appendix D is the TypeScript binding) |
+| [java/](java/README.md) | Java reference implementation — core, PostgreSQL dialect, TCK |
+| [typescript/](typescript/README.md) | TypeScript port — same three packages on `node:test` |
+| [java/fixtures/](java/fixtures/) | Shared test fixtures (deployment + obfuscated schema corpus) |
 
-**TypeScript** (`typescript/`, npm workspaces, Node ≥ 22.18, zero runtime dependencies):
+Java specifics — artifacts, Maven coordinates, JDBC usage, JPMS — are in [java/README.md](java/README.md). TypeScript specifics — npm packages, the `SqlDataSource` adapter, Promise-based API — are in [typescript/README.md](typescript/README.md).
 
-| Package | Contents |
-|---|---|
-| `@schema-reconciler/core` | API, SPI, core algorithm (Promise-based; see SPEC.md Appendix D) |
-| `@schema-reconciler/postgresql` | PostgreSQL dialect |
-| `@schema-reconciler/tck` | Dialect conformance suite (`node:test`) |
-
-## Getting started
-
-Releases are served from a Maven repository hosted on this repo's GitHub Pages site:
-
-```xml
-<repository>
-    <id>epicquest-github</id>
-    <url>https://epicquest-studios.github.io/schema-reconciler/maven</url>
-</repository>
-```
-
-Most applications need the PostgreSQL dialect, which brings the core transitively:
-
-```xml
-<dependency>
-    <groupId>studio.epicquest.schema</groupId>
-    <artifactId>schema-reconciler-postgresql</artifactId>
-    <version>0.9.0</version>
-</dependency>
-```
-
-Gradle:
-
-```groovy
-repositories { maven { url = 'https://epicquest-studios.github.io/schema-reconciler/maven' } }
-implementation 'studio.epicquest.schema:schema-reconciler-postgresql:0.9.0'
-```
-
-Implementing a dialect for another database? Depend on `-core`, and use `-tck` (test scope) to run the conformance suite against it. No credentials are needed — the repository is served anonymously over HTTPS.
-
-## Usage
-
-```java
-var reconciler = SchemaReconciler.builder()
-        .dataSource(dataSource)
-        .namespace("svc")
-        .desiredState(DesiredState.ofResource(getClass().getClassLoader(), "db/schema.sql"))
-        .build();
-
-var report = reconciler.reconcile();
-log.info("schema {}: {} applied, {} reported, {} unexpected",
-        report.outcome(), report.applied().size(), report.reported().size(), report.unexpected().size());
-```
-
-Dry run for review:
-
-```java
-var plan = reconciler.plan();
-Files.writeString(Path.of("schema-plan.sql"), plan.toSql());
-```
-
-Bootstrap a desired-state script from an existing schema (no `desiredState` needed):
-
-```java
-var dumper = SchemaReconciler.builder()
-        .dataSource(dataSource)
-        .namespace("svc")
-        .build();
-String script = dumper.dump();   // namespace-neutral desired-state script
-```
-
-`dump()` reads the catalog under the namespace lock and renders it as a `${namespace}`-placeholder script in dependency order — feeding it back via `DesiredState.ofScript(script)` converges the same schema with an empty plan. Objects the dialect cannot express as DDL become `-- folded:` / `-- unsupported:` comment lines rather than being silently dropped.
-
-The connecting role can be least-privilege:
-
-```sql
-GRANT USAGE, CREATE ON SCHEMA svc TO app_reconciler;
-GRANT CREATE ON DATABASE appdb TO app_reconciler;  -- scratch replay only; see SPEC.md A.4
-```
-
-Environments that cannot grant `CREATE ON DATABASE` point `scratchDataSource` at a separate scratch database instead.
-
-Objects managed by another tool can be left out of the reconcile entirely:
-
-```java
-var scoped = SchemaReconciler.builder()
-        .dataSource(dataSource)
-        .namespace("svc")
-        .desiredState(desired)
-        .filter(id -> !id.name().startsWith("staging_"))
-        .build();
-```
-
-`filter` hides the rejected objects — plus their children, mirrored annotations and followers — from both snapshots, so an externally-managed object produces no difference, no change and no unexpected report, and plan staleness is scoped to what remains visible.
-
-## Build
-
-**Java** — requires Java 25 and Maven 3.9+. `mvn -f java/pom.xml verify` builds all three modules and runs every test. Core and the PostgreSQL dialect are JPMS-modular; the TCK ships as an automatic module.
-
-Core tests run against an in-memory fake database. The PostgreSQL dialect tests need a PostgreSQL 14+ database; without configuration they start a Testcontainers `postgres:18` container, or you can point them at an existing one:
-
-```bash
-RECONCILER_TEST_URL=jdbc:postgresql://localhost:55999/rcl \
-RECONCILER_TEST_USER=rcl RECONCILER_TEST_PASSWORD=rcl \
-mvn -f java/pom.xml verify
-```
-
-**TypeScript** — requires Node ≥ 22.18 (native type stripping; packages ship `.ts` sources). `npm test` from `typescript/` runs every workspace test; `npm run typecheck` runs `tsc --noEmit` across packages. The PostgreSQL tests use the `pg` driver against `RECONCILER_TEST_URL` (`postgresql://rcl:rcl@localhost:55999/rcl` by convention) and skip when no database answers.
-
-See [SPEC.md](SPEC.md) for the full contract — including the PostgreSQL 14–19 feature-coverage matrix and the schema-corpus description in Appendix C. The obfuscated schema corpus lives in `java/fixtures/corpus/`.
+See [SPEC.md](SPEC.md) for the full contract — including the PostgreSQL 14–19 feature-coverage matrix and the schema-corpus description in Appendix C.
 
 ## License
 
