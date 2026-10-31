@@ -11,7 +11,7 @@ Vendor-neutral, declarative, data-safe schema reconciler (spec: `SPEC.md`) with 
 
 ## Build (TypeScript)
 
-Node ≥ 24, npm workspaces. Sources are `.ts` run directly (native type stripping, erasable syntax only — no enums, parameter properties, or namespaces). Per package: `npm run typecheck` (`tsc --noEmit`), `node --test` runs `test/**/*.test.ts` recursively. `node --test --test-name-pattern "C-32"` filters.
+Node ≥ 22.18, npm workspaces. Sources are `.ts` run directly (native type stripping, erasable syntax only — no enums, parameter properties, or namespaces). Per package: `npm run typecheck` (`tsc --noEmit`), `node --test` runs `test/**/*.test.ts` recursively. `node --test --test-name-pattern "C-32"` filters.
 
 ## Tests (TypeScript)
 

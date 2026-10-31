@@ -1,6 +1,9 @@
 # Log file
 *.log
 
+# npm pack artifacts
+*.tgz
+
 # Node
 node_modules/
 

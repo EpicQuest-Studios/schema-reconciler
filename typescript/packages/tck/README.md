@@ -5,11 +5,11 @@ C-01…C-67 of SPEC.md 9.2 as a reusable `node:test` suite. Third-party
 dialects prove conformance by running it against a live database.
 
 ```ts
-import { describe } from "node:test";
+// in a *.test.ts file picked up by `node --test`
 import { dialectConformanceSuite } from "@schema-reconciler/tck";
 import { MyDialect } from "./MyDialect.ts";
 
-describe("MyDialect TCK", dialectConformanceSuite({
+dialectConformanceSuite({
     dataSource: () => myTestDataSource,
     dialect: () => new MyDialect(),
     createNamespace: async () => {
@@ -22,7 +22,7 @@ describe("MyDialect TCK", dialectConformanceSuite({
     },
     // optional hooks declare optional capabilities: scratchDataSource,
     // unsupportedScript, extensionDdl, ownershipRoleDdl, …
-}));
+});
 ```
 
 `dataSource`/`dialect`/`createNamespace`/`dropNamespace` are required;

@@ -1,3 +1,5 @@
+import { IllegalArgumentError } from "@schema-reconciler/core";
+
 /**
  * PostgreSQL-aware SQL text handling: the normalisation of spec 5.3 and the
  * lexical statement scan the script constraints of spec 3.2 need. Both share
@@ -56,6 +58,9 @@ export function replaceNamespaceRefs(text: string, namespace: string): string {
  * expression, label and identifier values.
  */
 export function splitOutsideLiterals(text: string, separator: string): string[] {
+    if (separator.length !== 1) {
+        throw new IllegalArgumentError("separator must be a single character");
+    }
     const parts: string[] = [];
     let start = 0;
     for (let i = 0; i < text.length; i++) {
