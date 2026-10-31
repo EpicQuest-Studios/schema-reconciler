@@ -38,9 +38,9 @@
     </developers>
 
     <modules>
-        <module>schema-reconciler-core</module>
-        <module>schema-reconciler-postgresql</module>
-        <module>schema-reconciler-tck</module>
+        <module>java/schema-reconciler-core</module>
+        <module>java/schema-reconciler-postgresql</module>
+        <module>java/schema-reconciler-tck</module>
     </modules>
 
     <properties>

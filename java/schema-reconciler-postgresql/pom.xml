@@ -8,6 +8,7 @@
         <groupId>studio.epicquest.schema</groupId>
         <artifactId>schema-reconciler-parent</artifactId>
         <version>0.9.0</version>
+        <relativePath>../../pom.xml</relativePath>
     </parent>
 
     <artifactId>schema-reconciler-postgresql</artifactId>
@@ -48,6 +49,13 @@
     </dependencies>
 
     <build>
+        <!-- corpus + deployment fixtures live at repo root, shared with the
+             TypeScript port — they land on the test classpath unchanged -->
+        <testResources>
+            <testResource>
+                <directory>../../fixtures</directory>
+            </testResource>
+        </testResources>
         <plugins>
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>

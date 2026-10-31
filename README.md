@@ -137,7 +137,7 @@ RECONCILER_TEST_USER=rcl RECONCILER_TEST_PASSWORD=rcl \
 mvn verify
 ```
 
-See [SPEC.md](SPEC.md) for the full contract — including the PostgreSQL 14–19 feature-coverage matrix and the schema-corpus description in Appendix C. The obfuscated schema corpus lives in `schema-reconciler-postgresql/src/test/resources/corpus/`.
+See [SPEC.md](SPEC.md) for the full contract — including the PostgreSQL 14–19 feature-coverage matrix and the schema-corpus description in Appendix C. The obfuscated schema corpus lives in `fixtures/corpus/`.
 
 ## License
 
