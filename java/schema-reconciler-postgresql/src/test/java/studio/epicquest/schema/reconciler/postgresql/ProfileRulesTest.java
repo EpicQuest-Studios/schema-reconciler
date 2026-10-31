@@ -77,7 +77,7 @@ class ProfileRulesTest {
     @Test
     void tckScenarioIdsMatchTheSpecTable() throws Exception {
         final var spec = new java.util.TreeSet<String>();
-        for (final var line : java.nio.file.Files.readAllLines(Path.of("..", "SPEC.md"))) {
+        for (final var line : java.nio.file.Files.readAllLines(Path.of("..", "..", "SPEC.md"))) {
             final var m = java.util.regex.Pattern.compile("^\\| (C-\\d+) \\|").matcher(line);
             if (m.find()) {
                 spec.add(m.group(1));
