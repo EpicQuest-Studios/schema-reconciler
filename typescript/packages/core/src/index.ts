@@ -36,4 +36,5 @@ export * from "./VerificationException.ts";
 export * from "./spi/Sql.ts";
 export * from "./spi/Dialect.ts";
 export * from "./spi/DialectCapabilities.ts";
-export { registerDialect, registeredDialects } from "./internal/dialects.ts";
+export { registerDialect, registeredDialects, unregisterDialect }
+        from "./internal/dialects.ts";

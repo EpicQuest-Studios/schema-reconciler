@@ -20,5 +20,5 @@ export function unregisterDialect(dialect: Dialect): void {
 }
 
 export function registeredDialects(): readonly Dialect[] {
-    return registered;
+    return [...registered];
 }

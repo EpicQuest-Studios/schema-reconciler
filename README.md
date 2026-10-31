@@ -21,8 +21,8 @@ What is missing is an embeddable library where the *desired state is declared on
 
 This repository contains two things:
 
-1. **A specification** ([SPEC.md](SPEC.md)) that defines a vendor-neutral reconciliation contract: a Java API for applications, a `Dialect` SPI implemented once per database product, the reconciliation algorithm shared by all dialects, a 48-scenario conformance suite (TCK) every dialect must pass, and a PostgreSQL profile. The specification exists so the same contract can be implemented for other relational databases — dialects are discovered via `ServiceLoader` and selected per data source.
-2. **A reference implementation** of that specification: `schema-reconciler-core` (the engine, depending only on Java SE), `schema-reconciler-postgresql` (the PostgreSQL 14+ dialect), and `schema-reconciler-tck` (the conformance suite, reusable by third-party dialects).
+1. **A specification** ([SPEC.md](SPEC.md)) that defines a vendor-neutral reconciliation contract: a Java API for applications, a `Dialect` SPI implemented once per database product, the reconciliation algorithm shared by all dialects, a 67-scenario conformance suite (TCK) every dialect must pass, and a PostgreSQL profile. The specification exists so the same contract can be implemented for other relational databases — dialects are discovered via `ServiceLoader` and selected per data source.
+2. **Two implementations** of that specification: the Java reference implementation (`java/`) and an independent TypeScript port (`typescript/`) following the Appendix D binding.
 
 ## How it works
 
@@ -34,11 +34,21 @@ This repository contains two things:
 
 ## Modules
 
+**Java** (`java/`):
+
 | Artifact | Contents |
 |---|---|
 | `studio.epicquest.schema:schema-reconciler-core` | API, SPI, core algorithm (Java SE only) |
 | `studio.epicquest.schema:schema-reconciler-postgresql` | PostgreSQL dialect (reference implementation) |
 | `studio.epicquest.schema:schema-reconciler-tck` | Dialect conformance suite |
+
+**TypeScript** (`typescript/`, npm workspaces, Node ≥ 22.18, zero runtime dependencies):
+
+| Package | Contents |
+|---|---|
+| `@schema-reconciler/core` | API, SPI, core algorithm (Promise-based; see SPEC.md Appendix D) |
+| `@schema-reconciler/postgresql` | PostgreSQL dialect |
+| `@schema-reconciler/tck` | Dialect conformance suite (`node:test`) |
 
 ## Getting started
 
@@ -127,7 +137,7 @@ var scoped = SchemaReconciler.builder()
 
 ## Build
 
-Requires Java 25 and Maven 3.9+. `mvn -f java/pom.xml verify` builds all three modules and runs every test. Core and the PostgreSQL dialect are JPMS-modular; the TCK ships as an automatic module.
+**Java** — requires Java 25 and Maven 3.9+. `mvn -f java/pom.xml verify` builds all three modules and runs every test. Core and the PostgreSQL dialect are JPMS-modular; the TCK ships as an automatic module.
 
 Core tests run against an in-memory fake database. The PostgreSQL dialect tests need a PostgreSQL 14+ database; without configuration they start a Testcontainers `postgres:18` container, or you can point them at an existing one:
 
@@ -136,6 +146,8 @@ RECONCILER_TEST_URL=jdbc:postgresql://localhost:55999/rcl \
 RECONCILER_TEST_USER=rcl RECONCILER_TEST_PASSWORD=rcl \
 mvn -f java/pom.xml verify
 ```
+
+**TypeScript** — requires Node ≥ 22.18 (native type stripping; packages ship `.ts` sources). `npm test` from `typescript/` runs every workspace test; `npm run typecheck` runs `tsc --noEmit` across packages. The PostgreSQL tests use the `pg` driver against `RECONCILER_TEST_URL` (`postgresql://rcl:rcl@localhost:55999/rcl` by convention) and skip when no database answers.
 
 See [SPEC.md](SPEC.md) for the full contract — including the PostgreSQL 14–19 feature-coverage matrix and the schema-corpus description in Appendix C. The obfuscated schema corpus lives in `java/fixtures/corpus/`.
 

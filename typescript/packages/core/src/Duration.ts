@@ -1,3 +1,5 @@
+import { IllegalArgumentError } from "./IllegalArgumentError.ts";
+
 /**
  * A duration value — the TypeScript binding for {@code java.time.Duration},
  * stored as fractional milliseconds. Factory names mirror the Java API so
@@ -13,14 +15,17 @@ export class Duration {
     }
 
     static ofMillis(millis: number): Duration {
+        checkFinite(millis);
         return millis === 0 ? Duration.ZERO : new Duration(millis);
     }
 
     static ofSeconds(seconds: number): Duration {
+        checkFinite(seconds);
         return new Duration(seconds * 1000);
     }
 
     static ofNanos(nanos: number): Duration {
+        checkFinite(nanos);
         return new Duration(nanos / 1e6);
     }
 
@@ -38,5 +43,11 @@ export class Duration {
 
     toString(): string {
         return this.millis + "ms";
+    }
+}
+
+function checkFinite(value: number): void {
+    if (!Number.isFinite(value)) {
+        throw new IllegalArgumentError("duration must be finite, got " + value);
     }
 }
