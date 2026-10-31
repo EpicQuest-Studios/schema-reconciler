@@ -1,14 +1,14 @@
 {
     "name": "@schema-reconciler/core",
     "version": "0.9.0",
-    "description": "Vendor-neutral, declarative, data-safe schema reconciliation — API, SPI and engine (TypeScript binding of SPEC.md).",
+    "description": "Vendor-neutral, declarative, data-safe schema reconciliation \u2014 API, SPI and engine (TypeScript binding of SPEC.md).",
     "license": "Apache-2.0",
     "type": "module",
     "exports": {
         ".": "./src/index.ts",
-        "./internal/*": "./src/internal/*.ts",
-        "./model/*": "./src/model/*.ts",
-        "./spi/*": "./src/spi/*.ts"
+        "./model/*.ts": "./src/model/*.ts",
+        "./spi/*.ts": "./src/spi/*.ts",
+        "./*.ts": "./src/*.ts"
     },
     "files": [
         "src"
