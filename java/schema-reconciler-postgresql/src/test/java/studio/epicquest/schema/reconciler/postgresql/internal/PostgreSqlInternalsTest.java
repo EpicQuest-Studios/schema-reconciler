@@ -327,8 +327,20 @@ class PostgreSqlInternalsTest {
         PgScriptCheck.check("CREATE TABLE " + scratch + ".t (a int)", scratch);
         PgScriptCheck.check("CREATE OR REPLACE FUNCTION " + scratch
                 + ".f() RETURNS int LANGUAGE sql AS $$ SELECT 1 $$", scratch);
+        // the namespace's own acl and owner are snapshot state (A.5):
+        // GRANT/REVOKE ... ON SCHEMA <scratch> and ALTER SCHEMA
+        // <scratch> OWNER TO are the modeled forms
+        PgScriptCheck.check("GRANT USAGE ON SCHEMA " + scratch + " TO r", scratch);
+        PgScriptCheck.check("REVOKE CREATE ON SCHEMA " + scratch + " FROM r", scratch);
+        PgScriptCheck.check("ALTER SCHEMA " + scratch + " OWNER TO r", scratch);
         assertThrows(DesiredStateException.class,
-                () -> PgScriptCheck.check("GRANT USAGE ON SCHEMA " + scratch + " TO r", scratch));
+                () -> PgScriptCheck.check("GRANT USAGE ON SCHEMA " + scratch
+                        + ", other TO r", scratch));
+        assertThrows(DesiredStateException.class,
+                () -> PgScriptCheck.check("ALTER SCHEMA other OWNER TO r", scratch));
+        assertThrows(DesiredStateException.class,
+                () -> PgScriptCheck.check("ALTER SCHEMA " + scratch
+                        + " RENAME TO s2", scratch));
         PgScriptCheck.check("GRANT SELECT ON TABLE " + scratch + ".t TO r", scratch);
         PgScriptCheck.check("COMMENT ON TABLE " + scratch + ".t IS 'x'", scratch);
         PgScriptCheck.check("COMMENT ON COLUMN t.c IS 'x'", scratch);

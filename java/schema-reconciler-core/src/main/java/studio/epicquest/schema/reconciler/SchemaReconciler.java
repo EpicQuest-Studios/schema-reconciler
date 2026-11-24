@@ -1,6 +1,8 @@
 package studio.epicquest.schema.reconciler;
 
 import java.time.Duration;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Objects;
 import java.util.ServiceLoader;
 import java.util.function.Predicate;
@@ -8,6 +10,7 @@ import javax.sql.DataSource;
 import studio.epicquest.schema.reconciler.internal.Engine;
 import studio.epicquest.schema.reconciler.model.ObjectId;
 import studio.epicquest.schema.reconciler.model.ReconcilePlan;
+import studio.epicquest.schema.reconciler.model.RenameHint;
 import studio.epicquest.schema.reconciler.spi.Dialect;
 
 /**
@@ -48,6 +51,15 @@ public final class SchemaReconciler {
     }
 
     /**
+     * Applies a plan serialised by {@link ReconcilePlan#toJson()} — the
+     * machine-readable counterpart of {@link #apply}. Fails on invalid
+     * JSON or when the target changed since the plan was issued.
+     */
+    public ReconcileReport applyJson(String serializedPlan) {
+        return engine.applyJson(Objects.requireNonNull(serializedPlan, "serializedPlan"));
+    }
+
+    /**
      * Reads the target namespace under the namespace lock and renders it as
      * a namespace-neutral desired-state script — the bootstrap path of spec
      * 3.1. Requires no {@code desiredState}; the target is never mutated.
@@ -68,6 +80,8 @@ public final class SchemaReconciler {
         private Duration statementTimeout;
         private ReconcileListener listener = ReconcileListener.NONE;
         private Predicate<ObjectId> objectFilter = id -> true;
+        private boolean concurrentIndexes;
+        private final List<RenameHint> renameHints = new ArrayList<>();
 
         private Builder() {
         }
@@ -149,6 +163,28 @@ public final class SchemaReconciler {
         }
 
         /**
+         * Renders index creates/drops in their concurrent, non-transactional
+         * form where the dialect supports it (PostgreSQL: {@code CREATE INDEX
+         * CONCURRENTLY} outside a transaction, spec 5.6). Default {@code false}.
+         */
+        public Builder concurrentIndexes(boolean enabled) {
+            this.concurrentIndexes = enabled;
+            return this;
+        }
+
+        /**
+         * Declares that {@code from} was renamed to {@code to} — the same
+         * hint the {@code -- @reconciler rename} script directive gives. An
+         * active hint turns the UNEXPECTED(from)/MISSING(to) pair into an
+         * {@code ALTER ... RENAME} change instead of a drop+create (spec
+         * 5.5.1).
+         */
+        public Builder rename(ObjectId from, ObjectId to) {
+            this.renameHints.add(new RenameHint(from, to));
+            return this;
+        }
+
+        /**
          * Validates required properties and, when no dialect is set, that at
          * least one {@code Dialect} provider is discoverable. Opens no
          * connection: dialect selection happens on first use (spec 3.1, 3.4).
@@ -175,7 +211,7 @@ public final class SchemaReconciler {
             return new SchemaReconciler(new Engine(
                     dataSource, scratchDataSource, targetNamespace, desiredState,
                     dialect, policy, lockTimeout, statementTimeout, listener,
-                    objectFilter));
+                    objectFilter, concurrentIndexes, List.copyOf(renameHints)));
         }
     }
 }

@@ -5,6 +5,7 @@ import type { PlannedChange } from "../model/PlannedChange.ts";
 import type { SchemaObject } from "../model/SchemaObject.ts";
 import type { SchemaSnapshot } from "../model/SchemaSnapshot.ts";
 import type { DialectCapabilities } from "./DialectCapabilities.ts";
+import type { RenderOptions } from "./RenderOptions.ts";
 import type { DatabaseMetadata, SqlConnection } from "./Sql.ts";
 
 /**
@@ -88,9 +89,23 @@ export interface Dialect {
      * Renders the statements and safety class for one difference, bound to the
      * target namespace. Changes are returned with {@code order} set to {@code 0};
      * the core assigns the final order.
+     *
+     * For an {@code UNEXPECTED} difference under a pruning policy, the core
+     * passes the <em>actual</em> snapshot as {@code snapshot} so the dialect
+     * can read the unexpected object's drop fragments; for {@code MISSING}
+     * and {@code DRIFTED} it is the desired snapshot.
      */
-    render(difference: Difference, desired: SchemaSnapshot, targetNamespace: string)
-            : PlannedChange[];
+    render(difference: Difference, snapshot: SchemaSnapshot, targetNamespace: string,
+           options?: RenderOptions): PlannedChange[];
+
+    /**
+     * Renders an explicit rename (spec 5.5.1): {@code from} exists in
+     * {@code actual}, {@code to} is its desired identity. The default
+     * implementation throws {@link PlanningException} — dialects without a
+     * rename statement need not implement it.
+     */
+    renderRename?(from: ObjectId, to: ObjectId, actual: SchemaSnapshot,
+                  desired: SchemaSnapshot, targetNamespace: string): PlannedChange[];
 
     /**
      * Create-fragment statements for one snapshot object, written with the

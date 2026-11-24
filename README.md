@@ -28,15 +28,17 @@ This repository contains two things:
 
 - **The engine is the parser.** The desired script executes inside the real database in a scratch namespace that is rolled back afterwards, so the library never parses vendor SQL itself.
 - **Engine-canonical comparison.** Desired and actual objects are compared using definitions rendered by the same engine from its own catalog (`pg_get_*def` style), so a matching name is never mistaken for a matching definition.
-- **Plan before apply.** Every run produces an inspectable, deterministic plan ordered by the real dependency graph; applying is a separate step governed by an explicit `ReconcilePolicy` (`FAIL` / `REPORT` / `APPLY` for destructive, manual and unsupported changes).
-- **Never lose data by default.** Destructive changes are rejected unless opted in; unexpected objects are reported, never dropped; external dependents are detected before apply, not discovered as mid-apply errors.
-- **Converge and verify.** After applying, the catalog is re-read and every applied object is proven to match its desired definition; re-running on a converged schema reports `UP_TO_DATE`.
+- **Plan before apply.** Every run produces an inspectable, deterministic plan ordered by the real dependency graph (with per-change lock/rewrite/validation hazard metadata, plus `toSql()` and `toJson()`/`applyJson()` export); applying is a separate step governed by an explicit `ReconcilePolicy` (`FAIL` / `REPORT` / `APPLY` for destructive, manual and unsupported changes).
+- **Never lose data by default.** Destructive changes are rejected unless opted in; unexpected objects are reported by default (opt-in `prune` drops them by data risk); explicit rename hints (`-- @reconciler rename` or `Builder.rename`) avoid destructive drop+create; optional `concurrentIndexes(true)` runs `CREATE`/`DROP INDEX CONCURRENTLY` post-commit; external dependents are detected before apply, not discovered as mid-apply errors.
+- **Converge and verify.** After applying, the catalog is re-read and every applied object is proven to match its desired definition; re-running on a converged schema reports `UP_TO_DATE`. `MultiNamespaceReconciler` coordinates multi-schema runs in order.
 
 ## Repository layout
 
 | Path | Contents |
 |---|---|
 | [SPEC.md](SPEC.md) | The vendor-neutral contract (normative; Appendix D is the TypeScript binding) |
+| [docs/adr/](docs/adr/) | Architectural decision records |
+| [sql/postgresql/](sql/postgresql/) | Shared PostgreSQL catalog SQL queries loaded by both Java and TypeScript |
 | [java/](java/README.md) | Java reference implementation — core, PostgreSQL dialect, TCK |
 | [typescript/](typescript/README.md) | TypeScript port — same three packages on `node:test` |
 | [java/fixtures/](java/fixtures/) | Shared test fixtures (deployment + obfuscated schema corpus) |

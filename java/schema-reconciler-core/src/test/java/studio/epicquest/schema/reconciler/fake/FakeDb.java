@@ -35,6 +35,7 @@ import studio.epicquest.schema.reconciler.spi.Dialect;
  *   CREATE &lt;KIND&gt; &lt;parent.&gt;?&lt;name&gt; [REQUIRES &lt;KIND&gt;:&lt;name&gt;,...] [COMPARED] [DEF &lt;canonical&gt;]
  *   DROP   &lt;KIND&gt; &lt;parent.&gt;?&lt;name&gt;
  *   ALTER  &lt;KIND&gt; &lt;parent.&gt;?&lt;name&gt; DEF &lt;canonical&gt;
+ *   RENAME &lt;KIND&gt; &lt;parent.&gt;?&lt;name&gt; TO &lt;newname&gt;
  * </pre>
  *
  * {@code COMPARED} sets the content-compared attribute (spec 5.4). A {@code CREATE} stores a {@link SchemaObject} whose canonical definition is
@@ -184,6 +185,20 @@ public final class FakeDb {
                 objects.put(id, new SchemaObject(id, new Definition(parsed.def.get()),
                         parsed.requires.isEmpty() ? existing.dependsOn() : parsed.requires,
                         existing.attributes()));
+            }
+            case "RENAME" -> {
+                if (tokens.length != 5 || !tokens[3].equals("TO")) {
+                    throw new SQLException("syntax error: " + sql);
+                }
+                final var id = parseObjectId(tokens[1], tokens[2]);
+                final var existing = objects.remove(id);
+                if (existing == null) {
+                    throw new SQLException("object does not exist: " + id);
+                }
+                final var newId = new ObjectId(id.kind(), tokens[4],
+                        id.parent());
+                objects.put(newId, new SchemaObject(newId, existing.definition(),
+                        existing.dependsOn(), existing.attributes()));
             }
             default -> throw new SQLException("syntax error: " + sql);
         }

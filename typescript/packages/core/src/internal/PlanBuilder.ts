@@ -13,8 +13,10 @@ import { ObjectMap } from "../model/ObjectMap.ts";
 import { ObjectSet } from "../model/ObjectSet.ts";
 import { PlannedChange } from "../model/PlannedChange.ts";
 import { ReconcilePlan } from "../model/ReconcilePlan.ts";
+import type { RenameHint } from "../model/RenameHint.ts";
 import type { SchemaSnapshot } from "../model/SchemaSnapshot.ts";
 import type { Dialect } from "../spi/Dialect.ts";
+import type { RenderOptions } from "../spi/RenderOptions.ts";
 import { Dependencies } from "./Dependencies.ts";
 import { MinHeap } from "./MinHeap.ts";
 
@@ -38,7 +40,9 @@ function actionRank(action: ChangeAction): number {
  * Turns differences into an ordered {@link ReconcilePlan}: covered-child
  * suppression (5.8.4), dependent-rebuild expansion (5.8.2, 5.8.3), drop/create
  * pairing (4.4), name-collision detection (5.8.7) and two-phase ordering
- * (5.8.5).
+ * (5.8.5). With {@code prune} on, UNEXPECTED objects produce standalone
+ * DROPs (5.5); with rename hints, matching from/to pairs collapse to an
+ * {@code ALTER ... RENAME} plus a drift fix when the definition moved.
  */
 export class PlanBuilder {
 
@@ -46,13 +50,22 @@ export class PlanBuilder {
     private readonly targetNamespace: string;
     private readonly actual: SchemaSnapshot;
     private readonly desired: SchemaSnapshot;
+    private readonly prune: boolean;
+    private readonly renameHints: readonly RenameHint[];
+    private readonly options: RenderOptions;
+    private renamedParents: ReadonlyMap<string, string> = new Map();
 
     constructor(dialect: Dialect, targetNamespace: string,
-                actual: SchemaSnapshot, desired: SchemaSnapshot) {
+                actual: SchemaSnapshot, desired: SchemaSnapshot,
+                prune = false, renameHints: readonly RenameHint[] = [],
+                options: RenderOptions = {}) {
         this.dialect = dialect;
         this.targetNamespace = targetNamespace;
         this.actual = actual;
         this.desired = desired;
+        this.prune = prune;
+        this.renameHints = renameHints;
+        this.options = options;
     }
 
     build(differences: Difference[]): Built {
@@ -64,24 +77,73 @@ export class PlanBuilder {
             }
         }
 
+        // active rename hints hide the UNEXPECTED(from)/MISSING(to) pair
+        // (and the unexpected-column table-shape conflict) behind one
+        // RENAME change plus an optional drift fix (5.5.1)
+        const renamed = this.activeRenames();
+        for (const hint of renamed) {
+            covered.add(hint.from);
+            covered.add(hint.to);
+        }
+        // prune: an UNEXPECTED object dropped because another UNEXPECTED
+        // object it depends on is dropped needs no DROP of its own —
+        // the parent's drop takes it down (indexes and constraints on a
+        // dropped table, owned sequences, mirrored annotations)
+        const pruned = this.prune ? this.suppressedUnexpected(differences) : new ObjectSet();
+
+        // a parent rename carries its same-named children along: their
+        // UNEXPECTED(old.x)/MISSING(new.x) pairs are the same object with
+        // a moved parent, not a drop+create; a def change still gets a
+        // DRIFTED fix on the new id. Children dropped under prune with
+        // no desired counterpart render through the NEW parent name —
+        // the old one is gone once the rename ran (5.5.1)
+        const carried = this.carriedChildren(renamed);
+        for (const id of carried.suppressed) {
+            covered.add(id);
+        }
+        this.renamedParents = carried.parentNames;
+
         const changes: PlannedChange[] = [];
+        for (const drift of carried.drift) {
+            changes.push(...this.render(drift));
+        }
         for (const d of differences) {
-            if ((d.type === DifferenceType.MISSING || d.type === DifferenceType.DRIFTED)
-                    && !covered.has(d.id)) {
+            if (covered.has(d.id) || pruned.has(d.id)) {
+                continue;
+            }
+            if (d.type === DifferenceType.MISSING || d.type === DifferenceType.DRIFTED) {
+                changes.push(...this.render(d));
+            } else if (d.type === DifferenceType.UNEXPECTED && this.prune
+                    && d.id.kind !== ObjectKind.OTHER) {
                 changes.push(...this.render(d));
             }
         }
-        changes.push(...this.tableShapeConflicts(differences));
+        if (!this.prune) {
+            changes.push(...this.tableShapeConflicts(differences, covered));
+        }
         for (let i = changes.length - 1; i >= 0; i--) {
             if (covered.has(changes[i]!.target)) {
                 changes.splice(i, 1);
             }
         }
+        // rename changes arrive after the covered-children splice: they
+        // legitimately target {@code to}, which {@code covered} holds to
+        // suppress the MISSING difference — splicing them away with it
+        // would silently drop the rename
+        const renameChanges: PlannedChange[] = [];
+        for (const hint of renamed) {
+            const rendered = this.renderRename(hint);
+            // the ALTER ... RENAME must precede everything else that
+            // touches {@code to} — a drift recreate's DROP targets the
+            // new name, which only exists after the rename ran
+            renameChanges.push(...rendered.early);
+            changes.push(...rendered.late);
+        }
 
         this.addDependentRebuilds(changes, coveredByParent);
         this.validatePairs(changes);
         this.checkNameCollisions(changes);
-        const ordered = this.orderChanges(changes);
+        const ordered = this.orderChanges(changes, renameChanges);
 
         const visible = differences.filter(d => !covered.has(d.id));
         const plan = new ReconcilePlan(this.targetNamespace, this.dialect.id(),
@@ -89,8 +151,148 @@ export class PlanBuilder {
         return { plan, coveredByParent };
     }
 
+    /**
+     * The hints that are active in this diff: {@code from} exists in the
+     * actual snapshot, {@code to} does not, {@code to} is desired and
+     * {@code from} is not. Both sides present in actual is a conflict a
+     * rename cannot resolve.
+     */
+    private activeRenames(): RenameHint[] {
+        const active: RenameHint[] = [];
+        for (const hint of this.renameHints) {
+            const haveFrom = this.actual.objects.has(hint.from);
+            const haveTo = this.actual.objects.has(hint.to);
+            if (haveFrom && haveTo) {
+                throw new PlanningException("namespace '" + this.targetNamespace
+                        + "': rename " + hint.from + " -> " + hint.to
+                        + " is ambiguous, both objects exist");
+            }
+            if (haveFrom && !haveTo && this.desired.objects.has(hint.to)
+                    && !this.desired.objects.has(hint.from)) {
+                active.push(hint);
+            }
+        }
+        active.sort((a, b) => ObjectIds.ORDER(a.from, b.from));
+        return active;
+    }
+
+    /**
+     * One rename change, then a drift fix on {@code to} when the
+     * definition moved. {@code early} runs before all drops (the rename
+     * makes {@code to} exist); {@code late} joins the normal phases.
+     */
+    private renderRename(hint: RenameHint)
+            : { early: PlannedChange[]; late: PlannedChange[] } {
+        if (this.dialect.renderRename === undefined) {
+            throw new PlanningException("namespace '" + this.targetNamespace
+                    + "': dialect '" + this.dialect.id() + "' does not support renames");
+        }
+        let early: PlannedChange[];
+        try {
+            early = this.dialect.renderRename(hint.from, hint.to,
+                    this.actual, this.desired, this.targetNamespace);
+        } catch (e) {
+            if (e instanceof PlanningException) {
+                throw e;
+            }
+            throw new PlanningException("namespace '" + this.targetNamespace
+                    + "': dialect failed to render rename " + hint.from
+                    + " -> " + hint.to, e);
+        }
+        if (early == null || early.length === 0) {
+            throw new PlanningException("namespace '" + this.targetNamespace
+                    + "': dialect rendered no changes for rename " + hint.from
+                    + " -> " + hint.to);
+        }
+        const late: PlannedChange[] = [];
+        const want = this.desired.objects.get(hint.to)!;
+        const have = this.actual.objects.get(hint.from)!;
+        if (!want.definition.equals(have.definition)) {
+            const drift = new Difference(hint.to, DifferenceType.DRIFTED,
+                    want.definition, have.definition);
+            late.push(...this.render(drift));
+        }
+        return { early, late };
+    }
+
+    /**
+     * Children of renamed parents: {@code suppressed} holds both sides of
+     * each UNEXPECTED(old.x)/MISSING(new.x) pair that the rename carries,
+     * {@code drift} the synthetic DRIFTED differences for carried
+     * children whose definition also changed, and {@code parentNames}
+     * the old-to-new parent name map for prune renders.
+     */
+    private carriedChildren(renamed: readonly RenameHint[])
+            : { suppressed: ObjectSet; drift: Difference[];
+                parentNames: Map<string, string> } {
+        const suppressed = new ObjectSet();
+        const drift: Difference[] = [];
+        const parentNames = new Map<string, string>();
+        for (const hint of renamed) {
+            if (hint.from.parent !== undefined) {
+                continue;
+            }
+            parentNames.set(hint.from.name, hint.to.name);
+            for (const have of this.actual.objects.values()) {
+                if (have.id.parent !== hint.from.name) {
+                    continue;
+                }
+                const wantId = new ObjectId(have.id.kind, have.id.name,
+                        hint.to.name);
+                const want = this.desired.objects.get(wantId);
+                if (want === undefined) {
+                    continue;
+                }
+                suppressed.add(have.id);
+                suppressed.add(wantId);
+                if (!want.definition.equals(have.definition)) {
+                    drift.push(new Difference(wantId, DifferenceType.DRIFTED,
+                            want.definition, have.definition));
+                }
+            }
+        }
+        drift.sort((a, b) => ObjectIds.ORDER(a.id, b.id));
+        return { suppressed, drift, parentNames };
+    }
+
+    /** UNEXPECTED objects whose drop is covered by another UNEXPECTED object's drop. */
+    private suppressedUnexpected(differences: Difference[]): ObjectSet {
+        const unexpected = new ObjectSet();
+        for (const d of differences) {
+            if (d.type === DifferenceType.UNEXPECTED && d.id.kind !== ObjectKind.OTHER) {
+                unexpected.add(d.id);
+            }
+        }
+        const suppressed = new ObjectSet();
+        if (unexpected.isEmpty) {
+            return suppressed;
+        }
+        const prereqs = Dependencies.prerequisitesOf(this.dialect, this.actual);
+        for (const id of unexpected) {
+            const deps = Dependencies.reachable(id, prereqs);
+            deps.delete(id);
+            let covered = false;
+            for (const dep of deps) {
+                if (unexpected.has(dep)) {
+                    covered = true;
+                    break;
+                }
+            }
+            if (covered) {
+                suppressed.add(id);
+            }
+        }
+        return suppressed;
+    }
+
     private render(difference: Difference): PlannedChange[] {
-        return renderWith(this.dialect, this.targetNamespace, difference, this.desired);
+        const options = difference.type === DifferenceType.UNEXPECTED
+                && this.renamedParents.size > 0
+                ? { ...this.options, renamedParents: this.renamedParents }
+                : this.options;
+        return renderWith(this.dialect, this.targetNamespace, difference,
+                difference.type === DifferenceType.UNEXPECTED ? this.actual : this.desired,
+                options);
     }
 
     /** 5.8.4: for each MISSING difference, ask the dialect which children its create covers. */
@@ -141,11 +343,13 @@ export class PlanBuilder {
     }
 
     /** 5.5: an unexpected COLUMN on an expected table is a table-shape conflict. */
-    private tableShapeConflicts(differences: Difference[]): PlannedChange[] {
+    private tableShapeConflicts(differences: Difference[],
+                                covered: ObjectSet): PlannedChange[] {
         const out: PlannedChange[] = [];
         for (const d of differences) {
             if (d.type !== DifferenceType.UNEXPECTED
                     || d.id.kind !== ObjectKind.COLUMN
+                    || covered.has(d.id)
                     || d.id.parent === undefined) {
                 continue;
             }
@@ -176,7 +380,7 @@ export class PlanBuilder {
                 continue;
             }
             const dropped = change.target;
-            // a DROP is always half of a recreate: the object's CREATE
+            // a DROP that is half of a recreate: the object's CREATE
             // fragment re-materializes its covered children, so those
             // dependents need no rebuild of their own — they verify through
             // the parent's covered-children expectations
@@ -199,6 +403,11 @@ export class PlanBuilder {
                 }
                 const want = this.desired.objects.get(dependent);
                 if (want === undefined) {
+                    if (this.prune) {
+                        // under prune the dependent is itself UNEXPECTED —
+                        // its drop dies with the parent's, no rebuild needed
+                        continue;
+                    }
                     throw new PlanningException("namespace '" + this.targetNamespace + "': "
                             + dependent + " depends on " + dropped
                             + " but is not part of the desired state");
@@ -208,7 +417,8 @@ export class PlanBuilder {
                         want.definition, have.definition);
                 for (const c of this.render(synthetic)) {
                     extra.push(new PlannedChange(0, c.target, c.action, c.safety,
-                            c.statements, c.expected, "dependency of " + dropped));
+                            c.statements, c.expected, "dependency of " + dropped,
+                            c.nonTransactional, c.hazard));
                     targets.add(c.target);
                 }
             }
@@ -216,7 +426,11 @@ export class PlanBuilder {
         changes.push(...extra);
     }
 
-    /** 4.4: a DROP is only ever the first half of a recreate, paired with a CREATE. */
+    /**
+     * 4.4: a DROP is only ever half of a recreate, paired with a CREATE —
+     * except a standalone DROP of an object the desired state does not
+     * contain (a pruning drop of an UNEXPECTED object, 5.5).
+     */
     private validatePairs(changes: PlannedChange[]): void {
         const byTarget = new ObjectMap<PlannedChange[]>();
         for (const c of changes) {
@@ -231,13 +445,27 @@ export class PlanBuilder {
             const drops = list.filter(c => c.action === ChangeAction.DROP).length;
             if (drops > 0) {
                 const creates = list.filter(c => c.action === ChangeAction.CREATE).length;
+                if (!this.desired.objects.has(target)) {
+                    // standalone DROP of an absent-from-desired object
+                    // (prune, 5.5): valid only with no CREATE on the target
+                    if (creates !== 0) {
+                        throw new PlanningException("namespace '" + this.targetNamespace + "': "
+                                + target + " is dropped but also created "
+                                + "while absent from the desired state");
+                    }
+                    continue;
+                }
                 if (drops !== creates) {
                     throw new PlanningException("namespace '" + this.targetNamespace + "': " + target
                             + " has " + drops + " DROP change(s) but " + creates
                             + " CREATE change(s); a DROP is only ever half of a recreate");
                 }
-                const safeties = new Set(list.map(c => c.safety));
-                const reasons = new Set(list.map(c => c.reason));
+                // the halves must match — other actions on the same target
+                // (a rename's ALTER followed by a drift recreate) carry
+                // their own reason and safety
+                const pair = list.filter(c => c.action !== ChangeAction.ALTER);
+                const safeties = new Set(pair.map(c => c.safety));
+                const reasons = new Set(pair.map(c => c.reason));
                 if (safeties.size !== 1) {
                     throw new PlanningException("namespace '" + this.targetNamespace
                             + "': the DROP and CREATE halves of " + target
@@ -302,9 +530,12 @@ export class PlanBuilder {
     /**
      * 5.8.5: all DROP changes in reverse dependency order of the actual
      * snapshot, then all CREATE and ALTER changes in dependency order of the
-     * desired snapshot.
+     * desired snapshot. {@code early} changes (rename ALTERs) run
+     * first, in hint order — a drift fix on the new name cannot touch
+     * it before the rename made it exist.
      */
-    private orderChanges(changes: PlannedChange[]): PlannedChange[] {
+    private orderChanges(changes: PlannedChange[],
+                         early: PlannedChange[] = []): PlannedChange[] {
         const desiredDeps = Dependencies.prerequisitesOf(this.dialect, this.desired);
         const actualDependents =
                 Dependencies.reverse(Dependencies.prerequisitesOf(this.dialect, this.actual));
@@ -312,11 +543,11 @@ export class PlanBuilder {
         const drops = changes.filter(c => c.action === ChangeAction.DROP);
         const creates = changes.filter(c => c.action !== ChangeAction.DROP);
 
-        const ordered: PlannedChange[] = [];
+        const ordered: PlannedChange[] = [...early];
         ordered.push(...this.topologicalOrder(drops, actualDependents));
         ordered.push(...this.topologicalOrder(creates, desiredDeps));
         return ordered.map((c, i) => new PlannedChange(i + 1, c.target, c.action, c.safety,
-                c.statements, c.expected, c.reason));
+                c.statements, c.expected, c.reason, c.nonTransactional, c.hazard));
     }
 
     /**
@@ -395,10 +626,11 @@ function coverRecreatedChildren(dialect: Dialect, dropped: ObjectId,
 }
 
 function renderWith(dialect: Dialect, targetNamespace: string,
-                    difference: Difference, desired: SchemaSnapshot): PlannedChange[] {
+                    difference: Difference, snapshot: SchemaSnapshot,
+                    options: RenderOptions): PlannedChange[] {
     let rendered: PlannedChange[];
     try {
-        rendered = dialect.render(difference, desired, targetNamespace);
+        rendered = dialect.render(difference, snapshot, targetNamespace, options);
     } catch (e) {
         if (e instanceof PlanningException) {
             if (messageOf(e).includes("namespace '" + targetNamespace + "'")) {

@@ -4,7 +4,7 @@
 
 | | |
 |---|---|
-| **Version** | 0.9, Draft |
+| **Version** | 0.10, Draft |
 | **Date** | 2026-10-25 |
 | **Maven group** | `studio.epicquest.schema` |
 | **Java baseline** | Java SE 25 |
@@ -215,6 +215,9 @@ public final class SchemaReconciler {
     /** Applies a plan previously returned by plan(); fails if the target has changed since. */
     public ReconcileReport apply(ReconcilePlan plan) { ... }
 
+    /** Deserialises a JSON plan produced by ReconcilePlan.toJson() and applies it (4.4). */
+    public ReconcileReport applyJson(String serializedPlan) { ... }
+
     /** Reads the target namespace under the lock and returns an equivalent desired-state script. */
     public String dump() { ... }
 
@@ -227,6 +230,8 @@ public final class SchemaReconciler {
         public Builder policy(ReconcilePolicy policy) { ... }             // default ReconcilePolicy.defaults()
         public Builder lockTimeout(Duration timeout) { ... }              // default 60 s
         public Builder statementTimeout(Duration timeout) { ... }         // optional, unbounded by default
+        public Builder concurrentIndexes(boolean enabled) { ... }         // optional, default false (6.4)
+        public Builder rename(ObjectId from, ObjectId to) { ... }         // optional, repeatable explicit rename hint
         public Builder listener(ReconcileListener listener) { ... }       // optional
         public Builder filter(Predicate<ObjectId> include) { ... }        // optional, default includes all objects
         public SchemaReconciler build() { ... }
@@ -259,7 +264,7 @@ The desired script is a trusted build artefact. It is executed with the privileg
 1. The script should create objects only inside `${namespace}` (or unqualified). A statement that creates an object in another namespace escapes the scratch namespace — it can neither be detected nor cleaned up — so its behaviour is undefined. A dialect may instead reject a statement it can determine would create an object with no namespace anchor at all — a role or a server, for example — since such an object could never appear in a snapshot (5.4).
 2. The script must not create, alter or drop namespaces, must not acquire session-level locks (for example `pg_advisory_lock`), and must not change session state (for example `SET` without `LOCAL`, `RESET`, `LOAD`, or `set_config` with `is_local` other than the literal `true`): session-level effects can leak onto a pooled connection (C-21). A dialect should detect these statically, including inside anonymous code blocks, and must release any session-level lock a script took indirectly (for example inside a function it invoked) before the scratch connection is reused (A.2). A dialect may also reject a statement whose created, altered or dropped object name is qualified by a namespace other than the scratch namespace — the statement would escape the scratch namespace even though its text parses.
 3. On transactional dialects, the script must not contain transaction control (`BEGIN`, `COMMIT`, `ROLLBACK`, `SAVEPOINT`), nor statements that cannot run inside a transaction block, for example `CREATE INDEX CONCURRENTLY` or `VACUUM` (OI-3). After executing the script, the dialect must check that the run's transaction and scratch savepoint are still intact. If they are not, it must remove the scratch namespace and fail with `DesiredStateException`.
-4. Other non-DDL statements may appear; their effects are confined to the scratch connection. A dialect may instead reject a statement whose catalog effect its snapshot cannot represent — it would apply during the scratch replay yet leave no detectable trace, so a plan could claim success while the target never changed. The PostgreSQL check therefore rejects grants, comments and security labels on the reconcile unit itself (`ON SCHEMA`), storage-placement clauses (`TABLESPACE`, `REINDEX ... TABLESPACE`), typed tables (`OF`), non-heap access methods (`CREATE TABLE ... USING`), clustering-index membership (`CLUSTER ... USING`, `ALTER ... CLUSTER ON`), planner tuning (`SET STATISTICS`), sequence `RESTART`, `OWNER TO` on targets whose owner column is not modeled (including `ALTER INDEX`, whose owner silently follows its table), partition-index attach, operator member mutations beyond an operator class's `ADD|DROP OPERATOR|FUNCTION` forms (snapshot state — standalone `OPERATOR FAMILY` members stay unmodeled) and text-search member mutations beyond a configuration's `MAPPING` forms and a dictionary's option redefinition, `DEPENDS ON EXTENSION`, collation `REFRESH VERSION` and view column defaults.
+4. Other non-DDL statements may appear; their effects are confined to the scratch connection. A dialect may instead reject a statement whose catalog effect its snapshot cannot represent — it would apply during the scratch replay yet leave no detectable trace, so a plan could claim success while the target never changed. The PostgreSQL check therefore rejects comments and security labels on the reconcile unit itself (`COMMENT ON SCHEMA`, `SECURITY LABEL ... ON SCHEMA` — its acl and owner are snapshot state, its annotations are not), storage-placement clauses (`TABLESPACE`, `REINDEX ... TABLESPACE`), typed tables (`OF`), non-heap access methods (`CREATE TABLE ... USING`), clustering-index membership (`CLUSTER ... USING`, `ALTER ... CLUSTER ON`), planner tuning (`SET STATISTICS`), sequence `RESTART`, `OWNER TO` on targets whose owner column is not modeled (including `ALTER INDEX`, whose owner silently follows its table), partition-index attach, operator member mutations beyond an operator class's `ADD|DROP OPERATOR|FUNCTION` forms (snapshot state — standalone `OPERATOR FAMILY` members stay unmodeled) and text-search member mutations beyond a configuration's `MAPPING` forms and a dictionary's option redefinition, `DEPENDS ON EXTENSION`, collation `REFRESH VERSION` and view column defaults.
 5. The script must not refer to the target namespace by its literal name; it uses `${namespace}` or unqualified names instead. Before substitution, the core must search the script for the target namespace identifier — bare or enclosed in the dialect's identifier quotes, compared case-insensitively — immediately followed by `.` and not preceded by an identifier character (letter, digit, `_`, `$`) or by `.`. On a match, `plan()` must fail with `DesiredStateException` giving the position of the first match.
 
    Rationale: in the scratch namespace a literal reference stays literal. In the actual snapshot, normalisation rule 5.3(1) turns the same reference into `${namespace}.`. The object would therefore be `DRIFTED` on every run and never pass verification. The check is lexical, so a match inside a comment or string literal also fails; this follows P4, and the script author can rewrite the text. The same failure has a second form on the placeholder side: substitution replaces `${namespace}` textually, so a bare token inside a string literal — `DEFAULT '${namespace}'` — bakes the scratch name itself into the catalog, where it stays literal and drifts on every run; and a literal the escape leaves behind — `DEFAULT '$${namespace}'` — stores the token text, which binding replaces with the quoted target on apply while normalisation sees no `.` qualifier, drifting forever. The PostgreSQL dialect therefore rejects a string literal whose whole content is the substituted scratch name (bare or in identifier quotes) and any literal containing the token text unless it is followed by `.`; the qualified form `'${namespace}.seq'` inside a literal stays legal because binding and normalisation both see the `.` qualifier.
@@ -274,13 +279,15 @@ public record ReconcilePolicy(
         Decision rebuild,                           // default APPLY
         Decision destructive,                       // default FAIL
         Decision unsupported,                       // default FAIL; APPLY is not permitted
-        Map<String, Decision> unsupportedCategories) { // per-category overrides; APPLY is not permitted
+        Map<String, Decision> unsupportedCategories,// per-category overrides; APPLY is not permitted
+        boolean prune) {                            // default false; opt-in DROP for UNEXPECTED objects
 
     public static ReconcilePolicy defaults() { ... }
-    public static ReconcilePolicy reportOnly() { ... }  // REPORT for every class
+    public static ReconcilePolicy reportOnly() { ... }  // REPORT for every class, prune = false
 
     public ReconcilePolicy withDestructive(Decision decision) { ... }
     public ReconcilePolicy withUnsupportedCategory(String category, Decision decision) { ... }
+    public ReconcilePolicy withPrune(boolean prune) { ... }
     // with... for each component
 }
 ```
@@ -295,7 +302,7 @@ The compact constructor must reject `unsupported == APPLY` and any `unsupportedC
 - `REPORT`: the change is not executed. It appears in `ReconcileReport.reported()` and is logged at `WARNING`. For `unsupported`, each `UNSUPPORTED` difference appears in `ReconcileReport.unsupported()` and is logged at `WARNING`.
 - `FAIL`: if the plan contains at least one change of this class — or, for `unsupported`, at least one `UNSUPPORTED` difference — `reconcile()` and `apply(plan)` must throw `PolicyViolationException` **before executing any change**.
 
-Unexpected objects (section 5.5) never produce changes, regardless of policy, except for the table-shape conflict defined there.
+Unexpected objects (section 5.5) never produce changes when `prune` is `false` (the default), except for the table-shape conflict defined there. When `prune` is `true`, `UNEXPECTED` managed objects produce standalone `DROP` changes classified by data risk (`REBUILD` for indexes, views, routines, constraints, etc.; `DESTRUCTIVE` for tables, columns, materialized views, partitions, sequences) and governed by `rebuild` / `destructive` like any other change.
 
 A change whose `statements` list is empty is a *manual change*: the dialect can describe it but not perform it safely. A manual change mapped to `APPLY` must be treated as `FAIL`.
 
@@ -357,6 +364,51 @@ public interface ReconcileListener {
 ```
 
 Listeners are called on the reconciling thread. An exception thrown by a listener must abort the run as `ApplyException`, carrying the changes applied so far (possibly none) and, when thrown from `applying` or `applied`, the change being processed. This holds even when the exception comes from `planned`, before anything is applied. `plan()` applies nothing, so there a listener exception aborts as `PlanningException`. In transactional dialects the abort rolls everything back.
+
+### 3.7 `MultiNamespaceReconciler`
+
+```java
+public final class MultiNamespaceReconciler {
+
+    public static Builder builder() { ... }
+
+    /** One plan() per namespace, in configured order. */
+    public Map<String, ReconcilePlan> plan() { ... }
+
+    /** One reconcile() per namespace in configured order; fails fast on the first exception. */
+    public MultiReconcileReport reconcile() { ... }
+
+    /** One dump() per namespace, in configured order. */
+    public Map<String, String> dump() { ... }
+
+    public static final class Builder {
+        // shared defaults forwarded to each namespace's SchemaReconciler.Builder
+        public Builder dataSource(DataSource dataSource) { ... }          // required
+        public Builder scratchDataSource(DataSource dataSource) { ... }   // optional, see 6.3
+        public Builder dialect(Dialect dialect) { ... }                   // optional, see 3.4
+        public Builder policy(ReconcilePolicy policy) { ... }             // default ReconcilePolicy.defaults()
+        public Builder lockTimeout(Duration timeout) { ... }              // default 60 s
+        public Builder statementTimeout(Duration timeout) { ... }         // optional, unbounded by default
+        public Builder concurrentIndexes(boolean enabled) { ... }         // optional, default false (6.4)
+        public Builder listener(ReconcileListener listener) { ... }       // optional
+        public Builder filter(Predicate<ObjectId> include) { ... }        // optional, default includes all objects
+
+        /** Registers a target namespace, preserving execution order. */
+        public Builder namespace(String namespace) { ... }                                // dump()-only usage
+        public Builder namespace(String namespace, DesiredState desiredState) { ... }
+        public Builder namespace(String namespace, DesiredState desiredState,
+                                 Consumer<SchemaReconciler.Builder> customize) { ... }
+        public MultiNamespaceReconciler build() { ... }
+    }
+}
+
+public record MultiReconcileReport(
+        ReconcileOutcome outcome,
+        Map<String, ReconcileReport> reports,   // insertion-ordered by configured namespace order
+        Duration elapsed) { }
+```
+
+`build()` must fail with `ConfigurationException` when `dataSource` is missing, when no namespace is registered, or when a namespace name is empty or a duplicate (compared case-sensitively); it also builds every registered `SchemaReconciler` up front — applying the shared defaults first, then the optional `customize` — so a per-namespace configuration error fails at `build()` without opening a connection (3.1). `reconcile()` runs the namespaces sequentially in configured order, each under its own namespace lock, so a later namespace's desired script may reference an earlier namespace's objects — a cross-schema `REFERENCES`, an external dependency (5.8.3) — and aborts the whole run on the first exception. `MultiReconcileReport.outcome` aggregates the per-namespace outcomes: `RECONCILED` when any namespace reconciled, else `REPORTED_ONLY` when any reported, else `UP_TO_DATE`; `elapsed` is the call's total monotonic run time.
 
 ## 4. Model
 
@@ -421,6 +473,15 @@ public record Difference(
 ```java
 public enum ChangeAction { CREATE, ALTER, DROP }
 public enum ChangeSafety { ADDITIVE, REBUILD, DESTRUCTIVE }
+public enum LockLevel { NONE, SHARE_UPDATE_EXCLUSIVE, SHARE, SHARE_ROW_EXCLUSIVE, ACCESS_EXCLUSIVE }
+
+public record ChangeHazard(
+        LockLevel lockLevel,
+        boolean rewritesTable,
+        boolean validatesRows,
+        List<String> notes) {
+    public static final ChangeHazard NONE = new ChangeHazard(LockLevel.NONE, false, false, List.of());
+}
 
 public record PlannedChange(
         int order,                          // 1-based execution order
@@ -429,7 +490,9 @@ public record PlannedChange(
         ChangeSafety safety,
         List<String> statements,            // final SQL, already bound to the target namespace
         Optional<Definition> expected,      // definition the target must have after apply; empty for DROP changes and changes against unexpected objects
-        String reason) { }                  // human-readable cause, e.g. "definition drift", "dependency of <id>"
+        String reason,                      // human-readable cause, e.g. "definition drift", "dependency of <id>"
+        boolean nonTransactional,           // true when change must run post-commit with autoCommit=true (e.g. CONCURRENTLY)
+        ChangeHazard hazard) { }            // estimated lock/rewrite/validation hazard metadata
 
 public record ReconcilePlan(
         String targetNamespace,
@@ -442,8 +505,14 @@ public record ReconcilePlan(
     public boolean isEmpty() { return changes.isEmpty(); }
 
     /** All statements in order, each preceded by a comment with its order,
-        target, action, safety and reason; manual changes are marked MANUAL. */
+        target, action, safety, hazard and reason; manual changes are marked MANUAL. */
     public String toSql() { ... }
+
+    /** Deterministic JSON representation (schemaVersion: 1) for machine review and cross-process apply. */
+    public String toJson() { ... }
+
+    /** Parses and validates a JSON plan produced by toJson(). */
+    public static ReconcilePlan fromJson(String json) { ... }
 }
 ```
 
@@ -451,7 +520,7 @@ Each `PlannedChange` is one unit of execution, placed by its own `order`. Action
 
 - `CREATE`: creates an object that does not exist, including creating it again after its `DROP` half (below), and adding a column or constraint to an existing table.
 - `ALTER`: modifies an existing object in place, for example `CREATE OR REPLACE` of a routine, and every manual change.
-- `DROP`: removes an object. In version 1 a `DROP` is only ever the first half of a *recreate*: whenever an object must be dropped and created again, `render` must return two changes for the same `target` — a `DROP` change and a `CREATE` change carrying `expected` — with the same safety class and reason. A `DROP` without a matching `CREATE` for the same target is invalid, and the core must reject it with `PlanningException`. The core ties the two halves together: they are always both applied or both reported (3.3).
+- `DROP`: removes an object. A `DROP` is either the first half of a *recreate* — whenever an object must be dropped and created again, `render` returns a `DROP` change and a `CREATE` change carrying `expected` with the same safety class and reason — or a standalone drop of an `UNEXPECTED` object when `ReconcilePolicy.prune()` is `true`. A `DROP` for a `DRIFTED` object without a matching `CREATE` for the same target is invalid, and the core must reject it with `PlanningException`. The core ties the two halves of a recreate together: they are always both applied or both reported (3.3).
 
 Splitting a recreate into two changes lets the drop and create halves be ordered separately (5.8.5): dependents are dropped before their prerequisites and created after them.
 
@@ -470,9 +539,9 @@ A plan must be serialisable as plain text for review via `toSql()`. The output m
 5. **Diff.** Compute differences (5.4, 5.5).
 6. **Plan.** Ask the dialect to render changes for each difference, add dependent rebuilds (5.8), assign execution order and safety classes, and build the `ReconcilePlan`.
 7. **Evaluate policy.** Evaluate the plan as defined in 3.3: fail check, recreate pairing, then prerequisite closure. On a `FAIL`, throw `PolicyViolationException` carrying the plan. Nothing is executed.
-8. **Apply.** Bind the session namespace to the target namespace (6.1), then execute the changes that remain mapped to `APPLY`, in plan order. Collect the changes mapped to or demoted to `REPORT`, and the `UNSUPPORTED` differences reported under `REPORT`.
-9. **Verify.** Re-read the actual snapshot. The target of every applied change whose `expected` is present must now have a definition equal to it (4.4); otherwise throw `VerificationException`, listing each object that did not converge. `DROP` changes are verified through the `CREATE` half of their recreate.
-10. **Finish.** Commit (transactional dialects), release the lock and return the report.
+8. **Apply.** Bind the session namespace to the target namespace (6.1), then execute the transactional changes (`!nonTransactional`) that remain mapped to `APPLY`, in plan order. Collect the changes mapped to or demoted to `REPORT`, and the `UNSUPPORTED` differences reported under `REPORT`.
+9. **Verify.** Re-read the actual snapshot. The target of every applied transactional change whose `expected` is present must now have a definition equal to it (4.4); for an applied standalone `DROP` (from `prune`), the target must now be absent. Otherwise throw `VerificationException`, listing each object that did not converge. `DROP` changes that are part of a recreate are verified through the `CREATE` half.
+10. **Finish & optional non-transactional phase.** Commit (transactional dialects). If any applied-policy changes have `nonTransactional == true` (for example `CREATE INDEX CONCURRENTLY` when `concurrentIndexes` is enabled), switch the connection to `autoCommit = true`, execute them in plan order, and re-verify their targets (catching invalid indexes); restore `autoCommit` before releasing the lock. Release the lock and return the report.
 
 On any exception in steps 3 to 9, transactional dialects must roll back the whole run. For non-transactional dialects see 6.4.
 
@@ -502,9 +571,11 @@ A dialect must detect every object in the scratch namespace, including kinds it 
 
 ### 5.5 Unexpected objects
 
-`UNEXPECTED`: present in actual, absent in desired. Unexpected objects must be listed in the report and logged at `WARNING`. They must not produce changes in version 1. Removing them is an operator decision outside this library.
+`UNEXPECTED`: present in actual, absent in desired. Unexpected objects must be listed in the report and logged at `WARNING`. When `ReconcilePolicy.prune()` is `false` (the default), they do not produce changes, except for the table-shape conflict below; removing them is an operator decision outside this library. When `ReconcilePolicy.prune()` is `true`, `UNEXPECTED` managed objects produce standalone `DROP` changes classified by data risk (`REBUILD` for indexes, views, routines, constraints, triggers, etc.; `DESTRUCTIVE` for tables, columns, materialized views, partitions, sequences), ordered in reverse dependency order of `actual`.
 
-Exception: an unexpected `COLUMN` whose parent table is expected is a table-shape conflict. The core must add a `DESTRUCTIVE` change for the owning table with the reason `unexpected column <name>`, so that the default policy fails loudly instead of running against a foreign table shape.
+Exception: an unexpected `COLUMN` whose parent table is expected is a table-shape conflict when `prune` is `false`. The core must add a `DESTRUCTIVE` change for the owning table with the reason `unexpected column <name>`, so that the default policy fails loudly instead of running against a foreign table shape. When `prune` is `true`, it instead renders `ALTER TABLE ... DROP COLUMN` (`DESTRUCTIVE`).
+
+**Explicit rename hints.** A caller may supply rename hints via `Builder.rename(from, to)` or SQL comment directives (`-- @reconciler rename <KIND> [<parent>.]<old_name> -> <new_name>`). When `from` is present in `actual` (and absent from `desired`) and `to` is present in `desired` (and absent from `actual`), the core suppresses `UNEXPECTED(from)` and `MISSING(to)` and asks the dialect to render a `REBUILD` `ALTER ... RENAME` change (followed by a `DRIFTED` change if the definition also changed). If the rename has already occurred, the hint is an idempotent no-op.
 
 The asymmetry applies to comments too: a `COMMENT` object exists only where a script's `COMMENT ON` produced one in the scratch snapshot, so removing the statement from the desired script never drops the comment — the actual comment is reported `UNEXPECTED` instead. Version 1 has no desired-state spelling of "no comment"; deleting one is an operator decision.
 
@@ -610,8 +681,22 @@ public interface Dialect {
     /** Reads every object in the namespace, normalised per 5.3. */
     SchemaSnapshot readSnapshot(Connection connection, String namespace) throws SQLException;
 
-    /** Renders the statements and safety class for one difference, bound to the target namespace. */
-    List<PlannedChange> render(Difference difference, SchemaSnapshot desired, String targetNamespace);
+    /** Renders the statements and safety class for one difference, bound to the target namespace.
+     *  For UNEXPECTED differences (prune), the snapshot argument is the actual snapshot. */
+    List<PlannedChange> render(Difference difference, SchemaSnapshot snapshot, String targetNamespace);
+
+    /** Renders with explicit options (e.g. concurrentIndexes). Defaults to 3-arg render. */
+    default List<PlannedChange> render(Difference difference, SchemaSnapshot snapshot,
+                                       String targetNamespace, RenderOptions options) {
+        return render(difference, snapshot, targetNamespace);
+    }
+
+    /** Renders an explicit rename (from -> to) as a REBUILD ALTER change. */
+    default List<PlannedChange> renderRename(ObjectId from, ObjectId to,
+                                             SchemaSnapshot actual, SchemaSnapshot desired,
+                                             String targetNamespace) {
+        throw new PlanningException("dialect '" + id() + "' does not support rename hints");
+    }
 
     /**
      * Create-fragment statements for one snapshot object, written with the
@@ -699,7 +784,7 @@ Every message raised during a run must name the target namespace and, where appl
 2. The library must not build SQL from data supplied at run time other than the configured namespace and the trusted desired script.
 3. The configured namespace must be validated as a legal identifier for the dialect before use: the core passes it to `Dialect.quoteIdentifier` and reports an `IllegalArgumentException` from it as `ConfigurationException`. Because a dialect is selected on first use (3.4), this validation happens then, before any SQL is sent.
 4. Documentation should recommend running reconciliation with a role limited to the target namespace. The run verifies that role's privileges before locking (`Dialect.checkAccess`), so a misconfigured role fails fast rather than mid-apply. When no `scratchDataSource` is configured, that role additionally needs namespace-creation privilege on the target database (for example `CREATE ON DATABASE` in PostgreSQL); `scratchDataSource` exists for environments that cannot grant it.
-5. The script checks of 3.2 and A.4 are guardrails, not a security sandbox. They scan top-level statements, and `DO` bodies only for `set_config` and session advisory locks: function and procedure bodies and other string literals are otherwise opaque to them, and dynamic SQL issued from inside (`EXECUTE`, `format()`) runs with the connection's privileges. Desired scripts must be treated as trusted artifacts — ship them with the service's own build, review them like migrations, and combine them with the least-privilege role of rule 4 rather than relying on lexical checks alone.
+5. **Frozen best-effort lexical guard.** The script checks of 3.2 and A.4 (`PgScriptCheck`) are **frozen as a best-effort lexical guard**, not a security sandbox or full SQL parser. They scan top-level statements (and `DO` bodies for common leaks) to catch accidental mistakes; function/procedure bodies and dynamic SQL (`EXECUTE`, `format()`) are opaque and run with the connection's privileges. For untrusted or complex scripts, treat desired scripts as trusted build artifacts and pair `scratchDataSource` with a least-privilege role (rule 4) rather than relying on lexical checks.
 
 ## 9. Conformance
 
@@ -796,6 +881,7 @@ A release of this project ships three deliverables: this document, the reference
 
 1. Releases follow Semantic Versioning 2.0.0.
 2. Within a major version, the API and model must stay source- and binary-compatible. New SPI methods must be `default` methods. Before 1.0 the SPI may still change signatures, so dialect implementations must be recompiled against each release.
+   - While the major version is 0 the specification version sets the implementation version: a small spec change — an editorial fix, a clarification, a narrow rule — bumps the patch version (`0.9.1`, `0.9.2`); a bigger spec change — new API surface, newly modeled catalog state, a new feature — bumps the minor version (`0.10.0`).
 3. A dialect declares the core major version it was built against via `Dialect.coreMajorVersion()` (6.1). The core must refuse, with `ConfigurationException`, a dialect reporting a different major version than its own.
 4. Changing a dialect's normalisation rules is a breaking change for that dialect, because it can turn equal objects into drifted ones.
 5. Implementations of this specification must run on Java SE 25 or later and must not rely on preview, incubator or deprecated-for-removal APIs.
@@ -860,8 +946,8 @@ Where `CREATE ON DATABASE` cannot be granted, a separate `scratchDataSource` (6.
 | `PARTITION` | `pg_class` (`relkind` `r` under a `p` parent — a partition child) | `pg_get_expr(relpartbound)` — the `FOR VALUES` bound; the parent is the `ObjectId` parent |
 | `FOREIGN_TABLE` | `pg_class` (`relkind` `f`) + `pg_foreign_table` + `pg_foreign_server` | `srvname` (a cluster-object reference, 4.1) plus sorted `ftoptions` plus `reloptions`; columns are separate objects |
 | `PUBLICATION` (binding) | `pg_publication_rel`/`pg_publication_namespace`/`pg_publication_sequences` — the namespace-visible edge to a cluster publication (4.1); `puballsequences` rows are flag expansions, not bindings | binding shape (`table`/`schema`/`sequence`) plus `pg_get_expr(prqual)` and the `prattrs` column list (PG15+) |
-| `OWNERSHIP` | `relowner`/`proowner`/`typowner` on managed rel/proc/type targets — the owning role is a cluster-object reference (4.1). Loaded only when the owner differs from the connecting role, so a script that assigns no owner is "don't care", never a claim to itself | `owner=<role>` |
-| `PRIVILEGES` | `relacl`/`proacl`/`typacl` on managed rel/proc/type targets, plus column-level `attacl` on managed relations — a column grant mirrors the column: `PRIVILEGES <col>` parented on the relation. The grantee roles are cluster-object references (4.1). Loaded only while the acl column holds a real grant, so a script that grants nothing is "don't care", never a claim to itself | sorted `grantee:PRIVILEGE[*]` tokens — `PUBLIC` for grantee 0, `<owner>` for the object's owner, `*` a grant option; the grantor is dropped, so the same grant recorded under another grantor compares equal (5.4) |
+| `OWNERSHIP` | `relowner`/`proowner`/`typowner` on managed rel/proc/type targets — the owning role is a cluster-object reference (4.1) — plus `nspowner` on the target namespace itself, mirrored onto the neutral `ObjectId` name `<namespace>` so the schema name never enters a canonical. Loaded only when the owner differs from the connecting role, so a script that assigns no owner is "don't care", never a claim to itself | `owner=<role>` |
+| `PRIVILEGES` | `relacl`/`proacl`/`typacl` on managed rel/proc/type targets, plus column-level `attacl` on managed relations — a column grant mirrors the column: `PRIVILEGES <col>` parented on the relation — plus `nspacl` on the target namespace itself, mirrored onto the neutral `ObjectId` name `<namespace>`. The grantee roles are cluster-object references (4.1). Loaded only while the acl column holds a real grant, so a script that grants nothing is "don't care", never a claim to itself | sorted `grantee:PRIVILEGE[*]` tokens — `PUBLIC` for grantee 0, `<owner>` for the object's owner, `*` a grant option; the grantor is dropped, so the same grant recorded under another grantor compares equal (5.4) |
 | `DEFAULT_PRIVILEGES` | `pg_default_acl` rows with `defaclnamespace` = the target namespace — one object per (`defaclobjtype`, `defaclrole`) pair, named `<CLASS> for <role>` (`TABLES`/`SEQUENCES`/`FUNCTIONS`/`TYPES`). The `FOR ROLE` role and grantees are cluster-object references (4.1); a global default ACL (`defaclnamespace` = 0) belongs to no namespace and is not an object | sorted `grantee:PRIVILEGE[*]` tokens in the same `privileges=` canonical form `PRIVILEGES` uses — the `FOR ROLE` role takes the `<owner>` slot |
 | `CAST` | `pg_cast` rows anchored to a managed object — a namespace source/target type or the cast function; unanchored or only-unmanaged-anchored rows stay `OTHER` | `castcontext` + `castmethod` + the cast function (`castfunc::regprocedure`, `none` when 0); the `ObjectId` name is `format_type(source)->format_type(target)` |
 | `TRANSFORM` | `pg_transform` rows whose `trftype` is a managed type — the only anchor a script can express (3.2); the language is a cluster-object reference (4.1) | `trffromsql`/`trftosql` as `regprocedure` text (`none` when 0); the `ObjectId` name is `format_type(trftype)/lanname` |
@@ -969,10 +1055,13 @@ create an undetectable object. It also rejects any object name in
 targets of `GRANT`/`REVOKE`, `COMMENT` and `SECURITY LABEL` — that is
 qualified by a schema other than the scratch namespace (`pg_temp`
 excepted), because such a statement creates or changes an object outside
-the sandbox (3.2 rule 1); `GRANT`/`REVOKE ... ON SCHEMA`,
-`COMMENT ON SCHEMA` and `SECURITY LABEL ... ON SCHEMA` are rejected
-outright — the namespace is the reconcile unit itself and its own acl,
-description and labels are outside the snapshot. References to foreign schemas elsewhere in a
+the sandbox (3.2 rule 1). The reconcile unit itself is the one schema a
+statement may name: `GRANT`/`REVOKE ... ON SCHEMA <namespace>` mutates
+the namespace's own acl and `ALTER SCHEMA <namespace> OWNER TO` its
+owner — both snapshot objects (A.5) — while `COMMENT ON SCHEMA`,
+`SECURITY LABEL ... ON SCHEMA` and every other `... SCHEMA` form are
+rejected outright, because a description or label on the namespace is
+outside the snapshot. References to foreign schemas elsewhere in a
 statement remain legal: a cross-schema `REFERENCES` clause is a declared
 external dependency, not an escaping creation. Finally it rejects
 session-state changes — `SET` without `LOCAL` or `TRANSACTION`,
@@ -1116,7 +1205,7 @@ Coverage of the PostgreSQL SQL command set by the reference dialect, measured ag
 | `CREATE COLLATION` | `COLLATION` objects (`pg_collation` provider `libc`/`icu`, encoding `-1` or the database's; `collversion` excluded) |
 | `CREATE CONVERSION` | `CONVERSION` objects (`pg_conversion`, `condefault` false) |
 | `SECURITY LABEL` | `SECURITY_LABEL` objects (`pg_seclabel`) on managed targets; labels on unmanaged targets stay `OTHER`. No TCK scenario exists: a `SECURITY LABEL` statement fails unless the named provider module is loaded, and none ships with a stock server — coverage is the catalog-fixture test in `AppendixCoverageTest` |
-| `GRANT`/`REVOKE` on a managed target (`TABLE`, `VIEW`, `MATERIALIZED_VIEW`, `SEQUENCE`, `FOREIGN TABLE`, `ROUTINE`, `TYPE`, `DOMAIN`), including a column list (`GRANT SELECT (c) ON t`) | `PRIVILEGES` objects mirroring the target — a column grant mirrors the column; the acl token diff renders `GRANT`/`REVOKE` (the column name parenthesized after the privilege word for column grants), a grant-option-only difference `REVOKE GRANT OPTION FOR`. `GRANT ... ON ALL ... IN SCHEMA` expands to per-target acls and stays legal; `GRANT ... ON SCHEMA` is rejected (the namespace itself is not a snapshot object), and grants on unmanaged targets stay `OTHER` |
+| `GRANT`/`REVOKE` on a managed target (`TABLE`, `VIEW`, `MATERIALIZED_VIEW`, `SEQUENCE`, `FOREIGN TABLE`, `ROUTINE`, `TYPE`, `DOMAIN`), including a column list (`GRANT SELECT (c) ON t`) | `PRIVILEGES` objects mirroring the target — a column grant mirrors the column; the acl token diff renders `GRANT`/`REVOKE` (the column name parenthesized after the privilege word for column grants), a grant-option-only difference `REVOKE GRANT OPTION FOR`. `GRANT ... ON ALL ... IN SCHEMA` expands to per-target acls and stays legal; `GRANT ... ON SCHEMA ${namespace}` mutates the namespace's own acl — the `PRIVILEGES` object named `<namespace>` — while every `ON SCHEMA <other>` list member is rejected, and grants on unmanaged targets stay `OTHER` |
 | `ALTER DEFAULT PRIVILEGES [FOR ROLE r] IN SCHEMA s GRANT`/`REVOKE` | `DEFAULT_PRIVILEGES` objects per (`defaclobjtype`, `defaclrole`); the acl token diff renders `ALTER DEFAULT PRIVILEGES FOR ROLE "r" IN SCHEMA <ns> GRANT`/`REVOKE` on the class word (`TABLES`/`SEQUENCES`/`FUNCTIONS`/`TYPES`). A global default privilege (no `IN SCHEMA`) is database-wide and rejected |
 | `ALTER ... OWNER TO` | `OWNERSHIP` objects on managed targets; ownership of unmanaged targets stays `OTHER` — see below |
 | `CREATE CAST` | `CAST` objects when a namespace source/target type or the cast function is managed; a cast anchored only to unmanaged objects stays `OTHER`, and one with no namespace anchor is invisible to the model |
@@ -1131,7 +1220,7 @@ Coverage of the PostgreSQL SQL command set by the reference dialect, measured ag
 
 Objects with no namespace anchor — `CREATE DATABASE`*, `CREATE TABLESPACE`*, `CREATE SUBSCRIPTION`*, `CREATE PUBLICATION`, `CREATE EVENT TRIGGER`, `CREATE SERVER`, `CREATE FOREIGN DATA WRAPPER`, `CREATE USER MAPPING`, `CREATE ACCESS METHOD`, `CREATE LANGUAGE`, `CREATE ROLE|GROUP|USER`, default privileges, `REASSIGN OWNED`, `DROP OWNED`, `ALTER SYSTEM`*, `ALTER ... SET SCHEMA`, role-membership `GRANT`/`REVOKE` — and session/utility statements — transaction control*, `VACUUM`*, `CHECKPOINT`*, bare `CLUSTER`* (no table), `DISCARD`* (`DISCARD ALL` cannot run in a transaction; the other forms are session state), session-level advisory locks, `LOAD`*, bare and `CONCURRENTLY` `REPACK`*, `WAIT FOR LSN`. Large objects are created by function call, not by a statement, so the script check does not see them. Items marked `*` are rejected by the script check because they cannot run inside a transaction; the rest are rejected because their catalog rows have no namespace anchor and could never be detected (5.4), or — `WAIT FOR LSN` — because the statement manipulates session or replication state only.
 
-A second rejected group is everything whose catalog effect the snapshot cannot represent (3.2 rule 4, fail closed): `GRANT`/`REVOKE`/`COMMENT`/`SECURITY LABEL ... ON SCHEMA` (the reconcile unit itself), `TABLESPACE` clauses including `REINDEX ... TABLESPACE`, typed tables (`CREATE|ALTER TABLE ... OF`, `NOT OF`), `CREATE TABLE ... USING` access methods, `CLUSTER ... USING` and `ALTER ... CLUSTER ON`/`SET WITHOUT CLUSTER` (index membership), `SET STATISTICS`, sequence and identity `RESTART`, `ALTER ... OWNER TO` on targets whose owner column is not modeled (`INDEX`, `COLLATION`, `CONVERSION`, `TEXT SEARCH`, `OPERATOR`, `STATISTICS` — an index's owner follows its table silently), `ALTER INDEX ... ATTACH PARTITION`, `ALTER TEXT SEARCH` and `ALTER OPERATOR` member mutations, `DEPENDS ON EXTENSION`, collation `REFRESH VERSION`, and `ALTER VIEW ... SET|DROP DEFAULT` (view column defaults are not loaded). `LISTEN`/`NOTIFY`/`UNLISTEN`, `CLUSTER t`, `REPACK t`, `TRUNCATE`, `LOCK`, `ANALYZE`, `REFRESH MATERIALIZED VIEW` and foreign-table DML are transactional effects confined to the scratch connection and stay legal (3.2 rule 4). Casts and transforms anchored only to foreign objects have no anchor either and stay invisible; `DO`-block bodies are scanned only for `set_config` and session advisory locks (3.2 rule 2), so dynamic DDL issued from them is not scanned.
+A second rejected group is everything whose catalog effect the snapshot cannot represent (3.2 rule 4, fail closed): `COMMENT`/`SECURITY LABEL ... ON SCHEMA` (the reconcile unit's annotations — its acl and owner are modeled), `TABLESPACE` clauses including `REINDEX ... TABLESPACE`, typed tables (`CREATE|ALTER TABLE ... OF`, `NOT OF`), `CREATE TABLE ... USING` access methods, `CLUSTER ... USING` and `ALTER ... CLUSTER ON`/`SET WITHOUT CLUSTER` (index membership), `SET STATISTICS`, sequence and identity `RESTART`, `ALTER ... OWNER TO` on targets whose owner column is not modeled (`INDEX`, `COLLATION`, `CONVERSION`, `TEXT SEARCH`, `OPERATOR`, `STATISTICS` — an index's owner follows its table silently), `ALTER INDEX ... ATTACH PARTITION`, `ALTER TEXT SEARCH` and `ALTER OPERATOR` member mutations, `DEPENDS ON EXTENSION`, collation `REFRESH VERSION`, and `ALTER VIEW ... SET|DROP DEFAULT` (view column defaults are not loaded). `LISTEN`/`NOTIFY`/`UNLISTEN`, `CLUSTER t`, `REPACK t`, `TRUNCATE`, `LOCK`, `ANALYZE`, `REFRESH MATERIALIZED VIEW` and foreign-table DML are transactional effects confined to the scratch connection and stay legal (3.2 rule 4). Casts and transforms anchored only to foreign objects have no anchor either and stay invisible; `DO`-block bodies are scanned only for `set_config` and session advisory locks (3.2 rule 2), so dynamic DDL issued from them is not scanned.
 
 ### Test corpus
 

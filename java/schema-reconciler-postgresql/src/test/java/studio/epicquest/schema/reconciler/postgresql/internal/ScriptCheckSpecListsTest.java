@@ -100,13 +100,19 @@ class ScriptCheckSpecListsTest {
                 // bare CLUSTER re-clusters everything — cannot run in a
                 // transaction block; CLUSTER t is confined and stays legal
                 "CLUSTER", "CLUSTER VERBOSE", "CLUSTER (VERBOSE)",
-                // catalog state outside the snapshot (6a): grants/comments
-                // on the namespace object itself
-                "GRANT USAGE ON SCHEMA scr TO PUBLIC",
-                "GRANT USAGE ON SCHEMA scr, scr TO PUBLIC",
-                "REVOKE USAGE ON SCHEMA scr FROM r",
+                // catalog state outside the snapshot (6a): comments and
+                // labels on the namespace object itself — its acl and
+                // owner are modeled, its annotations are not
                 "COMMENT ON SCHEMA scr IS 'x'",
                 "SECURITY LABEL FOR p ON SCHEMA scr IS 'x'",
+                // the ALTER SCHEMA carve-out is exactly OWNER TO — every
+                // other form and every foreign schema name still mutates
+                // the namespace object itself
+                "ALTER SCHEMA scr RENAME TO s2",
+                "ALTER SCHEMA other OWNER TO r",
+                "ALTER SCHEMA scr OWNER",
+                "ALTER SCHEMA scr OWNER TO r EXTRA",
+                "REVOKE USAGE ON SCHEMA scr, other FROM r",
                 // clustering-index membership
                 "CLUSTER t USING i", "CLUSTER VERBOSE t USING i",
                 "CLUSTER other.t USING i",
@@ -401,6 +407,16 @@ class ScriptCheckSpecListsTest {
                 "ALTER PUBLICATION p ADD SEQUENCE s",
                 "ALTER PUBLICATION p DROP SEQUENCE scr.s",
                 "ALTER PUBLICATION p ADD SEQUENCES IN SCHEMA scr",
+                // the namespace's own acl and owner (A.5): schema-level
+                // grants on the scratch schema and the OWNER TO carve-out
+                "GRANT USAGE ON SCHEMA scr TO PUBLIC",
+                "GRANT USAGE ON SCHEMA scr, scr TO r",
+                "GRANT USAGE, CREATE ON SCHEMA scr TO r WITH GRANT OPTION",
+                "REVOKE USAGE ON SCHEMA scr FROM r",
+                "REVOKE GRANT OPTION FOR CREATE ON SCHEMA scr FROM r",
+                "ALTER SCHEMA scr OWNER TO r",
+                "ALTER SCHEMA scr OWNER TO \"some role\"",
+                "ALTER SCHEMA scr OWNER TO CURRENT_USER",
                 "ALTER DEFAULT PRIVILEGES IN SCHEMA scr GRANT SELECT ON TABLES TO r",
                 "ALTER DEFAULT PRIVILEGES FOR ROLE r IN SCHEMA scr GRANT EXECUTE ON FUNCTIONS TO r",
                 "ALTER DEFAULT PRIVILEGES FOR USER r IN SCHEMA scr GRANT USAGE ON SEQUENCES TO r",

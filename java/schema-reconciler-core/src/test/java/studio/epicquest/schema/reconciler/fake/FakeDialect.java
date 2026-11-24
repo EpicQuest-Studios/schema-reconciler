@@ -13,8 +13,10 @@ import java.util.Set;
 import java.util.concurrent.atomic.AtomicInteger;
 import studio.epicquest.schema.reconciler.LockTimeoutException;
 import studio.epicquest.schema.reconciler.model.ChangeAction;
+import studio.epicquest.schema.reconciler.model.ChangeHazard;
 import studio.epicquest.schema.reconciler.model.ChangeSafety;
 import studio.epicquest.schema.reconciler.model.Difference;
+import studio.epicquest.schema.reconciler.model.LockLevel;
 import studio.epicquest.schema.reconciler.model.ObjectId;
 import studio.epicquest.schema.reconciler.model.ObjectIds;
 import studio.epicquest.schema.reconciler.model.ObjectKind;
@@ -23,6 +25,7 @@ import studio.epicquest.schema.reconciler.model.SchemaObject;
 import studio.epicquest.schema.reconciler.model.SchemaSnapshot;
 import studio.epicquest.schema.reconciler.spi.Dialect;
 import studio.epicquest.schema.reconciler.spi.DialectCapabilities;
+import studio.epicquest.schema.reconciler.spi.RenderOptions;
 
 /**
  * A {@link Dialect} over {@link FakeDb}, used to exercise the whole engine in
@@ -117,25 +120,36 @@ public final class FakeDialect implements Dialect {
     @Override
     public List<PlannedChange> render(Difference difference, SchemaSnapshot desired,
                                     String targetNamespace) {
+        return render(difference, desired, targetNamespace, RenderOptions.DEFAULT);
+    }
+
+    @Override
+    public List<PlannedChange> render(Difference difference, SchemaSnapshot snapshot,
+                                    String targetNamespace, RenderOptions options) {
         final var id = difference.id();
         return switch (difference.type()) {
             case MISSING -> {
-                final var want = desired.objects().get(id);
+                final var want = snapshot.objects().get(id);
                 final var statements = new ArrayList<String>();
                 statements.add(FakeDb.createStatement(want));
-                final var children = new ArrayList<ObjectId>(coveredChildren(difference, desired));
+                final var children = new ArrayList<ObjectId>(coveredChildren(difference, snapshot));
                 children.sort(ObjectIds.ORDER);
                 for (final var child : children) {
-                    statements.add(FakeDb.createStatement(desired.objects().get(child)));
+                    statements.add(FakeDb.createStatement(snapshot.objects().get(child)));
                 }
                 yield List.of(new PlannedChange(0, id, ChangeAction.CREATE,
                         ChangeSafety.ADDITIVE, statements, Optional.of(want.definition()),
-                        "missing " + id));
+                        "missing " + id,
+                        options.concurrentIndexes() && id.kind() == ObjectKind.INDEX,
+                        options.concurrentIndexes() && id.kind() == ObjectKind.INDEX
+                                ? new ChangeHazard(LockLevel.SHARE_UPDATE_EXCLUSIVE,
+                                        false, false)
+                                : ChangeHazard.NONE));
             }
             case DRIFTED -> switch (id.kind()) {
-                case TABLE -> recreate(desired, id, ChangeSafety.DESTRUCTIVE, "drifted table");
+                case TABLE -> recreate(snapshot, id, ChangeSafety.DESTRUCTIVE, "drifted table");
                 case SEQUENCE -> {
-                    final var want = desired.objects().get(id);
+                    final var want = snapshot.objects().get(id);
                     yield List.of(new PlannedChange(0, id, ChangeAction.ALTER,
                             ChangeSafety.DESTRUCTIVE, List.of(FakeDb.alterStatement(want)),
                             Optional.of(want.definition()), "drifted sequence"));
@@ -143,10 +157,32 @@ public final class FakeDialect implements Dialect {
                 case COLUMN -> List.of(new PlannedChange(0, id, ChangeAction.ALTER,
                         ChangeSafety.DESTRUCTIVE, List.of(), Optional.empty(),
                         "drifted column requires manual change"));
-                default -> recreate(desired, id, ChangeSafety.REBUILD, "drifted " + id.kind());
+                default -> recreate(snapshot, id, ChangeSafety.REBUILD, "drifted " + id.kind());
             };
+            // pruning passes the ACTUAL snapshot (spec 5.5): the
+            // unexpected object drops; data-bearing kinds are DESTRUCTIVE
+            case UNEXPECTED -> List.of(new PlannedChange(0, id, ChangeAction.DROP,
+                    id.kind() == ObjectKind.TABLE || id.kind() == ObjectKind.COLUMN
+                            ? ChangeSafety.DESTRUCTIVE : ChangeSafety.REBUILD,
+                    List.of(FakeDb.dropStatement(id)), Optional.empty(),
+                    "unexpected " + id));
             default -> List.of();
         };
+    }
+
+    @Override
+    public List<PlannedChange> renderRename(ObjectId from, ObjectId to,
+                                            SchemaSnapshot actual, SchemaSnapshot desired,
+                                            String targetNamespace) {
+        final var have = actual.objects().get(from);
+        if (have == null) {
+            throw new IllegalArgumentException("rename source missing: " + from);
+        }
+        return List.of(new PlannedChange(0, to, ChangeAction.ALTER,
+                ChangeSafety.REBUILD,
+                List.of("RENAME " + from.kind() + " " + FakeDb.qualified(from)
+                        + " TO " + to.name()),
+                Optional.of(have.definition()), "renamed " + from + " to " + to));
     }
 
     private List<PlannedChange> recreate(SchemaSnapshot desired, ObjectId id, ChangeSafety safety,

@@ -1,5 +1,7 @@
 package studio.epicquest.schema.reconciler.internal;
 
+import java.util.ArrayList;
+import studio.epicquest.schema.reconciler.model.LockLevel;
 import studio.epicquest.schema.reconciler.model.ReconcilePlan;
 
 /**
@@ -27,6 +29,24 @@ public final class PlanRenderer {
                     .append(" (").append(change.safety()).append(')');
             if (change.isManual()) {
                 out.append(" MANUAL");
+            }
+            final var hazard = change.hazard();
+            if (change.nonTransactional() || !hazard.isTrivial()) {
+                final var parts = new ArrayList<String>();
+                if (hazard.lockLevel() != LockLevel.NONE) {
+                    parts.add("lock " + hazard.lockLevel());
+                }
+                if (hazard.rewritesTable()) {
+                    parts.add("rewrites table");
+                }
+                if (hazard.validatesRows()) {
+                    parts.add("validates rows");
+                }
+                if (change.nonTransactional()) {
+                    parts.add("non-transactional");
+                }
+                parts.addAll(hazard.notes());
+                out.append("; hazard: ").append(String.join("; ", parts));
             }
             out.append('\n');
             out.append("-- ").append(change.reason()).append('\n');

@@ -25,6 +25,7 @@ export interface ExecutedStatement {
  *   CREATE &lt;KIND&gt; &lt;parent.&gt;?&lt;name&gt; [REQUIRES &lt;KIND&gt;:&lt;name&gt;,...] [COMPARED] [DEF &lt;canonical&gt;]
  *   DROP   &lt;KIND&gt; &lt;parent.&gt;?&lt;name&gt;
  *   ALTER  &lt;KIND&gt; &lt;parent.&gt;?&lt;name&gt; DEF &lt;canonical&gt;
+ *   RENAME &lt;KIND&gt; &lt;parent.&gt;?&lt;name&gt; TO &lt;newname&gt;
  * </pre>
  *
  * {@code COMPARED} sets the content-compared attribute (spec 5.4). A {@code CREATE} stores a {@link SchemaObject} whose canonical definition is
@@ -171,6 +172,21 @@ export class FakeDb {
                 objects.set(id, new SchemaObject(id, new Definition(parsed.def),
                         parsed.requires.isEmpty ? existing.dependsOn : parsed.requires,
                         existing.attributes));
+                break;
+            }
+            case "RENAME": {
+                if (tokens.length !== 5 || tokens[3] !== "TO") {
+                    throw new Error("syntax error: " + sql);
+                }
+                const id = FakeDb.parseObjectId(tokens[1]!, tokens[2]!);
+                const existing = objects.get(id);
+                if (existing === undefined) {
+                    throw new Error("object does not exist: " + id);
+                }
+                objects.delete(id);
+                const newId = new ObjectId(id.kind, tokens[4]!, id.parent);
+                objects.set(newId, new SchemaObject(newId, existing.definition,
+                        existing.dependsOn, existing.attributes));
                 break;
             }
             default:

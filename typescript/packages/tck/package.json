@@ -1,6 +1,6 @@
 {
     "name": "@epicquest-studios/schema-reconciler-tck",
-    "version": "0.9.0",
+    "version": "0.10.0",
     "description": "Dialect conformance suite (C-01\u2026C-67) that every schema-reconciler dialect must pass \u2014 TypeScript binding.",
     "license": "Apache-2.0",
     "type": "module",
@@ -20,7 +20,7 @@
         "node": ">=22.18"
     },
     "dependencies": {
-        "@epicquest-studios/schema-reconciler-core": "0.9.0"
+        "@epicquest-studios/schema-reconciler-core": "0.10.0"
     },
     "scripts": {
         "build": "tsc -p tsconfig.build.json",

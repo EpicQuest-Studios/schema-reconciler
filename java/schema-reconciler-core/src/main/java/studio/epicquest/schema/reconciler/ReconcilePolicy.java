@@ -18,13 +18,17 @@ import studio.epicquest.schema.reconciler.model.ObjectKind;
  * {@code "comment"}, {@code "policy"}; a name without a prefix is
  * {@code "relation"}), for other kinds it is the lowercased
  * {@link ObjectKind} name.
+ *
+ * @param prune opt-in deletion of objects absent from the desired state
+ *        (spec 5.5)
  */
 public record ReconcilePolicy(
         Decision additive,
         Decision rebuild,
         Decision destructive,
         Decision unsupported,
-        Map<String, Decision> unsupportedCategories) {
+        Map<String, Decision> unsupportedCategories,
+        boolean prune) {
 
     public ReconcilePolicy {
         Objects.requireNonNull(additive, "additive");
@@ -43,7 +47,14 @@ public record ReconcilePolicy(
 
     public ReconcilePolicy(Decision additive, Decision rebuild, Decision destructive,
                            Decision unsupported) {
-        this(additive, rebuild, destructive, unsupported, Map.of());
+        this(additive, rebuild, destructive, unsupported, Map.of(), false);
+    }
+
+    public ReconcilePolicy(Decision additive, Decision rebuild, Decision destructive,
+                           Decision unsupported,
+                           Map<String, Decision> unsupportedCategories) {
+        this(additive, rebuild, destructive, unsupported, unsupportedCategories,
+                false);
     }
 
     public static ReconcilePolicy defaults() {
@@ -56,22 +67,22 @@ public record ReconcilePolicy(
 
     public ReconcilePolicy withAdditive(Decision decision) {
         return new ReconcilePolicy(decision, rebuild, destructive, unsupported,
-                unsupportedCategories);
+                unsupportedCategories, prune);
     }
 
     public ReconcilePolicy withRebuild(Decision decision) {
         return new ReconcilePolicy(additive, decision, destructive, unsupported,
-                unsupportedCategories);
+                unsupportedCategories, prune);
     }
 
     public ReconcilePolicy withDestructive(Decision decision) {
         return new ReconcilePolicy(additive, rebuild, decision, unsupported,
-                unsupportedCategories);
+                unsupportedCategories, prune);
     }
 
     public ReconcilePolicy withUnsupported(Decision decision) {
         return new ReconcilePolicy(additive, rebuild, destructive, decision,
-                unsupportedCategories);
+                unsupportedCategories, prune);
     }
 
     /** Overrides the {@code unsupported} decision for one difference category. */
@@ -81,7 +92,13 @@ public record ReconcilePolicy(
         final var categories = new HashMap<>(unsupportedCategories);
         categories.put(category, decision);
         return new ReconcilePolicy(additive, rebuild, destructive, unsupported,
-                Map.copyOf(categories));
+                Map.copyOf(categories), prune);
+    }
+
+    /** Opt-in deletion of {@code UNEXPECTED} objects (spec 5.5). */
+    public ReconcilePolicy withPrune(boolean prune) {
+        return new ReconcilePolicy(additive, rebuild, destructive, unsupported,
+                unsupportedCategories, prune);
     }
 
     /** The decision governing a change of the given safety class. */

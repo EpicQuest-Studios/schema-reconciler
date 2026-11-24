@@ -1,6 +1,6 @@
 {
     "name": "@epicquest-studios/schema-reconciler-core",
-    "version": "0.9.0",
+    "version": "0.10.0",
     "description": "Vendor-neutral, declarative, data-safe schema reconciliation \u2014 API, SPI and engine (TypeScript binding of SPEC.md).",
     "license": "Apache-2.0",
     "type": "module",

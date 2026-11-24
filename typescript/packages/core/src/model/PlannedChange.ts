@@ -1,6 +1,7 @@
 import { IllegalArgumentError } from "../IllegalArgumentError.ts";
 import { ChangeAction } from "./ChangeAction.ts";
 import type { ChangeSafety } from "./ChangeSafety.ts";
+import { ChangeHazard } from "./ChangeHazard.ts";
 import type { Definition } from "./Definition.ts";
 import type { ObjectId } from "./ObjectId.ts";
 
@@ -11,6 +12,9 @@ import type { ObjectId } from "./ObjectId.ts";
  *        {@code Dialect.render}, before the core assigns the final order
  * @param expected definition the target must have after apply; undefined for
  *        {@code DROP} changes and changes against unexpected objects
+ * @param nonTransactional the change cannot run inside a transaction —
+ *        the engine applies it after the transactional phase commits
+ * @param hazard lock/rewrite/validation metadata of the statements
  */
 export class PlannedChange {
     readonly order: number;
@@ -20,10 +24,13 @@ export class PlannedChange {
     readonly statements: readonly string[];
     readonly expected: Definition | undefined;
     readonly reason: string;
+    readonly nonTransactional: boolean;
+    readonly hazard: ChangeHazard;
 
     constructor(order: number, target: ObjectId, action: ChangeAction,
                 safety: ChangeSafety, statements: readonly string[],
-                expected: Definition | undefined, reason: string) {
+                expected: Definition | undefined, reason: string,
+                nonTransactional = false, hazard: ChangeHazard = ChangeHazard.NONE) {
         if (order < 0) {
             throw new IllegalArgumentError("order must not be negative");
         }
@@ -42,6 +49,9 @@ export class PlannedChange {
         if (reason == null) {
             throw new TypeError("reason is required");
         }
+        if (hazard == null) {
+            throw new TypeError("hazard is required");
+        }
         if (action === ChangeAction.DROP && expected !== undefined) {
             throw new IllegalArgumentError("a DROP change has no expected definition");
         }
@@ -52,6 +62,8 @@ export class PlannedChange {
         this.statements = Object.freeze([...statements]);
         this.expected = expected;
         this.reason = reason;
+        this.nonTransactional = nonTransactional;
+        this.hazard = hazard;
         Object.freeze(this);
     }
 

@@ -1,13 +1,16 @@
 import { DesiredStateException } from "../DesiredStateException.ts";
+import type { RenameHint } from "../model/RenameHint.ts";
 import type { Dialect } from "../spi/Dialect.ts";
+import * as RenameHints from "./RenameHints.ts";
 
 const TOKEN = "${namespace}";
 const ESCAPED = "$" + TOKEN;
 
 /**
  * Prepares the desired script for execution in the scratch namespace (spec 3.2):
- * the literal-target scan (rule 5), the quoted-placeholder rejection, and the
- * {@code ${namespace}} substitution with {@code $${namespace}} escaping.
+ * the literal-target scan (rule 5), the quoted-placeholder rejection, the
+ * {@code ${namespace}} substitution with {@code $${namespace}} escaping,
+ * and the `-- @reconciler rename` directive harvest.
  */
 export class ScriptProcessor {
     static readonly TOKEN = TOKEN;
@@ -17,6 +20,9 @@ export class ScriptProcessor {
 
     /** Whether the script contained at least one {@code ${namespace}} placeholder. */
     readonly hasPlaceholder: boolean;
+
+    /** The `-- @reconciler rename` directives found in the script (spec 5.5.1). */
+    readonly renameHints: readonly RenameHint[];
 
     /**
      * @param script the raw script
@@ -50,6 +56,7 @@ export class ScriptProcessor {
         }
         this.substituted = out.join("").replaceAll("\u0000", TOKEN);
         this.hasPlaceholder = found;
+        this.renameHints = RenameHints.parse(script);
     }
 }
 

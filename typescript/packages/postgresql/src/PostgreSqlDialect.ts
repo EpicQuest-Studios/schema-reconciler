@@ -1,7 +1,7 @@
 import { ConfigurationException } from "@epicquest-studios/schema-reconciler-core";
 import { DesiredStateException } from "@epicquest-studios/schema-reconciler-core";
 import { LockTimeoutException } from "@epicquest-studios/schema-reconciler-core";
-import type { Difference, ObjectId, PlannedChange } from "@epicquest-studios/schema-reconciler-core";
+import type { Difference, ObjectId, PlannedChange, RenderOptions } from "@epicquest-studios/schema-reconciler-core";
 import { ObjectKind } from "@epicquest-studios/schema-reconciler-core";
 import type { SchemaObject, SchemaSnapshot } from "@epicquest-studios/schema-reconciler-core";
 import type { DatabaseMetadata, Dialect } from "@epicquest-studios/schema-reconciler-core";
@@ -203,9 +203,14 @@ export class PostgreSqlDialect implements Dialect {
 
     // ---- A.6 rendering ---------------------------------------------------------
 
-    render(difference: Difference, desired: SchemaSnapshot,
-            targetNamespace: string): PlannedChange[] {
-        return PgRender.render(difference, desired, targetNamespace);
+    render(difference: Difference, snapshot: SchemaSnapshot,
+            targetNamespace: string, options?: RenderOptions): PlannedChange[] {
+        return PgRender.render(difference, snapshot, targetNamespace, options);
+    }
+
+    renderRename(from: ObjectId, to: ObjectId, actual: SchemaSnapshot,
+            desired: SchemaSnapshot, targetNamespace: string): PlannedChange[] {
+        return PgRender.renderRename(from, to, actual, desired, targetNamespace);
     }
 
     quoteIdentifier(identifier: string): string {

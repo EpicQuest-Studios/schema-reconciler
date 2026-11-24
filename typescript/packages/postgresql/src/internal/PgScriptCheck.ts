@@ -19,6 +19,12 @@ import * as PgIdentifiers from "./PgIdentifiers.ts";
  * been replaced by the scratch name — so a legitimate
  * `CREATE SCHEMA ${namespace}`-as-text is still rejected: the core
  * owns namespace creation.
+ *
+ * SCOPE FROZEN: this is a best-effort lexical guard, not a security
+ * sandbox (SPEC §8 rule 5, docs/adr/0001-pg-script-check.md). Its keyword
+ * and form coverage is fixed — do not add new lexer edge cases here;
+ * untrusted scripts must use `scratchDataSource` with a least-privilege
+ * role instead of relying on this scan.
  */
 
 const TRANSACTION_CONTROL = new Set([
@@ -360,6 +366,13 @@ function checkDdl(statement: PgSql.StatementTokens, first: string,
     }
     const object = objectWord(t);
     if (object === "SCHEMA") {
+        if (first === "ALTER") {
+            // ALTER SCHEMA <scratch> OWNER TO <role> mutates nspowner —
+            // the one ALTER SCHEMA form the snapshot models (the
+            // namespace's OWNERSHIP object, A.5)
+            checkSchemaAlter(statement, scratchNamespace);
+            return;
+        }
         throw rejected(statement,
                 first + " SCHEMA is not allowed; the core owns namespace creation");
     }
@@ -1236,9 +1249,11 @@ function checkGrantTarget(statement: PgSql.StatementTokens,
         return;
     }
     if (w === "SCHEMA") {
-        throw rejected(statement,
-                "ON SCHEMA grants mutate the namespace object itself,"
-                        + " which the snapshot does not model");
+        // GRANT/REVOKE ... ON SCHEMA <scratch> mutates the namespace's
+        // own acl — modeled as the PRIVILEGES object named <namespace>
+        // (A.5); every listed schema must be the scratch namespace
+        checkSchemaList(statement, i + 1, scratchNamespace);
+        return;
     }
     if (foreignTable || GRANT_KINDS.has(w)) {
         i += foreignTable ? 2 : 1;
@@ -1269,6 +1284,32 @@ function checkSchemaList(statement: PgSql.StatementTokens, index: number,
             checkSchemaName(statement, j + 1, scratchNamespace);
         }
     }
+}
+
+/**
+ * The `ALTER SCHEMA` carve-out: only `ALTER SCHEMA <scratch> OWNER TO
+ * <role>` is snapshot state — the namespace's OWNERSHIP object (A.5).
+ * `RENAME` and every other form mutates the namespace object itself,
+ * which the core owns; a foreign schema name or a malformed tail
+ * rejects. Returns silently on the name check when {@code
+ * scratchNamespace} is undefined — the form check alone decides
+ * admissibility.
+ */
+function checkSchemaAlter(statement: PgSql.StatementTokens,
+                          scratchNamespace: string | undefined): void {
+    const t = statement.tokens;
+    const name = nameIndex(t);
+    if (t.length !== name + 4 || t[name + 1] !== "OWNER"
+            || t[name + 2] !== "TO") {
+        throw rejected(statement,
+                "ALTER SCHEMA mutates the namespace object itself; only"
+                        + " ALTER SCHEMA ${namespace} OWNER TO <role>"
+                        + " is modeled");
+    }
+    if (scratchNamespace === undefined) {
+        return;
+    }
+    checkSchemaName(statement, name, scratchNamespace);
 }
 
 /**

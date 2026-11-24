@@ -6,6 +6,7 @@ import java.sql.SQLException;
 import java.time.Duration;
 import java.util.List;
 import java.util.Set;
+import studio.epicquest.schema.reconciler.PlanningException;
 import studio.epicquest.schema.reconciler.model.Difference;
 import studio.epicquest.schema.reconciler.model.ObjectId;
 import studio.epicquest.schema.reconciler.model.PlannedChange;
@@ -108,8 +109,37 @@ public interface Dialect {
      * Renders the statements and safety class for one difference, bound to the
      * target namespace. Changes are returned with {@code order} set to {@code 0};
      * the core assigns the final order.
+     *
+     * For an {@code UNEXPECTED} difference under a pruning policy, the core
+     * passes the <em>actual</em> snapshot as {@code snapshot} so the dialect
+     * can read the unexpected object's drop fragments; for {@code MISSING}
+     * and {@code DRIFTED} it is the desired snapshot.
      */
     List<PlannedChange> render(Difference difference, SchemaSnapshot desired, String targetNamespace);
+
+    /**
+     * {@link #render(Difference, SchemaSnapshot, String)} with render-time
+     * options — concurrent index forms, renamed parents (spec 5.6, 5.5.1).
+     * The default discards the options; a dialect that honours any of them
+     * overrides this overload instead.
+     */
+    default List<PlannedChange> render(Difference difference, SchemaSnapshot snapshot,
+                                       String targetNamespace, RenderOptions options) {
+        return render(difference, snapshot, targetNamespace);
+    }
+
+    /**
+     * Renders an explicit rename (spec 5.5.1): {@code from} exists in
+     * {@code actual}, {@code to} is its desired identity. The default
+     * implementation throws {@code PlanningException} — dialects without a
+     * rename statement need not implement it.
+     */
+    default List<PlannedChange> renderRename(ObjectId from, ObjectId to,
+                                             SchemaSnapshot actual, SchemaSnapshot desired,
+                                             String targetNamespace) {
+        throw new PlanningException("namespace '" + targetNamespace
+                + "': dialect '" + id() + "' does not support renames");
+    }
 
     /**
      * Create-fragment statements for one snapshot object, written with the

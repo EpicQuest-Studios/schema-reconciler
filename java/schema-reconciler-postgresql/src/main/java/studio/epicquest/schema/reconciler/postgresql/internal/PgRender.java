@@ -13,15 +13,18 @@ import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 import studio.epicquest.schema.reconciler.PlanningException;
 import studio.epicquest.schema.reconciler.model.ChangeAction;
+import studio.epicquest.schema.reconciler.model.ChangeHazard;
 import studio.epicquest.schema.reconciler.model.ChangeSafety;
 import studio.epicquest.schema.reconciler.model.Definition;
 import studio.epicquest.schema.reconciler.model.Difference;
+import studio.epicquest.schema.reconciler.model.LockLevel;
 import studio.epicquest.schema.reconciler.model.ObjectId;
 import studio.epicquest.schema.reconciler.model.ObjectIds;
 import studio.epicquest.schema.reconciler.model.ObjectKind;
 import studio.epicquest.schema.reconciler.model.PlannedChange;
 import studio.epicquest.schema.reconciler.model.SchemaObject;
 import studio.epicquest.schema.reconciler.model.SchemaSnapshot;
+import studio.epicquest.schema.reconciler.spi.RenderOptions;
 
 /**
  * The rendering rules of spec A.6. Pre-computed statement fragments live in
@@ -32,16 +35,44 @@ public final class PgRender {
 
     private static final String TOKEN = "${namespace}";
 
+    /** Full-table lock of a DROP/recreate or a destructive ALTER. */
+    private static final ChangeHazard LOCK_EXCLUSIVE =
+            new ChangeHazard(LockLevel.ACCESS_EXCLUSIVE, false, false);
+    /** {@code SHARE ROW EXCLUSIVE} — constraint/index adds that still allow writes. */
+    private static final ChangeHazard LOCK_ROW_EXCLUSIVE =
+            new ChangeHazard(LockLevel.SHARE_ROW_EXCLUSIVE, false, false);
+    /** A CHECK/FOREIGN KEY add scans existing rows to validate them. */
+    private static final ChangeHazard VALIDATES =
+            new ChangeHazard(LockLevel.SHARE_ROW_EXCLUSIVE, false, true);
+    /** {@code CREATE INDEX} (plain) — SHARE on the table: reads pass, writes block. */
+    private static final ChangeHazard INDEX_BUILD =
+            new ChangeHazard(LockLevel.SHARE, false, false);
+    /** {@code CREATE/DROP INDEX CONCURRENTLY} — SHARE UPDATE EXCLUSIVE, off-transaction. */
+    private static final ChangeHazard INDEX_CONCURRENT =
+            new ChangeHazard(LockLevel.SHARE_UPDATE_EXCLUSIVE, false, false);
+    /** An {@code ALTER COLUMN TYPE} whose cast is not binary-compatible rewrites the table. */
+    private static final ChangeHazard REWRITES =
+            new ChangeHazard(LockLevel.ACCESS_EXCLUSIVE, true, false);
+
     private PgRender() {
     }
 
     public static List<PlannedChange> render(Difference difference, SchemaSnapshot desired,
                                              String targetNamespace) {
+        return render(difference, desired, targetNamespace, RenderOptions.DEFAULT);
+    }
+
+    public static List<PlannedChange> render(Difference difference, SchemaSnapshot snapshot,
+                                             String targetNamespace, RenderOptions options) {
         final var id = difference.id();
-        final var want = desired.objects().get(id);
+        final var want = snapshot.objects().get(id);
         return switch (difference.type()) {
-            case MISSING -> missing(id, want, desired, targetNamespace);
-            case DRIFTED -> drifted(id, want, difference, desired, targetNamespace);
+            case MISSING -> missing(id, want, snapshot, targetNamespace, options);
+            case DRIFTED -> drifted(id, want, difference, snapshot, targetNamespace, options);
+            // under a pruning policy the second parameter is the ACTUAL
+            // snapshot (spec 5.5): the unexpected object's drop fragments
+            // live there — nothing desired exists to read
+            case UNEXPECTED -> unexpected(id, want, snapshot, targetNamespace, options);
             default -> throw new PlanningException("difference " + difference.id()
                     + " of type " + difference.type() + " is not renderable");
         };
@@ -50,7 +81,8 @@ public final class PgRender {
     // ---- MISSING ---------------------------------------------------------
 
     private static List<PlannedChange> missing(ObjectId id, SchemaObject want,
-                                               SchemaSnapshot desired, String ns) {
+                                               SchemaSnapshot desired, String ns,
+                                               RenderOptions options) {
         return switch (id.kind()) {
             case TABLE -> List.of(new PlannedChange(0, id, ChangeAction.CREATE,
                     ChangeSafety.ADDITIVE, createTableStatements(id, desired, ns),
@@ -59,11 +91,19 @@ public final class PgRender {
                     ChangeSafety.ADDITIVE, createForeignTableStatements(id, desired, ns),
                     Optional.of(want.definition()), "missing " + id));
             case COLUMN -> missingColumn(id, want, desired, ns);
-            case PRIMARY_KEY, UNIQUE, FOREIGN_KEY, CHECK, EXCLUSION, INDEX, VIEW,
-                    TRIGGER, TYPE, DOMAIN, POLICY, EXTENSION, STATISTICS, RULE,
+            case INDEX -> List.of(indexCreate(id, want, desired, ns, "missing " + id,
+                    options));
+            case PRIMARY_KEY, UNIQUE, FOREIGN_KEY, CHECK, EXCLUSION ->
+                    List.of(additive(id, want, ns, "missing " + id, false,
+                            id.kind() == ObjectKind.FOREIGN_KEY
+                                    || id.kind() == ObjectKind.CHECK
+                                    ? VALIDATES : LOCK_ROW_EXCLUSIVE));
+            case VIEW, TRIGGER, TYPE, DOMAIN, POLICY, EXTENSION, STATISTICS, RULE,
                     COLLATION, CONVERSION, PARTITION, PUBLICATION, CAST,
                     TRANSFORM ->
-                    List.of(additive(id, want, ns, "missing " + id));
+                    List.of(additive(id, want, ns, "missing " + id, false,
+                            id.kind() == ObjectKind.PARTITION
+                                    ? LOCK_EXCLUSIVE : ChangeHazard.NONE));
             case MATERIALIZED_VIEW -> List.of(new PlannedChange(0, id, ChangeAction.CREATE,
                     ChangeSafety.ADDITIVE, matviewCreateStatements(want, ns),
                     Optional.of(want.definition()), "missing " + id));
@@ -229,14 +269,16 @@ public final class PgRender {
         if (!notnull) {
             return List.of(new PlannedChange(0, id, ChangeAction.CREATE,
                     ChangeSafety.ADDITIVE, List.of(bind(alter, ns)),
-                    Optional.of(want.definition()), "missing nullable column " + id.name()));
+                    Optional.of(want.definition()), "missing nullable column " + id.name(),
+                    false, LOCK_EXCLUSIVE));
         }
         final var defexpr = want.attributes().get(PgCatalog.DEFAULT);
         if (defexpr != null && PgIdentifiers.isConstantDefault(defexpr)) {
             return List.of(new PlannedChange(0, id, ChangeAction.CREATE,
                     ChangeSafety.ADDITIVE, List.of(bind(alter, ns)),
                     Optional.of(want.definition()),
-                    "missing NOT NULL column " + id.name() + " with a constant default"));
+                    "missing NOT NULL column " + id.name() + " with a constant default",
+                    false, LOCK_EXCLUSIVE));
         }
         return List.of(new PlannedChange(0, id, ChangeAction.ALTER,
                 ChangeSafety.DESTRUCTIVE, List.of(), Optional.empty(),
@@ -259,9 +301,11 @@ public final class PgRender {
         final var reason = "drifted " + id + " (stored rows are dropped)";
         return List.of(
                 new PlannedChange(0, id, ChangeAction.DROP, ChangeSafety.DESTRUCTIVE,
-                        List.of(bind(want, PgCatalog.DROP_SQL, ns)), Optional.empty(), reason),
+                        List.of(bind(want, PgCatalog.DROP_SQL, ns)), Optional.empty(), reason,
+                        false, LOCK_EXCLUSIVE),
                 new PlannedChange(0, id, ChangeAction.CREATE, ChangeSafety.DESTRUCTIVE,
-                        statements, Optional.of(want.definition()), reason));
+                        statements, Optional.of(want.definition()), reason,
+                        false, LOCK_EXCLUSIVE));
     }
 
     /**
@@ -332,7 +376,8 @@ public final class PgRender {
         }
         return List.of(new PlannedChange(0, id, ChangeAction.ALTER, ChangeSafety.REBUILD,
                 statements.stream().map(s -> bind(s, ns)).toList(),
-                Optional.of(want.definition()), "drifted " + id + " (row-level security flag)"));
+                Optional.of(want.definition()), "drifted " + id + " (row-level security flag)",
+                false, LOCK_EXCLUSIVE));
     }
 
     private static List<PlannedChange> manual(ObjectId id, String reason) {
@@ -410,14 +455,16 @@ public final class PgRender {
                             .collect(Collectors.joining(";")));
             changes.add(new PlannedChange(0, id, ChangeAction.ALTER, ChangeSafety.REBUILD,
                     safe.stream().map(s -> bind(s, ns)).toList(),
-                    Optional.of(expected), "drifted " + id));
+                    Optional.of(expected), "drifted " + id, false, LOCK_EXCLUSIVE));
         }
         if (!validating.isEmpty()) {
             changes.add(new PlannedChange(0, id, ChangeAction.ALTER,
                     ChangeSafety.DESTRUCTIVE,
                     validating.stream().map(s -> bind(s, ns)).toList(),
                     Optional.of(want.definition()),
-                    "drifted " + id + " (validates existing values)"));
+                    "drifted " + id + " (validates existing values)",
+                    false, new ChangeHazard(LockLevel.ACCESS_EXCLUSIVE,
+                            false, true)));
         }
         return changes;
     }
@@ -435,30 +482,36 @@ public final class PgRender {
 
     private static List<PlannedChange> drifted(ObjectId id, SchemaObject want,
                                                Difference difference, SchemaSnapshot desired,
-                                               String ns) {
+                                               String ns, RenderOptions options) {
         return switch (id.kind()) {
             case COLUMN -> driftedColumn(id, want, difference, desired, ns);
             case TABLE -> driftedTable(id, want, difference, ns);
-            case PRIMARY_KEY, UNIQUE, FOREIGN_KEY, CHECK, EXCLUSION, INDEX, VIEW,
-                    TRIGGER, POLICY, STATISTICS, RULE, COLLATION, CONVERSION,
+            case INDEX -> indexRecreate(id, want, desired, ns, "drifted " + id,
+                    options);
+            case PRIMARY_KEY, UNIQUE, FOREIGN_KEY, CHECK, EXCLUSION ->
+                    recreate(id, want, ns, "drifted " + id, false,
+                            LOCK_ROW_EXCLUSIVE);
+            case VIEW, TRIGGER, POLICY, STATISTICS, RULE, COLLATION, CONVERSION,
                     PUBLICATION, CAST, TRANSFORM ->
                     recreate(id, want, ns, "drifted " + id);
             // a bound change re-homes rows — DESTRUCTIVE, not REBUILD
             case PARTITION -> List.of(
                     new PlannedChange(0, id, ChangeAction.DROP, ChangeSafety.DESTRUCTIVE,
                             List.of(bind(want, PgCatalog.DROP_SQL, ns)),
-                            Optional.empty(), "drifted " + id),
+                            Optional.empty(), "drifted " + id, false, LOCK_EXCLUSIVE),
                     new PlannedChange(0, id, ChangeAction.CREATE, ChangeSafety.DESTRUCTIVE,
                             List.of(bind(want, PgCatalog.CREATE_SQL, ns)),
-                            Optional.of(want.definition()), "drifted " + id));
+                            Optional.of(want.definition()), "drifted " + id,
+                            false, LOCK_EXCLUSIVE));
             // no local data — a server/options change is a plain drop+create
             case FOREIGN_TABLE -> List.of(
                     new PlannedChange(0, id, ChangeAction.DROP, ChangeSafety.REBUILD,
                             List.of(bind(want, PgCatalog.DROP_SQL, ns)),
-                            Optional.empty(), "drifted " + id),
+                            Optional.empty(), "drifted " + id, false, LOCK_EXCLUSIVE),
                     new PlannedChange(0, id, ChangeAction.CREATE, ChangeSafety.REBUILD,
                             createForeignTableStatements(id, desired, ns),
-                            Optional.of(want.definition()), "drifted " + id));
+                            Optional.of(want.definition()), "drifted " + id,
+                            false, LOCK_EXCLUSIVE));
             case MATERIALIZED_VIEW -> driftedMatview(id, want, ns);
             // a composite's attribute drift and a range's pg_range drift
             // drop and recreate the type — no in-place recipe exists;
@@ -482,8 +535,8 @@ public final class PgRender {
                     ns, "drifted privileges on " + id);
             case SEQUENCE -> {
                 final var statements = new ArrayList<String>();
-                final var options = want.attributes().get(PgCatalog.OPTIONS_SQL);
-                statements.add(bind("ALTER SEQUENCE " + seqRef(id) + " " + options, ns));
+                final var seqOptions = want.attributes().get(PgCatalog.OPTIONS_SQL);
+                statements.add(bind("ALTER SEQUENCE " + seqRef(id) + " " + seqOptions, ns));
                 final var owned = want.attributes().get(PgCatalog.OWNED_SQL);
                 if (owned != null) {
                     statements.add(bind(owned, ns));
@@ -501,7 +554,7 @@ public final class PgRender {
                 }
                 yield List.of(new PlannedChange(0, id, ChangeAction.ALTER,
                         ChangeSafety.DESTRUCTIVE, statements, Optional.of(want.definition()),
-                        "drifted " + id));
+                        "drifted " + id, false, LOCK_EXCLUSIVE));
             }
             case ROUTINE -> {
                 final var haveDef = difference.actual()
@@ -720,16 +773,22 @@ public final class PgRender {
                     ? new Definition(canonicalWith(wantFields, "notnull",
                             haveFields.get("notnull")))
                     : want.definition();
+            // an ALTER COLUMN TYPE can rewrite the table even on the
+            // widening allowlist (e.g. integer -> bigint)
+            final var hazard = !Objects.equals(wantType, haveFields.get("type"))
+                    ? REWRITES : LOCK_EXCLUSIVE;
             changes.add(new PlannedChange(0, id, ChangeAction.ALTER, ChangeSafety.REBUILD,
                     safe.stream().map(s -> bind(s, ns)).toList(),
-                    Optional.of(expected), "drifted " + id));
+                    Optional.of(expected), "drifted " + id, false, hazard));
         }
         if (setNotNull) {
             changes.add(new PlannedChange(0, id, ChangeAction.ALTER,
                     ChangeSafety.DESTRUCTIVE,
                     List.of(bind(alter + "SET NOT NULL", ns)),
                     Optional.of(want.definition()),
-                    "drifted " + id + " (SET NOT NULL validates existing rows)"));
+                    "drifted " + id + " (SET NOT NULL validates existing rows)",
+                    false, new ChangeHazard(LockLevel.ACCESS_EXCLUSIVE,
+                            false, true)));
         }
         return changes;
     }
@@ -879,9 +938,17 @@ public final class PgRender {
                 : new int[] { Integer.parseInt(m.group(1)) };
     }
 
-    private static PlannedChange additive(ObjectId id, SchemaObject want, String ns, String reason) {
+    private static PlannedChange additive(ObjectId id, SchemaObject want, String ns,
+                                          String reason) {
+        return additive(id, want, ns, reason, false, ChangeHazard.NONE);
+    }
+
+    private static PlannedChange additive(ObjectId id, SchemaObject want, String ns,
+                                          String reason, boolean nonTransactional,
+                                          ChangeHazard hazard) {
         return new PlannedChange(0, id, ChangeAction.CREATE, ChangeSafety.ADDITIVE,
-                createStatements(want, ns), Optional.of(want.definition()), reason);
+                createStatements(want, ns), Optional.of(want.definition()), reason,
+                nonTransactional, hazard);
     }
 
     /** The CREATE statement plus its post-create fragment (trigger enablement, replica identity). */
@@ -898,11 +965,19 @@ public final class PgRender {
     /** A DROP change plus a CREATE change — the two halves of a recreate (4.4). */
     private static List<PlannedChange> recreate(ObjectId id, SchemaObject want, String ns,
                                                 String reason) {
+        return recreate(id, want, ns, reason, false, LOCK_EXCLUSIVE);
+    }
+
+    private static List<PlannedChange> recreate(ObjectId id, SchemaObject want, String ns,
+                                                String reason, boolean nonTransactional,
+                                                ChangeHazard hazard) {
         return List.of(
                 new PlannedChange(0, id, ChangeAction.DROP, ChangeSafety.REBUILD,
-                        List.of(bind(want, PgCatalog.DROP_SQL, ns)), Optional.empty(), reason),
+                        List.of(bind(want, PgCatalog.DROP_SQL, ns)), Optional.empty(), reason,
+                        nonTransactional, hazard),
                 new PlannedChange(0, id, ChangeAction.CREATE, ChangeSafety.REBUILD,
-                        createStatements(want, ns), Optional.of(want.definition()), reason));
+                        createStatements(want, ns), Optional.of(want.definition()), reason,
+                        nonTransactional, hazard));
     }
 
     private static String seqRef(ObjectId id) {
@@ -922,6 +997,302 @@ public final class PgRender {
         final var matcher = Pattern
                 .compile("\\bRETURNS (.+?) LANGUAGE\\b").matcher(functionDef);
         return matcher.find() ? matcher.group(1) : null;
+    }
+
+    // ---- UNEXPECTED (5.5 pruning) -------------------------------------------
+
+    /**
+     * Data-bearing kinds: their standalone drop is DESTRUCTIVE because the
+     * rows are lost. Every other kind's standalone drop is a REBUILD —
+     * removing it cannot destroy stored data.
+     */
+    private static final Set<ObjectKind> DESTRUCTIVE_PRUNE = Set.of(
+            ObjectKind.TABLE, ObjectKind.COLUMN, ObjectKind.MATERIALIZED_VIEW,
+            ObjectKind.PARTITION, ObjectKind.SEQUENCE);
+
+    /**
+     * A standalone DROP for an object absent from the desired state (5.5).
+     * {@code have} is the ACTUAL object — its attributes hold the drop
+     * fragments. An unexpected {@code COLUMN} on an expected table renders
+     * {@code ALTER TABLE ... DROP COLUMN}; one on an unexpected table is
+     * suppressed upstream (the parent's own drop covers it). Mirrored kinds
+     * map to their null/revoke/owner-reset forms; COMMENT and OWNERSHIP
+     * have no {@code DROP_SQL} so their statements derive from the create
+     * fragment.
+     */
+    private static List<PlannedChange> unexpected(ObjectId id, SchemaObject have,
+                                                  SchemaSnapshot actual, String ns,
+                                                  RenderOptions options) {
+        final var safety = DESTRUCTIVE_PRUNE.contains(id.kind())
+                ? ChangeSafety.DESTRUCTIVE : ChangeSafety.REBUILD;
+        final var reason = "unexpected " + id;
+        switch (id.kind()) {
+            case COLUMN -> {
+                // a pruned column on a renamed parent drops through the new
+                // name — the old one no longer exists once the rename ran
+                final var parent = options.renamedParents()
+                        .getOrDefault(id.parent().orElse(""), id.parent().orElse(""));
+                final var routed = partitionParent(parent, actual);
+                return List.of(new PlannedChange(0, id, ChangeAction.DROP, safety,
+                        List.of(bind("ALTER TABLE " + TOKEN + "."
+                                + PgIdentifiers.quote(routed != null ? routed : parent)
+                                + " DROP COLUMN " + PgIdentifiers.quote(id.name()), ns)),
+                        Optional.empty(), reason, false, LOCK_EXCLUSIVE));
+            }
+            case TABLE -> {
+                // a plain table never carries DROP_SQL — its drift path is
+                // the destructive manual one, so the prune drop is built here
+                return List.of(new PlannedChange(0, id, ChangeAction.DROP, safety,
+                        List.of(bind("DROP TABLE " + TOKEN + "."
+                                + PgIdentifiers.quote(id.name()), ns)),
+                        Optional.empty(), reason, false, LOCK_EXCLUSIVE));
+            }
+            case INDEX -> {
+                return List.of(indexDrop(id, have, actual, ns, reason, options));
+            }
+            case COMMENT -> {
+                // COMMENT ON <target> IS NULL — the create fragment's
+                // literal is always the statement's tail
+                final var create = have.attributes().getOrDefault(PgCatalog.CREATE_SQL, "");
+                return List.of(new PlannedChange(0, id, ChangeAction.ALTER, safety,
+                        List.of(bind(create.replaceAll(" IS '(?:[^']|'')*'$", " IS NULL"), ns)),
+                        Optional.empty(), reason));
+            }
+            case SECURITY_LABEL -> {
+                return List.of(new PlannedChange(0, id, ChangeAction.ALTER, safety,
+                        List.of(bind(have, PgCatalog.DROP_SQL, ns)),
+                        Optional.empty(), reason));
+            }
+            case OWNERSHIP -> {
+                // ALTER <target> OWNER TO CURRENT_USER — surrender the
+                // scripted owner to whoever runs the reconcile
+                final var create = have.attributes().getOrDefault(PgCatalog.CREATE_SQL, "");
+                return List.of(new PlannedChange(0, id, ChangeAction.ALTER, safety,
+                        List.of(bind(create.replaceAll(" OWNER TO \"(?:[^\"]|\"\")*\"$",
+                                " OWNER TO CURRENT_USER"), ns)),
+                        Optional.empty(), reason));
+            }
+            case PRIVILEGES, DEFAULT_PRIVILEGES -> {
+                final var target = bind(have, PgCatalog.GRANT_TARGET, ns);
+                final var prefix = have.attributes().get(PgCatalog.GRANT_PREFIX);
+                final var pfx = prefix == null ? "" : bind(prefix, ns) + " ";
+                final var stmts = new ArrayList<String>();
+                for (final var tok : aclTokens(have.definition().canonical())) {
+                    final var g = grantee(tok);
+                    if (g.equals("<owner>")) {
+                        continue;
+                    }
+                    stmts.add(pfx + "REVOKE ALL PRIVILEGES ON " + target
+                            + " FROM " + granteeSql(g));
+                }
+                if (stmts.isEmpty()) {
+                    return List.of();
+                }
+                return List.of(new PlannedChange(0, id, ChangeAction.ALTER, safety,
+                        stmts, Optional.empty(), reason));
+            }
+            default -> {
+                final var drop = have.attributes().get(PgCatalog.DROP_SQL);
+                if (drop == null) {
+                    throw new PlanningException("unexpected " + id
+                            + " has no drop statement");
+                }
+                return List.of(new PlannedChange(0, id, ChangeAction.DROP, safety,
+                        List.of(bind(drop, ns)), Optional.empty(), reason,
+                        false, safety == ChangeSafety.DESTRUCTIVE
+                                ? LOCK_EXCLUSIVE : ChangeHazard.NONE));
+            }
+        }
+    }
+
+    // ---- concurrent indexes (5.6) -------------------------------------------
+
+    /**
+     * Whether the index's parent relation is a partitioned table —
+     * PostgreSQL rejects {@code CREATE INDEX CONCURRENTLY} on one (the
+     * partitioned index build is transactional anyway).
+     */
+    private static boolean parentPartitioned(ObjectId id, SchemaSnapshot snapshot) {
+        for (final var o : snapshot.objects().values()) {
+            if (o.id().name().equals(id.parent().orElse(null))
+                    && o.id().parent().isEmpty()
+                    && (o.id().kind() == ObjectKind.TABLE
+                            || o.id().kind() == ObjectKind.PARTITION)
+                    && o.attributes().get(PgCatalog.PARTKEY) != null) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** Whether concurrent index DDL applies to this index under the options. */
+    private static boolean concurrentIndex(ObjectId id, SchemaSnapshot snapshot,
+                                           RenderOptions options) {
+        return options.concurrentIndexes() && !parentPartitioned(id, snapshot);
+    }
+
+    /**
+     * {@code CREATE [UNIQUE] INDEX CONCURRENTLY} — the concurrently variant
+     * of a missing index (5.6). The statement runs outside a transaction
+     * ({@code nonTransactional}) under a SHARE UPDATE EXCLUSIVE lock; on a
+     * partitioned parent it degrades to the plain transactional form.
+     */
+    private static PlannedChange indexCreate(ObjectId id, SchemaObject want,
+                                             SchemaSnapshot snapshot, String ns, String reason,
+                                             RenderOptions options) {
+        if (!concurrentIndex(id, snapshot, options)) {
+            return new PlannedChange(0, id, ChangeAction.CREATE,
+                    ChangeSafety.ADDITIVE, createStatements(want, ns),
+                    Optional.of(want.definition()), reason, false, INDEX_BUILD);
+        }
+        final var statements = createStatements(want, ns).stream()
+                .map(s -> s.replaceFirst("^(CREATE\\s+(?:UNIQUE\\s+)?INDEX)\\s",
+                        "$1 CONCURRENTLY "))
+                .toList();
+        return new PlannedChange(0, id, ChangeAction.CREATE,
+                ChangeSafety.ADDITIVE, statements, Optional.of(want.definition()), reason,
+                true, INDEX_CONCURRENT);
+    }
+
+    /**
+     * {@code DROP INDEX CONCURRENTLY} — the concurrently variant of an
+     * index drop, whether from a drifted recreate pair or a prune of an
+     * unexpected index.
+     */
+    private static PlannedChange indexDrop(ObjectId id, SchemaObject have,
+                                           SchemaSnapshot snapshot, String ns, String reason,
+                                           RenderOptions options) {
+        final var drop = bind(have, PgCatalog.DROP_SQL, ns);
+        if (!concurrentIndex(id, snapshot, options)) {
+            return new PlannedChange(0, id, ChangeAction.DROP,
+                    ChangeSafety.REBUILD, List.of(drop), Optional.empty(), reason,
+                    false, LOCK_EXCLUSIVE);
+        }
+        return new PlannedChange(0, id, ChangeAction.DROP, ChangeSafety.REBUILD,
+                List.of(drop.replaceFirst("^DROP\\s+INDEX\\s", "DROP INDEX CONCURRENTLY ")),
+                Optional.empty(), reason, true, INDEX_CONCURRENT);
+    }
+
+    /** The DROP+CREATE pair of a drifted index — concurrent when allowed. */
+    private static List<PlannedChange> indexRecreate(ObjectId id, SchemaObject want,
+                                                     SchemaSnapshot snapshot, String ns,
+                                                     String reason, RenderOptions options) {
+        if (!concurrentIndex(id, snapshot, options)) {
+            return recreate(id, want, ns, reason, false, INDEX_BUILD);
+        }
+        return List.of(
+                indexDrop(id, want, snapshot, ns, reason, options),
+                indexCreate(id, want, snapshot, ns, reason, options));
+    }
+
+    // ---- RENAME (5.5.1) ------------------------------------------------------
+
+    /**
+     * An {@code ALTER ... RENAME} statement per kind; returns {@code null}
+     * when the kind has no rename form — the caller falls back to
+     * drop+create.
+     */
+    private static String renameSql(ObjectId from, ObjectId to) {
+        final var qFrom = TOKEN + "." + PgIdentifiers.quote(from.name());
+        final var qNew = PgIdentifiers.quote(to.name());
+        final var qParent = from.parent().isEmpty() ? null
+                : TOKEN + "." + PgIdentifiers.quote(from.parent().orElseThrow());
+        switch (from.kind()) {
+            case TABLE, PARTITION -> {
+                return "ALTER TABLE " + qFrom + " RENAME TO " + qNew;
+            }
+            case FOREIGN_TABLE -> {
+                return "ALTER FOREIGN TABLE " + qFrom + " RENAME TO " + qNew;
+            }
+            case VIEW -> {
+                return "ALTER VIEW " + qFrom + " RENAME TO " + qNew;
+            }
+            case MATERIALIZED_VIEW -> {
+                return "ALTER MATERIALIZED VIEW " + qFrom + " RENAME TO " + qNew;
+            }
+            case SEQUENCE -> {
+                return "ALTER SEQUENCE " + qFrom + " RENAME TO " + qNew;
+            }
+            case INDEX -> {
+                return "ALTER INDEX " + qFrom + " RENAME TO " + qNew;
+            }
+            case TYPE, DOMAIN -> {
+                return "ALTER TYPE " + qFrom + " RENAME TO " + qNew;
+            }
+            case STATISTICS -> {
+                return "ALTER STATISTICS " + qFrom + " RENAME TO " + qNew;
+            }
+            case COLLATION -> {
+                return "ALTER COLLATION " + qFrom + " RENAME TO " + qNew;
+            }
+            case CONVERSION -> {
+                return "ALTER CONVERSION " + qFrom + " RENAME TO " + qNew;
+            }
+            case COLUMN -> {
+                return "ALTER TABLE " + qParent + " RENAME COLUMN "
+                        + PgIdentifiers.quote(from.name()) + " TO " + qNew;
+            }
+            case PRIMARY_KEY, UNIQUE, FOREIGN_KEY, CHECK, EXCLUSION -> {
+                return "ALTER TABLE " + qParent + " RENAME CONSTRAINT "
+                        + PgIdentifiers.quote(from.name()) + " TO " + qNew;
+            }
+            case TRIGGER -> {
+                return "ALTER TRIGGER " + PgIdentifiers.quote(from.name())
+                        + " ON " + qParent + " RENAME TO " + qNew;
+            }
+            case POLICY -> {
+                return "ALTER POLICY " + PgIdentifiers.quote(from.name())
+                        + " ON " + qParent + " RENAME TO " + qNew;
+            }
+            case ROUTINE, AGGREGATE -> {
+                // the signature rides the name — ALTER FUNCTION
+                // <ns>.<name>(<sig>) RENAME TO <newname>
+                final var sig = signatureOf(from.name());
+                final var word = from.kind() == ObjectKind.AGGREGATE
+                        ? "AGGREGATE" : "FUNCTION";
+                return "ALTER " + word + " " + TOKEN + "."
+                        + PgIdentifiers.quote(baseName(from.name())) + sig
+                        + " RENAME TO " + PgIdentifiers.quote(baseName(to.name()));
+            }
+            default -> {
+                return null;
+            }
+        }
+    }
+
+    /** The {@code (args)} tail of a routine id name, or {@code ""}. */
+    private static String signatureOf(String name) {
+        final var p = name.indexOf('(');
+        return p < 0 ? "" : name.substring(p);
+    }
+
+    /** The name without a {@code (args)} signature tail. */
+    private static String baseName(String name) {
+        final var p = name.indexOf('(');
+        return p < 0 ? name : name.substring(0, p);
+    }
+
+    /**
+     * 5.5.1: an explicit rename hint renders {@code ALTER ... RENAME} as a
+     * single ALTER change targeting the NEW name — a rename is a
+     * metadata-only, data-safe operation (REBUILD). The change's expected
+     * definition is the actual one (a rename does not alter the
+     * definition); when the desired definition also changed, the plan adds
+     * a following DRIFTED change on the new name.
+     */
+    public static List<PlannedChange> renderRename(ObjectId from, ObjectId to,
+                                                   SchemaSnapshot actual,
+                                                   SchemaSnapshot desired,
+                                                   String targetNamespace) {
+        final var sql = renameSql(from, to);
+        if (sql == null) {
+            throw new PlanningException("rename of " + from.kind() + " " + from
+                    + " is not supported");
+        }
+        final var have = actual.objects().get(from);
+        return List.of(new PlannedChange(0, to, ChangeAction.ALTER, ChangeSafety.REBUILD,
+                List.of(bind(sql, targetNamespace)), Optional.of(have.definition()),
+                "renamed " + from + " to " + to, false, LOCK_EXCLUSIVE));
     }
 
     // ---- SPI helpers -------------------------------------------------------

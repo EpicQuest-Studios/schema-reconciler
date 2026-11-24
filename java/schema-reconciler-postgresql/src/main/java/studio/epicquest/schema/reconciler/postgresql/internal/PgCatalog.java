@@ -248,20 +248,7 @@ public final class PgCatalog {
         }
 
         void loadExtensionOwned(Connection conn) throws SQLException {
-            try (PreparedStatement ps = conn.prepareStatement(
-                    // relations, routines and types dominate the member count (a
-                    // PostGIS install owns thousands), so only those in this
-                    // namespace are read; other classes are few and read whole
-                    "SELECT d.objid FROM pg_depend d"
-                            + " WHERE d.refclassid = 'pg_extension'::regclass AND d.deptype = 'e'"
-                            + " AND CASE d.classid"
-                            + " WHEN 'pg_class'::regclass THEN EXISTS (SELECT 1 FROM pg_class o"
-                            + "   WHERE o.oid = d.objid AND o.relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = ?))"
-                            + " WHEN 'pg_proc'::regclass THEN EXISTS (SELECT 1 FROM pg_proc o"
-                            + "   WHERE o.oid = d.objid AND o.pronamespace = (SELECT oid FROM pg_namespace WHERE nspname = ?))"
-                            + " WHEN 'pg_type'::regclass THEN EXISTS (SELECT 1 FROM pg_type o"
-                            + "   WHERE o.oid = d.objid AND o.typnamespace = (SELECT oid FROM pg_namespace WHERE nspname = ?))"
-                            + " ELSE true END")) {
+            try (PreparedStatement ps = conn.prepareStatement(PgQueries.get("extension_owned"))) {
                 ps.setString(1, ns);
                 ps.setString(2, ns);
                 ps.setString(3, ns);
@@ -284,13 +271,7 @@ public final class PgCatalog {
          * routine loader so the oid maps are populated early.
          */
         void loadAutoTypeFamily(Connection conn) throws SQLException {
-            try (PreparedStatement ps = conn.prepareStatement("""
-                    SELECT t.oid, t.typname, r.rngmultitypid
-                    FROM pg_range r
-                    JOIN pg_type t ON t.oid = r.rngtypid
-                    JOIN pg_namespace n ON n.oid = t.typnamespace
-                    WHERE n.nspname = ?
-                    """)) {
+            try (PreparedStatement ps = conn.prepareStatement(PgQueries.get("range_types"))) {
                 ps.setString(1, ns);
                 try (ResultSet rs = ps.executeQuery()) {
                     while (rs.next()) {
@@ -307,17 +288,7 @@ public final class PgCatalog {
                     }
                 }
             }
-            try (PreparedStatement ps = conn.prepareStatement("""
-                    SELECT d.objid, coalesce(rg.rngtypid, d.refobjid) AS rng
-                    FROM pg_depend d
-                    JOIN pg_type t ON t.oid = d.refobjid
-                    JOIN pg_namespace n ON n.oid = t.typnamespace
-                    LEFT JOIN pg_range rg ON rg.rngmultitypid = d.refobjid
-                    WHERE n.nspname = ? AND t.typtype IN ('r','m')
-                      AND d.classid = 'pg_proc'::regclass
-                      AND d.refclassid = 'pg_type'::regclass
-                      AND d.deptype = 'i'
-                    """)) {
+            try (PreparedStatement ps = conn.prepareStatement(PgQueries.get("auto_type_procs"))) {
                 ps.setString(1, ns);
                 try (ResultSet rs = ps.executeQuery()) {
                     while (rs.next()) {
@@ -326,17 +297,7 @@ public final class PgCatalog {
                     }
                 }
             }
-            try (PreparedStatement ps = conn.prepareStatement("""
-                    SELECT d.objid, coalesce(rg.rngtypid, d.refobjid) AS rng
-                    FROM pg_depend d
-                    JOIN pg_type t ON t.oid = d.refobjid
-                    JOIN pg_namespace n ON n.oid = t.typnamespace
-                    LEFT JOIN pg_range rg ON rg.rngmultitypid = d.refobjid
-                    WHERE n.nspname = ? AND t.typtype IN ('r','m')
-                      AND d.classid = 'pg_cast'::regclass
-                      AND d.refclassid = 'pg_type'::regclass
-                      AND d.deptype = 'i'
-                    """)) {
+            try (PreparedStatement ps = conn.prepareStatement(PgQueries.get("auto_type_casts"))) {
                 ps.setString(1, ns);
                 try (ResultSet rs = ps.executeQuery()) {
                     while (rs.next()) {
@@ -348,30 +309,7 @@ public final class PgCatalog {
         }
 
         void loadRelations(Connection conn) throws SQLException {
-            try (PreparedStatement ps = conn.prepareStatement("""
-                    SELECT c.oid, c.relname, c.relkind, c.relpersistence,
-                           c.reloptions::text AS options, c.relreplident,
-                           c.relrowsecurity, c.relforcerowsecurity,
-                           pg_get_partkeydef(c.oid) AS partkey,
-                           pg_get_expr(c.relpartbound, c.oid) AS partbound,
-                           (SELECT p.relname FROM pg_inherits i
-                              JOIN pg_class p ON p.oid = i.inhparent
-                             WHERE i.inhrelid = c.oid AND p.relkind = 'p'
-                             LIMIT 1) AS pparent,
-                           (SELECT string_agg(p.relkind, '') FROM pg_inherits i
-                              JOIN pg_class p ON p.oid = i.inhparent
-                             WHERE i.inhrelid = c.oid) AS parentkinds,
-                           (SELECT ic.relname FROM pg_index ix JOIN pg_class ic ON ic.oid = ix.indexrelid
-                             WHERE ix.indrelid = c.oid AND ix.indisreplident) AS replindex,
-                           (SELECT t.oid FROM pg_type t
-                             WHERE t.typrelid = c.oid) AS typeoid,
-                           s.srvname AS ftserver, f.ftoptions::text AS ftoptions
-                    FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
-                    LEFT JOIN pg_foreign_table f ON f.ftrelid = c.oid
-                    LEFT JOIN pg_foreign_server s ON s.oid = f.ftserver
-                    WHERE n.nspname = ? AND c.relkind IN ('r','v','m','f','p','c','t','I','S')
-                    ORDER BY c.oid
-                    """)) {
+            try (PreparedStatement ps = conn.prepareStatement(PgQueries.get("relations"))) {
                 ps.setString(1, ns);
                 try (ResultSet rs = ps.executeQuery()) {
                     while (rs.next()) {
@@ -504,39 +442,7 @@ public final class PgCatalog {
         }
 
         void loadColumns(Connection conn) throws SQLException {
-            try (PreparedStatement ps = conn.prepareStatement("""
-                    SELECT c.relname AS parent, c.oid AS reloid, a.attnum,
-                           a.attname, format_type(a.atttypid, a.atttypmod) AS typ,
-                           a.attgenerated, a.attcollation, t.typcollation, a.attidentity,
-                           a.attstorage, t.typstorage, a.attcompression,
-                           co.collname,
-                           (a.attnotnull OR EXISTS (
-                               SELECT 1 FROM pg_constraint cn
-                               WHERE cn.conrelid = a.attrelid AND cn.contype = 'n'
-                                 AND a.attnum = ANY(cn.conkey))) AS notnull,
-                           pg_get_expr(d.adbin, d.adrelid) AS defexpr,
-                           format_type(ids.seqtypid, NULL) AS idtype,
-                           ids.seqincrement, ids.seqmin, ids.seqmax,
-                           ids.seqstart, ids.seqcache, ids.seqcycle
-                    FROM pg_attribute a
-                    JOIN pg_class c ON c.oid = a.attrelid AND c.relkind IN ('r', 'p', 'f')
-                    JOIN pg_namespace n ON n.oid = c.relnamespace
-                    JOIN pg_type t ON t.oid = a.atttypid
-                    LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum
-                    LEFT JOIN pg_collation co ON co.oid = a.attcollation
-                    LEFT JOIN LATERAL (
-                        SELECT ps.* FROM pg_depend dep
-                        JOIN pg_class sq ON sq.oid = dep.objid AND sq.relkind = 'S'
-                        JOIN pg_sequence ps ON ps.seqrelid = sq.oid
-                        WHERE dep.classid = 'pg_class'::regclass
-                          AND dep.refclassid = 'pg_class'::regclass
-                          AND dep.refobjid = a.attrelid
-                          AND dep.refobjsubid = a.attnum
-                          AND dep.deptype = 'i'
-                    ) ids ON true
-                    WHERE n.nspname = ? AND a.attnum > 0 AND NOT a.attisdropped
-                    ORDER BY c.oid, a.attnum
-                    """)) {
+            try (PreparedStatement ps = conn.prepareStatement(PgQueries.get("columns"))) {
                 ps.setString(1, ns);
                 try (ResultSet rs = ps.executeQuery()) {
                     while (rs.next()) {
@@ -641,21 +547,7 @@ public final class PgCatalog {
         }
 
         void loadConstraints(Connection conn) throws SQLException {
-            try (PreparedStatement ps = conn.prepareStatement("""
-                    SELECT c.oid, c.conname, c.contype, rel.relname AS parent,
-                           pg_get_constraintdef(c.oid) AS def,
-                           ref.oid AS refoid, c.conindid,
-                           EXISTS (SELECT 1 FROM pg_index ix
-                                    WHERE ix.indexrelid = c.conindid AND ix.indisreplident
-                                      AND c.contype IN ('p','u')) AS replident
-                    FROM pg_constraint c
-                    JOIN pg_class rel ON rel.oid = c.conrelid
-                    JOIN pg_namespace n ON n.oid = rel.relnamespace
-                    LEFT JOIN pg_class ref ON ref.oid = c.confrelid
-                    WHERE n.nspname = ? AND c.contype IN ('p','u','f','c','x')
-                      AND c.conislocal
-                    ORDER BY c.oid
-                    """)) {
+            try (PreparedStatement ps = conn.prepareStatement(PgQueries.get("constraints"))) {
                 ps.setString(1, ns);
                 try (ResultSet rs = ps.executeQuery()) {
                     while (rs.next()) {
@@ -707,20 +599,7 @@ public final class PgCatalog {
         }
 
         void loadIndexes(Connection conn) throws SQLException {
-            try (PreparedStatement ps = conn.prepareStatement("""
-                    SELECT i.indexrelid AS oid, ic.relname, tc.relname AS parent,
-                           pg_get_indexdef(i.indexrelid) AS def, i.indisreplident AS replident
-                    FROM pg_index i
-                    JOIN pg_class ic ON ic.oid = i.indexrelid
-                    JOIN pg_class tc ON tc.oid = i.indrelid
-                    JOIN pg_namespace n ON n.oid = ic.relnamespace
-                    WHERE n.nspname = ? AND ic.relkind = 'i'
-                      AND NOT EXISTS (SELECT 1 FROM pg_constraint co
-                                      WHERE co.conindid = i.indexrelid
-                                        AND co.contype IN ('p','u','x'))
-                      AND NOT EXISTS (SELECT 1 FROM pg_inherits inh WHERE inh.inhrelid = i.indexrelid)
-                    ORDER BY i.indexrelid
-                    """)) {
+            try (PreparedStatement ps = conn.prepareStatement(PgQueries.get("indexes"))) {
                 ps.setString(1, ns);
                 try (ResultSet rs = ps.executeQuery()) {
                     while (rs.next()) {
@@ -746,18 +625,7 @@ public final class PgCatalog {
         }
 
         void loadViews(Connection conn) throws SQLException {
-            try (PreparedStatement ps = conn.prepareStatement("""
-                    SELECT c.oid, c.relname, c.relkind, c.relpersistence, c.relispopulated,
-                           pg_get_viewdef(c.oid, true) AS def,
-                           c.reloptions::text AS options,
-                           (SELECT string_agg(a.attname || ' ' || format_type(a.atttypid, a.atttypmod),
-                                              ', ' ORDER BY a.attnum)
-                              FROM pg_attribute a
-                             WHERE a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped) AS cols
-                    FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
-                    WHERE n.nspname = ? AND c.relkind IN ('v','m')
-                    ORDER BY c.oid
-                    """)) {
+            try (PreparedStatement ps = conn.prepareStatement(PgQueries.get("views"))) {
                 ps.setString(1, ns);
                 try (ResultSet rs = ps.executeQuery()) {
                     while (rs.next()) {
@@ -798,21 +666,7 @@ public final class PgCatalog {
         }
 
         void loadSequences(Connection conn) throws SQLException {
-            try (PreparedStatement ps = conn.prepareStatement("""
-                    SELECT c.oid, c.relname, c.relpersistence,
-                           format_type(s.seqtypid, NULL) AS stype,
-                           s.seqincrement, s.seqmin, s.seqmax, s.seqstart, s.seqcache, s.seqcycle
-                    FROM pg_class c
-                    JOIN pg_namespace n ON n.oid = c.relnamespace
-                    JOIN pg_sequence s ON s.seqrelid = c.oid
-                    WHERE n.nspname = ? AND c.relkind = 'S'
-                      AND NOT EXISTS (
-                          SELECT 1 FROM pg_depend d
-                          WHERE d.classid = 'pg_class'::regclass
-                            AND d.refclassid = 'pg_class'::regclass
-                            AND d.objid = c.oid AND d.deptype = 'i')
-                    ORDER BY c.oid
-                    """)) {
+            try (PreparedStatement ps = conn.prepareStatement(PgQueries.get("sequences"))) {
                 ps.setString(1, ns);
                 try (ResultSet rs = ps.executeQuery()) {
                     while (rs.next()) {
@@ -851,20 +705,7 @@ public final class PgCatalog {
                 }
             }
             // serial-style ownership (deptype 'a')
-            try (PreparedStatement ps = conn.prepareStatement("""
-                    SELECT dep.objid AS seq_oid, dep.refobjid AS tbl_oid,
-                           rc.relname AS tbl, ra.attname AS col,
-                           rn.nspname AS tblns
-                    FROM pg_depend dep
-                    JOIN pg_class sq ON sq.oid = dep.objid AND sq.relkind = 'S'
-                    JOIN pg_namespace sn ON sn.oid = sq.relnamespace
-                    JOIN pg_class rc ON rc.oid = dep.refobjid
-                    JOIN pg_namespace rn ON rn.oid = rc.relnamespace
-                    JOIN pg_attribute ra ON ra.attrelid = dep.refobjid AND ra.attnum = dep.refobjsubid
-                    WHERE dep.classid = 'pg_class'::regclass
-                      AND dep.refclassid = 'pg_class'::regclass
-                      AND dep.deptype = 'a' AND sn.nspname = ?
-                    """)) {
+            try (PreparedStatement ps = conn.prepareStatement(PgQueries.get("sequence_owners"))) {
                 ps.setString(1, ns);
                 try (ResultSet rs = ps.executeQuery()) {
                     while (rs.next()) {
@@ -910,19 +751,7 @@ public final class PgCatalog {
         private final Map<ObjectId, String> seqOwnedBy = new HashMap<>();
 
         void loadRoutines(Connection conn) throws SQLException {
-            try (PreparedStatement ps = conn.prepareStatement("""
-                    SELECT p.oid, p.proname, p.prokind,
-                           coalesce((SELECT string_agg(format_type(a, NULL), ', '
-                                                     ORDER BY x.i)
-                                       FROM unnest(string_to_array(p.proargtypes::text, ' ')::oid[])
-                                            WITH ORDINALITY AS x(a, i)), '') AS sigargs,
-                           (CASE WHEN p.proretset THEN 'SETOF ' ELSE '' END)
-                               || format_type(p.prorettype, NULL) AS rettype,
-                           pg_get_functiondef(p.oid) AS def
-                    FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
-                    WHERE n.nspname = ? AND p.prokind IN ('f','p','w')
-                    ORDER BY p.oid
-                    """)) {
+            try (PreparedStatement ps = conn.prepareStatement(PgQueries.get("routines"))) {
                 ps.setString(1, ns);
                 try (ResultSet rs = ps.executeQuery()) {
                     while (rs.next()) {
@@ -972,36 +801,7 @@ public final class PgCatalog {
          * difference.
          */
         void loadAggregates(Connection conn) throws SQLException {
-            try (PreparedStatement ps = conn.prepareStatement("""
-                    SELECT p.oid, p.proname,
-                           pg_get_function_identity_arguments(p.oid) AS idargs,
-                           pg_get_function_arguments(p.oid) AS args,
-                           a.aggkind,
-                           a.aggtransfn::regprocedure::text AS sfunc,
-                           CASE WHEN a.aggtranstype = 0 THEN 'internal'
-                                ELSE format_type(a.aggtranstype, NULL) END AS stype,
-                           NULLIF(a.aggtransspace, 0) AS sspace,
-                           NULLIF(a.aggfinalfn, 0)::regprocedure::text AS ffunc,
-                           a.aggfinalextra, a.aggfinalmodify,
-                           NULLIF(a.aggcombinefn, 0)::regprocedure::text AS combine,
-                           NULLIF(a.aggserialfn, 0)::regprocedure::text AS serial,
-                           NULLIF(a.aggdeserialfn, 0)::regprocedure::text AS deserial,
-                           a.agginitval,
-                           NULLIF(a.aggmtransfn, 0)::regprocedure::text AS msfunc,
-                           NULLIF(a.aggminvtransfn, 0)::regprocedure::text AS minv,
-                           CASE WHEN a.aggmtransfn::text = '-' THEN NULL
-                                WHEN a.aggmtranstype = 0 THEN 'internal'
-                                ELSE format_type(a.aggmtranstype, NULL) END AS mstype,
-                           NULLIF(a.aggmtransspace, 0) AS msspace,
-                           NULLIF(a.aggmfinalfn, 0)::regprocedure::text AS mffunc,
-                           a.aggmfinalextra, a.aggmfinalmodify,
-                           a.aggminitval,
-                           NULLIF(a.aggsortop, 0)::regoper::text AS sortop
-                    FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
-                    JOIN pg_aggregate a ON a.aggfnoid = p.oid
-                    WHERE n.nspname = ? AND p.prokind = 'a'
-                    ORDER BY p.oid
-                    """)) {
+            try (PreparedStatement ps = conn.prepareStatement(PgQueries.get("aggregates"))) {
                 ps.setString(1, ns);
                 try (ResultSet rs = ps.executeQuery()) {
                     while (rs.next()) {
@@ -1092,15 +892,7 @@ public final class PgCatalog {
         }
 
         void loadTriggers(Connection conn) throws SQLException {
-            try (PreparedStatement ps = conn.prepareStatement("""
-                    SELECT t.oid, t.tgname, c.relname AS parent, t.tgenabled,
-                           pg_get_triggerdef(t.oid, true) AS def, t.tgfoid
-                    FROM pg_trigger t
-                    JOIN pg_class c ON c.oid = t.tgrelid
-                    JOIN pg_namespace n ON n.oid = c.relnamespace
-                    WHERE n.nspname = ? AND NOT t.tgisinternal AND t.tgparentid = 0
-                    ORDER BY t.oid
-                    """)) {
+            try (PreparedStatement ps = conn.prepareStatement(PgQueries.get("triggers"))) {
                 ps.setString(1, ns);
                 try (ResultSet rs = ps.executeQuery()) {
                     while (rs.next()) {
@@ -1136,49 +928,8 @@ public final class PgCatalog {
         }
 
         /** Namespace-scoped catalog rows resolved to a stable display name, for
-         *  locating comments and security labels. Every SELECT emits
-         *  (classid, objoid, name); the parameter order matches the SELECTs. */
-        private static final String NS_OBJECTS = """
-                SELECT 'pg_class'::regclass AS cls, c.oid AS obj, c.relname AS name
-                FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace AND n.nspname = ?
-                UNION ALL SELECT 'pg_proc', p.oid,
-                        p.proname || '(' || pg_get_function_identity_arguments(p.oid) || ')'
-                FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace AND n.nspname = ?
-                UNION ALL SELECT 'pg_type', t.oid, t.typname
-                FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace AND n.nspname = ?
-                UNION ALL SELECT 'pg_constraint', c.oid, rel.relname || '.' || c.conname
-                FROM pg_constraint c JOIN pg_class rel ON rel.oid = c.conrelid
-                JOIN pg_namespace n ON n.oid = rel.relnamespace AND n.nspname = ?
-                UNION ALL SELECT 'pg_rewrite', r.oid, c.relname || '.' || r.rulename
-                FROM pg_rewrite r JOIN pg_class c ON c.oid = r.ev_class
-                JOIN pg_namespace n ON n.oid = c.relnamespace AND n.nspname = ?
-                UNION ALL SELECT 'pg_namespace', n.oid, 'namespace'
-                FROM pg_namespace n WHERE n.nspname = ?
-                UNION ALL SELECT 'pg_policy', p.oid, c.relname || '.' || p.polname
-                FROM pg_policy p JOIN pg_class c ON c.oid = p.polrelid
-                JOIN pg_namespace n ON n.oid = c.relnamespace AND n.nspname = ?
-                UNION ALL SELECT 'pg_collation', cl.oid, cl.collname
-                FROM pg_collation cl JOIN pg_namespace n ON n.oid = cl.collnamespace AND n.nspname = ?
-                UNION ALL SELECT 'pg_statistic_ext', s.oid, s.stxname
-                FROM pg_statistic_ext s JOIN pg_namespace n ON n.oid = s.stxnamespace AND n.nspname = ?
-                UNION ALL SELECT 'pg_ts_config', g.oid, g.cfgname
-                FROM pg_ts_config g JOIN pg_namespace n ON n.oid = g.cfgnamespace AND n.nspname = ?
-                UNION ALL SELECT 'pg_ts_dict', g.oid, g.dictname
-                FROM pg_ts_dict g JOIN pg_namespace n ON n.oid = g.dictnamespace AND n.nspname = ?
-                UNION ALL SELECT 'pg_ts_parser', g.oid, g.prsname
-                FROM pg_ts_parser g JOIN pg_namespace n ON n.oid = g.prsnamespace AND n.nspname = ?
-                UNION ALL SELECT 'pg_ts_template', g.oid, g.tmplname
-                FROM pg_ts_template g JOIN pg_namespace n ON n.oid = g.tmplnamespace AND n.nspname = ?
-                UNION ALL SELECT 'pg_operator', g.oid, g.oprname
-                FROM pg_operator g JOIN pg_namespace n ON n.oid = g.oprnamespace AND n.nspname = ?
-                UNION ALL SELECT 'pg_opclass', g.oid, g.opcname
-                FROM pg_opclass g JOIN pg_namespace n ON n.oid = g.opcnamespace AND n.nspname = ?
-                UNION ALL SELECT 'pg_opfamily', g.oid, g.opfname
-                FROM pg_opfamily g JOIN pg_namespace n ON n.oid = g.opfnamespace AND n.nspname = ?
-                UNION ALL SELECT 'pg_trigger', t.oid, c.relname || '.' || t.tgname
-                FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid
-                JOIN pg_namespace n ON n.oid = c.relnamespace AND n.nspname = ?
-                """;
+         *  locating comments and security labels, live in annotations.sql (the
+         *  `seclabels` and `comments` queries); see PgQueries. */
 
         private void bindNamespace(PreparedStatement ps, int count) throws SQLException {
             for (var i = 1; i <= count; i++) {
@@ -1190,14 +941,7 @@ public final class PgCatalog {
          *  the {@code typeByOid} entry resolves column and table dependency
          *  edges to the managed {@link ObjectKind#TYPE} object. */
         void loadEnums(Connection conn) throws SQLException {
-            try (PreparedStatement ps = conn.prepareStatement("""
-                    SELECT t.oid, t.typname,
-                           (SELECT array_agg(e.enumlabel ORDER BY e.enumsortorder, e.oid)
-                              FROM pg_enum e WHERE e.enumtypid = t.oid) AS labels
-                    FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace
-                    WHERE n.nspname = ? AND t.typtype = 'e'
-                    ORDER BY t.oid
-                    """)) {
+            try (PreparedStatement ps = conn.prepareStatement(PgQueries.get("enums"))) {
                 ps.setString(1, ns);
                 try (ResultSet rs = ps.executeQuery()) {
                     while (rs.next()) {
@@ -1235,14 +979,7 @@ public final class PgCatalog {
          */
         void loadDomains(Connection conn) throws SQLException {
             final var checks = new LinkedHashMap<Long, List<String>>();
-            try (PreparedStatement ps = conn.prepareStatement("""
-                    SELECT c.contypid AS dom, c.conname, pg_get_constraintdef(c.oid) AS def
-                    FROM pg_constraint c
-                    JOIN pg_type t ON t.oid = c.contypid
-                    JOIN pg_namespace n ON n.oid = t.typnamespace AND n.nspname = ?
-                    WHERE c.contype = 'c'
-                    ORDER BY c.contypid, c.conname
-                    """)) {
+            try (PreparedStatement ps = conn.prepareStatement(PgQueries.get("domain_checks"))) {
                 ps.setString(1, ns);
                 try (ResultSet rs = ps.executeQuery()) {
                     while (rs.next()) {
@@ -1251,16 +988,7 @@ public final class PgCatalog {
                     }
                 }
             }
-            try (PreparedStatement ps = conn.prepareStatement("""
-                    SELECT t.oid, t.typname,
-                           format_type(t.typbasetype, t.typtypmod) AS basetype,
-                           t.typnotnull, pg_get_expr(t.typdefaultbin, 0) AS dflt,
-                           NULLIF(t.typcollation, 0)::regcollation::text AS coll,
-                           t.typbasetype
-                    FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace
-                    WHERE n.nspname = ? AND t.typtype = 'd'
-                    ORDER BY t.oid
-                    """)) {
+            try (PreparedStatement ps = conn.prepareStatement(PgQueries.get("domains"))) {
                 ps.setString(1, ns);
                 try (ResultSet rs = ps.executeQuery()) {
                     while (rs.next()) {
@@ -1320,25 +1048,7 @@ public final class PgCatalog {
          * standalone composites.
          */
         void loadComposites(Connection conn) throws SQLException {
-            try (PreparedStatement ps = conn.prepareStatement("""
-                    SELECT t.oid, t.typname, t.typrelid,
-                           (SELECT string_agg(quote_ident(a.attname) || ' '
-                                    || format_type(a.atttypid, a.atttypmod)
-                                    || CASE WHEN a.attcollation <> at.typcollation
-                                            THEN ' collate '
-                                                 || a.attcollation::regcollation::text
-                                            ELSE '' END,
-                                    ', ' ORDER BY a.attnum)
-                              FROM pg_attribute a
-                              JOIN pg_type at ON at.oid = a.atttypid
-                              WHERE a.attrelid = t.typrelid
-                                AND a.attnum > 0 AND NOT a.attisdropped) AS attrs
-                    FROM pg_type t
-                    JOIN pg_class c ON c.oid = t.typrelid AND c.relkind = 'c'
-                    JOIN pg_namespace n ON n.oid = t.typnamespace
-                    WHERE n.nspname = ? AND t.typtype = 'c'
-                    ORDER BY t.oid
-                    """)) {
+            try (PreparedStatement ps = conn.prepareStatement(PgQueries.get("composites"))) {
                 ps.setString(1, ns);
                 try (ResultSet rs = ps.executeQuery()) {
                     while (rs.next()) {
@@ -1373,36 +1083,7 @@ public final class PgCatalog {
          * {@code typeByOid} is already populated there.
          */
         void loadRanges(Connection conn) throws SQLException {
-            try (PreparedStatement ps = conn.prepareStatement("""
-                    SELECT t.oid, t.typname,
-                           format_type(r.rngsubtype, NULL) AS subtype,
-                           NULLIF(r.rngcollation, 0)::regcollation::text AS coll,
-                           -- SUBTYPE_OPCLASS takes a bare name and pg_range
-                           -- always stores the resolved class, so it is
-                           -- reported only when it is not the subtype's
-                           -- default btree operator class
-                           CASE WHEN EXISTS (
-                                    SELECT 1 FROM pg_opclass d
-                                    JOIN pg_opfamily f
-                                      ON f.oid = d.opcfamily
-                                    JOIN pg_am am
-                                      ON am.oid = f.opfmethod
-                                    WHERE am.amname = 'btree'
-                                      AND d.opcintype = r.rngsubtype
-                                      AND d.opcdefault
-                                      AND d.oid = r.rngsubopc)
-                                THEN NULL
-                                ELSE (SELECT o.opcname FROM pg_opclass o
-                                      WHERE o.oid = r.rngsubopc)
-                           END AS opc,
-                           NULLIF(r.rngcanonical, 0)::regproc::text AS canonical,
-                           NULLIF(r.rngsubdiff, 0)::regproc::text AS diff
-                    FROM pg_range r
-                    JOIN pg_type t ON t.oid = r.rngtypid
-                    JOIN pg_namespace n ON n.oid = t.typnamespace
-                    WHERE n.nspname = ?
-                    ORDER BY t.oid
-                    """)) {
+            try (PreparedStatement ps = conn.prepareStatement(PgQueries.get("ranges"))) {
                 ps.setString(1, ns);
                 try (ResultSet rs = ps.executeQuery()) {
                     while (rs.next()) {
@@ -1460,21 +1141,7 @@ public final class PgCatalog {
          * expressions' referenced routines and types.
          */
         void loadPolicies(Connection conn) throws SQLException {
-            try (PreparedStatement ps = conn.prepareStatement("""
-                    SELECT po.oid, po.polname, po.polrelid, c.relname, po.polcmd,
-                           po.polpermissive,
-                           (SELECT array_agg(x ORDER BY x)
-                              FROM (SELECT DISTINCT CASE WHEN u = 0 THEN 'PUBLIC'
-                                                         ELSE r.rolname END AS x
-                                      FROM unnest(po.polroles) u
-                                      LEFT JOIN pg_roles r ON r.oid = u) s) AS roles,
-                           pg_get_expr(po.polqual, po.polrelid) AS using,
-                           pg_get_expr(po.polwithcheck, po.polrelid) AS wcheck
-                    FROM pg_policy po
-                    JOIN pg_class c ON c.oid = po.polrelid
-                    JOIN pg_namespace n ON n.oid = c.relnamespace AND n.nspname = ?
-                    ORDER BY po.oid
-                    """)) {
+            try (PreparedStatement ps = conn.prepareStatement(PgQueries.get("policies"))) {
                 ps.setString(1, ns);
                 try (ResultSet rs = ps.executeQuery()) {
                     while (rs.next()) {
@@ -1540,13 +1207,7 @@ public final class PgCatalog {
          * declarable, so it stays outside the canonical (like attstattarget).
          */
         void loadStatistics(Connection conn) throws SQLException {
-            try (PreparedStatement ps = conn.prepareStatement("""
-                    SELECT s.oid, s.stxname, s.stxrelid,
-                           pg_get_statisticsobjdef(s.oid) AS def
-                    FROM pg_statistic_ext s
-                    JOIN pg_namespace n ON n.oid = s.stxnamespace AND n.nspname = ?
-                    ORDER BY s.oid
-                    """)) {
+            try (PreparedStatement ps = conn.prepareStatement(PgQueries.get("statistics"))) {
                 ps.setString(1, ns);
                 try (ResultSet rs = ps.executeQuery()) {
                     while (rs.next()) {
@@ -1582,15 +1243,7 @@ public final class PgCatalog {
          * its relation and every object the action references.
          */
         void loadRules(Connection conn) throws SQLException {
-            try (PreparedStatement ps = conn.prepareStatement("""
-                    SELECT r.oid, r.rulename, c.relname AS parent, r.ev_class,
-                           r.ev_enabled, pg_get_ruledef(r.oid, true) AS def
-                    FROM pg_rewrite r
-                    JOIN pg_class c ON c.oid = r.ev_class
-                    JOIN pg_namespace n ON n.oid = c.relnamespace AND n.nspname = ?
-                    WHERE r.rulename <> '_RETURN'
-                    ORDER BY r.oid
-                    """)) {
+            try (PreparedStatement ps = conn.prepareStatement(PgQueries.get("rules"))) {
                 ps.setString(1, ns);
                 try (ResultSet rs = ps.executeQuery()) {
                     while (rs.next()) {
@@ -1641,20 +1294,7 @@ public final class PgCatalog {
          * resolve.
          */
         void loadCollations(Connection conn) throws SQLException {
-            try (PreparedStatement ps = conn.prepareStatement("""
-                    SELECT cl.oid, cl.collname, cl.collprovider, cl.collisdeterministic,
-                           cl.collencoding, cl.collcollate, cl.collctype,
-                           COALESCE(to_json(cl)->>'colllocale',
-                                    to_json(cl)->>'colliculocale') AS colllocale,
-                           cl.collicurules
-                    FROM pg_collation cl
-                    JOIN pg_namespace n ON n.oid = cl.collnamespace AND n.nspname = ?
-                    WHERE cl.collprovider IN ('c', 'i')
-                      AND cl.collencoding IN (-1,
-                          (SELECT encoding FROM pg_database
-                           WHERE datname = current_database()))
-                    ORDER BY cl.oid
-                    """)) {
+            try (PreparedStatement ps = conn.prepareStatement(PgQueries.get("collations"))) {
                 ps.setString(1, ns);
                 try (ResultSet rs = ps.executeQuery()) {
                     while (rs.next()) {
@@ -1709,17 +1349,7 @@ public final class PgCatalog {
          * when the function is managed.
          */
         void loadConversions(Connection conn) throws SQLException {
-            try (PreparedStatement ps = conn.prepareStatement("""
-                    SELECT cv.oid, cv.conname,
-                           pg_encoding_to_char(cv.conforencoding) AS forenc,
-                           pg_encoding_to_char(cv.contoencoding) AS toenc,
-                           cv.conproc::regproc::text AS procname,
-                           cv.conproc::oid AS conproc
-                    FROM pg_conversion cv
-                    JOIN pg_namespace n ON n.oid = cv.connamespace AND n.nspname = ?
-                    WHERE NOT cv.condefault
-                    ORDER BY cv.oid
-                    """)) {
+            try (PreparedStatement ps = conn.prepareStatement(PgQueries.get("conversions"))) {
                 ps.setString(1, ns);
                 try (ResultSet rs = ps.executeQuery()) {
                     while (rs.next()) {
@@ -1766,17 +1396,7 @@ public final class PgCatalog {
          */
         void loadTextSearch(Connection conn) throws SQLException {
             // templates: the two support functions are the whole body
-            try (PreparedStatement ps = conn.prepareStatement("""
-                    SELECT t.oid, t.tmplname,
-                           t.tmplinit::regproc::text AS init,
-                           t.tmpllexize::regproc::text AS lexize,
-                           t.tmplinit::oid AS init_oid,
-                           t.tmpllexize::oid AS lexize_oid
-                    FROM pg_ts_template t
-                    JOIN pg_namespace n ON n.oid = t.tmplnamespace
-                    WHERE n.nspname = ?
-                    ORDER BY t.oid
-                    """)) {
+            try (PreparedStatement ps = conn.prepareStatement(PgQueries.get("ts_templates"))) {
                 ps.setString(1, ns);
                 try (ResultSet rs = ps.executeQuery()) {
                     while (rs.next()) {
@@ -1810,23 +1430,7 @@ public final class PgCatalog {
                 }
             }
             // parsers: five support functions; prsheadline is optional ('-')
-            try (PreparedStatement ps = conn.prepareStatement("""
-                    SELECT p.oid, p.prsname,
-                           p.prsstart::regproc::text AS start,
-                           p.prstoken::regproc::text AS token,
-                           p.prsend::regproc::text AS end,
-                           p.prsheadline::regproc::text AS headline,
-                           p.prslextype::regproc::text AS lextype,
-                           p.prsstart::oid AS start_oid,
-                           p.prstoken::oid AS token_oid,
-                           p.prsend::oid AS end_oid,
-                           p.prsheadline::oid AS headline_oid,
-                           p.prslextype::oid AS lextype_oid
-                    FROM pg_ts_parser p
-                    JOIN pg_namespace n ON n.oid = p.prsnamespace
-                    WHERE n.nspname = ?
-                    ORDER BY p.oid
-                    """)) {
+            try (PreparedStatement ps = conn.prepareStatement(PgQueries.get("ts_parsers"))) {
                 ps.setString(1, ns);
                 try (ResultSet rs = ps.executeQuery()) {
                     while (rs.next()) {
@@ -1869,17 +1473,7 @@ public final class PgCatalog {
                 }
             }
             // dictionaries: template reference + free-form init option text
-            try (PreparedStatement ps = conn.prepareStatement("""
-                    SELECT d.oid, d.dictname, d.dicttemplate,
-                           tn.nspname || '.' || t.tmplname AS tmplref,
-                           d.dictinitoption
-                    FROM pg_ts_dict d
-                    JOIN pg_ts_template t ON t.oid = d.dicttemplate
-                    JOIN pg_namespace tn ON tn.oid = t.tmplnamespace
-                    JOIN pg_namespace n ON n.oid = d.dictnamespace
-                    WHERE n.nspname = ?
-                    ORDER BY d.oid
-                    """)) {
+            try (PreparedStatement ps = conn.prepareStatement(PgQueries.get("ts_dictionaries"))) {
                 ps.setString(1, ns);
                 try (ResultSet rs = ps.executeQuery()) {
                     while (rs.next()) {
@@ -1914,16 +1508,7 @@ public final class PgCatalog {
             // configurations: parser reference plus the folded token→dict
             // map chain; each map row renders an ALTER ... ADD MAPPING in
             // mapseqno order inside POST_SQL
-            try (PreparedStatement ps = conn.prepareStatement("""
-                    SELECT c.oid, c.cfgname, c.cfgparser,
-                           pn.nspname || '.' || p.prsname AS prsref
-                    FROM pg_ts_config c
-                    JOIN pg_ts_parser p ON p.oid = c.cfgparser
-                    JOIN pg_namespace pn ON pn.oid = p.prsnamespace
-                    JOIN pg_namespace n ON n.oid = c.cfgnamespace
-                    WHERE n.nspname = ?
-                    ORDER BY c.oid
-                    """)) {
+            try (PreparedStatement ps = conn.prepareStatement(PgQueries.get("ts_configurations"))) {
                 ps.setString(1, ns);
                 try (ResultSet rs = ps.executeQuery()) {
                     while (rs.next()) {
@@ -1976,21 +1561,7 @@ public final class PgCatalog {
         private List<TsMap> configMaps(Connection conn, long cfgoid,
                                        String qName) throws SQLException {
             final var out = new ArrayList<TsMap>();
-            try (PreparedStatement ps = conn.prepareStatement("""
-                    SELECT m.maptokentype, m.mapseqno, m.mapdict,
-                           dn.nspname || '.' || d.dictname AS dictref,
-                           tt.alias
-                    FROM pg_ts_config_map m
-                    JOIN pg_ts_config c ON c.oid = m.mapcfg
-                    JOIN pg_ts_dict d ON d.oid = m.mapdict
-                    JOIN pg_namespace dn ON dn.oid = d.dictnamespace
-                    LEFT JOIN LATERAL (
-                        SELECT alias FROM ts_token_type(c.cfgparser)
-                        WHERE tokid = m.maptokentype
-                    ) tt ON true
-                    WHERE m.mapcfg = ?
-                    ORDER BY m.mapseqno
-                    """)) {
+            try (PreparedStatement ps = conn.prepareStatement(PgQueries.get("ts_config_maps"))) {
                 ps.setLong(1, cfgoid);
                 try (ResultSet rs = ps.executeQuery()) {
                     while (rs.next()) {
@@ -2032,31 +1603,7 @@ public final class PgCatalog {
          * DROP+CREATE REBUILD.
          */
         void loadOperators(Connection conn) throws SQLException {
-            try (PreparedStatement ps = conn.prepareStatement("""
-                    SELECT o.oid, o.oprname, o.oprleft, o.oprright,
-                           o.oprleft::regtype::text AS leftt,
-                           o.oprright::regtype::text AS rightt,
-                           o.oprresult::regtype::text AS result,
-                           o.oprcode::regproc::text AS proc,
-                           o.oprcode::oid AS proc_oid,
-                           o.oprrest::regproc::text AS rest,
-                           o.oprrest::oid AS rest_oid,
-                           o.oprjoin::regproc::text AS joinsel,
-                           o.oprjoin::oid AS join_oid,
-                           cn.nspname || '.' || co.oprname AS comref,
-                           nn.nspname || '.' || no.oprname AS negref,
-                           o.oprcom, o.oprnegate,
-                           o.oprresult AS result_oid,
-                           o.oprcanhash, o.oprcanmerge
-                    FROM pg_operator o
-                    JOIN pg_namespace n ON n.oid = o.oprnamespace
-                    LEFT JOIN pg_operator co ON co.oid = o.oprcom
-                    LEFT JOIN pg_namespace cn ON cn.oid = co.oprnamespace
-                    LEFT JOIN pg_operator no ON no.oid = o.oprnegate
-                    LEFT JOIN pg_namespace nn ON nn.oid = no.oprnamespace
-                    WHERE n.nspname = ?
-                    ORDER BY o.oid
-                    """)) {
+            try (PreparedStatement ps = conn.prepareStatement(PgQueries.get("operators"))) {
                 ps.setString(1, ns);
                 try (ResultSet rs = ps.executeQuery()) {
                     while (rs.next()) {
@@ -2135,14 +1682,7 @@ public final class PgCatalog {
             }
             // families: name + access method only — standalone members are
             // not modeled (ALTER FAMILY member mutations stay rejected)
-            try (PreparedStatement ps = conn.prepareStatement("""
-                    SELECT f.oid, f.opfname, a.amname
-                    FROM pg_opfamily f
-                    JOIN pg_am a ON a.oid = f.opfmethod
-                    JOIN pg_namespace n ON n.oid = f.opfnamespace
-                    WHERE n.nspname = ?
-                    ORDER BY f.oid
-                    """)) {
+            try (PreparedStatement ps = conn.prepareStatement(PgQueries.get("opfamilies"))) {
                 ps.setString(1, ns);
                 try (ResultSet rs = ps.executeQuery()) {
                     while (rs.next()) {
@@ -2169,20 +1709,7 @@ public final class PgCatalog {
             // classes: am/type/family/default/storage plus the folded
             // amop/amproc member list (members where the row's left type is
             // the class's indexed type — cross-type members included)
-            try (PreparedStatement ps = conn.prepareStatement("""
-                    SELECT c.oid, c.opcname, a.amname, c.opcfamily,
-                           fn.nspname || '.' || f.opfname AS famref,
-                           format_type(c.opcintype, NULL) AS intype,
-                           format_type(c.opckeytype, NULL) AS storage,
-                           c.opcintype, c.opckeytype, c.opcdefault
-                    FROM pg_opclass c
-                    JOIN pg_am a ON a.oid = c.opcmethod
-                    JOIN pg_opfamily f ON f.oid = c.opcfamily
-                    JOIN pg_namespace fn ON fn.oid = f.opfnamespace
-                    JOIN pg_namespace n ON n.oid = c.opcnamespace
-                    WHERE n.nspname = ?
-                    ORDER BY c.oid
-                    """)) {
+            try (PreparedStatement ps = conn.prepareStatement(PgQueries.get("opclasses"))) {
                 ps.setString(1, ns);
                 try (ResultSet rs = ps.executeQuery()) {
                     while (rs.next()) {
@@ -2247,18 +1774,7 @@ public final class PgCatalog {
                                             long intype, ObjectId id)
                 throws SQLException {
             final var out = new ArrayList<String>();
-            try (PreparedStatement ps = conn.prepareStatement("""
-                    SELECT m.amopstrategy, m.amoppurpose,
-                           m.amopopr::regoperator::text AS opref,
-                           m.amopopr::oid AS amopopr_oid,
-                           sn.nspname || '.' || sf.opfname AS sortref,
-                           m.amopsortfamily
-                    FROM pg_amop m
-                    LEFT JOIN pg_opfamily sf ON sf.oid = m.amopsortfamily
-                    LEFT JOIN pg_namespace sn ON sn.oid = sf.opfnamespace
-                    WHERE m.amopfamily = ? AND m.amoplefttype = ?
-                    ORDER BY m.amopstrategy, m.amoprighttype, m.oid
-                    """)) {
+            try (PreparedStatement ps = conn.prepareStatement(PgQueries.get("opclass_amop_members"))) {
                 ps.setLong(1, family);
                 ps.setLong(2, intype);
                 try (ResultSet rs = ps.executeQuery()) {
@@ -2274,16 +1790,7 @@ public final class PgCatalog {
                     }
                 }
             }
-            try (PreparedStatement ps = conn.prepareStatement("""
-                    SELECT m.amprocnum,
-                           format_type(m.amproclefttype, NULL) AS lt,
-                           format_type(m.amprocrighttype, NULL) AS rt,
-                           m.amproc::regprocedure::text AS fn,
-                           m.amproc::oid AS amproc_oid
-                    FROM pg_amproc m
-                    WHERE m.amprocfamily = ? AND m.amproclefttype = ?
-                    ORDER BY m.amprocnum, m.oid
-                    """)) {
+            try (PreparedStatement ps = conn.prepareStatement(PgQueries.get("opclass_amproc_members"))) {
                 ps.setLong(1, family);
                 ps.setLong(2, intype);
                 try (ResultSet rs = ps.executeQuery()) {
@@ -2314,16 +1821,7 @@ public final class PgCatalog {
          * cannot collapse into one entry).
          */
         void loadSecLabels(Connection conn) throws SQLException {
-            try (PreparedStatement ps = conn.prepareStatement("""
-                    SELECT o.name AS target, d.objoid, o.cls::text AS cls, d.objsubid,
-                           a.attname, d.provider, d.label
-                    FROM pg_seclabel d
-                    JOIN (""" + NS_OBJECTS + """
-                    ) o ON o.cls = d.classoid AND o.obj = d.objoid
-                    LEFT JOIN pg_attribute a ON d.classoid = 'pg_class'::regclass
-                            AND a.attrelid = d.objoid AND a.attnum = d.objsubid
-                    ORDER BY 1, 2, 3
-                    """)) {
+            try (PreparedStatement ps = conn.prepareStatement(PgQueries.get("seclabels"))) {
                 bindNamespace(ps, 17);
                 try (ResultSet rs = ps.executeQuery()) {
                     while (rs.next()) {
@@ -2373,12 +1871,7 @@ public final class PgCatalog {
             // types carry typelem != 0 and are not standalone; enums,
             // composites and ranges are managed TYPE objects, domains
             // managed DOMAIN, and a range's multirange folds into it)
-            try (PreparedStatement ps = conn.prepareStatement("""
-                    SELECT t.oid, t.typname, t.typtype
-                    FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace
-                    WHERE n.nspname = ? AND t.typtype = 'b' AND t.typelem = 0
-                    ORDER BY t.oid
-                    """)) {
+            try (PreparedStatement ps = conn.prepareStatement(PgQueries.get("other_base_types"))) {
                 ps.setString(1, ns);
                 try (ResultSet rs = ps.executeQuery()) {
                     while (rs.next()) {
@@ -2398,12 +1891,7 @@ public final class PgCatalog {
             // never surface as DRIFTED (A.5: ALTER EXTENSION UPDATE is out
             // of scope). The name keeps the extension: prefix so the id
             // stays stable across the promotion from OTHER.
-            try (PreparedStatement ps = conn.prepareStatement("""
-                    SELECT e.oid, e.extname
-                    FROM pg_extension e JOIN pg_namespace n ON n.oid = e.extnamespace
-                    WHERE n.nspname = ?
-                    ORDER BY e.oid
-                    """)) {
+            try (PreparedStatement ps = conn.prepareStatement(PgQueries.get("other_extensions"))) {
                 ps.setString(1, ns);
                 try (ResultSet rs = ps.executeQuery()) {
                     while (rs.next()) {
@@ -2420,12 +1908,7 @@ public final class PgCatalog {
             // loadPolicies — nothing to detect here
             // encoding conversions a desired script cannot express
             // (DEFAULT CONVERSION is a database-wide object word)
-            try (PreparedStatement ps = conn.prepareStatement("""
-                    SELECT cv.oid, cv.conname
-                    FROM pg_conversion cv JOIN pg_namespace n ON n.oid = cv.connamespace
-                    WHERE n.nspname = ? AND cv.condefault
-                    ORDER BY cv.oid
-                    """)) {
+            try (PreparedStatement ps = conn.prepareStatement(PgQueries.get("other_default_conversions"))) {
                 ps.setString(1, ns);
                 try (ResultSet rs = ps.executeQuery()) {
                     while (rs.next()) {
@@ -2445,17 +1928,7 @@ public final class PgCatalog {
             // constraints ('t') back a managed pg_trigger row and column
             // NOT NULL constraints ('n') fold into their COLUMN; non-local
             // rows are partition/inheritance copies of the parent.
-            try (PreparedStatement ps = conn.prepareStatement("""
-                    SELECT c.oid, rel.relname AS parent, c.conname
-                    FROM pg_constraint c
-                    JOIN pg_class rel ON rel.oid = c.conrelid
-                    JOIN pg_namespace n ON n.oid = rel.relnamespace
-                    WHERE n.nspname = ? AND c.conislocal
-                      AND c.contype NOT IN ('p','u','f','c','x','n')
-                      AND NOT EXISTS (SELECT 1 FROM pg_trigger t
-                                      WHERE t.tgconstraint = c.oid)
-                    ORDER BY c.oid
-                    """)) {
+            try (PreparedStatement ps = conn.prepareStatement(PgQueries.get("other_constraints"))) {
                 ps.setString(1, ns);
                 try (ResultSet rs = ps.executeQuery()) {
                     while (rs.next()) {
@@ -2474,16 +1947,7 @@ public final class PgCatalog {
             }
             // collations the managed loader cannot express (default provider,
             // bound encoding) stay OTHER
-            try (PreparedStatement ps = conn.prepareStatement("""
-                    SELECT cl.oid, cl.collname
-                    FROM pg_collation cl JOIN pg_namespace n ON n.oid = cl.collnamespace
-                    WHERE n.nspname = ?
-                      AND (cl.collprovider NOT IN ('c', 'i')
-                           OR cl.collencoding NOT IN (-1,
-                               (SELECT encoding FROM pg_database
-                                WHERE datname = current_database())))
-                    ORDER BY cl.oid
-                    """)) {
+            try (PreparedStatement ps = conn.prepareStatement(PgQueries.get("other_collations"))) {
                 ps.setString(1, ns);
                 try (ResultSet rs = ps.executeQuery()) {
                     while (rs.next()) {
@@ -2506,39 +1970,7 @@ public final class PgCatalog {
             // target holding the same grants reports nothing (5.4). The
             // definition is the sorted grantee:PRIVILEGE[*] token list with
             // the owner written <owner> and the grantor dropped.
-            try (PreparedStatement ps = conn.prepareStatement("""
-                    SELECT 'pg_class' AS cls, 'privileges:' || c.relname AS name,
-                           c.oid, '' AS attname,
-                           """ + aclTokens("c.relacl", "c.relowner") + """
-                           AS acl
-                    FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
-                    WHERE n.nspname = ? AND c.relacl IS NOT NULL
-                    UNION ALL
-                    SELECT 'pg_proc', 'privileges:' || p.proname || '('
-                            || pg_get_function_identity_arguments(p.oid) || ')',
-                            p.oid, '',
-                           """ + aclTokens("p.proacl", "p.proowner") + """
-                           AS acl
-                    FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
-                    WHERE n.nspname = ? AND p.proacl IS NOT NULL
-                    UNION ALL
-                    SELECT 'pg_type', 'privileges:' || t.typname, t.oid, '',
-                           """ + aclTokens("t.typacl", "t.typowner") + """
-                           AS acl
-                    FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace
-                    WHERE n.nspname = ? AND t.typacl IS NOT NULL
-                    UNION ALL
-                    SELECT 'pg_attribute', 'privileges:' || c.relname
-                            || '.' || a.attname, a.attrelid, a.attname,
-                           """ + aclTokens("a.attacl", "c.relowner") + """
-                           AS acl
-                    FROM pg_attribute a
-                    JOIN pg_class c ON c.oid = a.attrelid
-                    JOIN pg_namespace n ON n.oid = c.relnamespace
-                    WHERE n.nspname = ? AND a.attacl IS NOT NULL
-                      AND a.attnum > 0 AND NOT a.attisdropped
-                    ORDER BY 2, 1
-                    """)) {
+            try (PreparedStatement ps = conn.prepareStatement(PgQueries.get("privileges"))) {
                 bindNamespace(ps, 4);
                 try (ResultSet rs = ps.executeQuery()) {
                     while (rs.next()) {
@@ -2586,16 +2018,7 @@ public final class PgCatalog {
             // grants the namespace applies to every new object of a class.
             // Global rows (defaclnamespace = 0) belong to no namespace and
             // stay invisible like every other cluster object (A.5).
-            try (PreparedStatement ps = conn.prepareStatement("""
-                    SELECT d.oid, r.rolname AS role, d.defaclobjtype AS objtype,
-                           """ + aclTokens("d.defaclacl", "d.defaclrole") + """
-                           AS acl
-                    FROM pg_default_acl d
-                    JOIN pg_roles r ON r.oid = d.defaclrole
-                    JOIN pg_namespace n ON n.oid = d.defaclnamespace
-                    WHERE n.nspname = ?
-                    ORDER BY 2, 3
-                    """)) {
+            try (PreparedStatement ps = conn.prepareStatement(PgQueries.get("default_acl"))) {
                 bindNamespace(ps, 1);
                 try (ResultSet rs = ps.executeQuery()) {
                     while (rs.next()) {
@@ -2628,38 +2051,7 @@ public final class PgCatalog {
             // (mirroring COMMENT); on an unmanaged target it stays OTHER.
             // An index's relowner always follows its table's — it cannot
             // diverge, so index rows are skipped outright.
-            try (PreparedStatement ps = conn.prepareStatement("""
-                    -- an index's relowner always follows its table's — it
-                    -- cannot diverge — and a composite's 'c' or a toast 't'
-                    -- row follows its type/table, so 'i'/'I'/'c'/'t' are out
-                    SELECT 'pg_class' AS cls, 'ownership:' || c.relname AS name,
-                           c.oid, c.relowner::regrole::text AS owner
-                    FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
-                    WHERE n.nspname = ? AND c.relkind NOT IN ('i', 'I', 'c', 't')
-                      AND c.relowner::regrole::text <> current_user
-                    UNION ALL
-                    SELECT 'pg_proc', 'ownership:' || p.proname || '('
-                            || pg_get_function_identity_arguments(p.oid) || ')',
-                           p.oid, p.proowner::regrole::text
-                    FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
-                    WHERE n.nspname = ? AND p.proowner::regrole::text <> current_user
-                    UNION ALL
-                    SELECT 'pg_type', 'ownership:' || t.typname,
-                           t.oid, t.typowner::regrole::text
-                    FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace
-                    WHERE n.nspname = ? AND t.typowner::regrole::text <> current_user
-                      -- a table's implicit rowtype and its array type flip
-                      -- owner with the table — neither is a type object of
-                      -- its own; only a standalone composite's 'c' relation
-                      -- counts. A multirange follows its range (ALTER TYPE on
-                      -- it is rejected outright), so 'm' is out too
-                      AND t.typtype <> 'm'
-                      AND t.typelem = 0
-                      AND NOT EXISTS (SELECT 1 FROM pg_class rt
-                                      WHERE rt.oid = t.typrelid
-                                        AND rt.relkind <> 'c')
-                    ORDER BY 2
-                    """)) {
+            try (PreparedStatement ps = conn.prepareStatement(PgQueries.get("ownership"))) {
                 bindNamespace(ps, 3);
                 try (ResultSet rs = ps.executeQuery()) {
                     while (rs.next()) {
@@ -2694,28 +2086,47 @@ public final class PgCatalog {
                     }
                 }
             }
+            // the reconcile unit itself: the schema's own owner and acl.
+            // nspowner follows the same session-role "don't care" rule as
+            // every other owner leg; nspacl is NULL until a GRANT (the
+            // default acl then), and an empty acl means nothing held. Both
+            // mirror onto the neutral "<namespace>" name — a managed name
+            // no table, view or type can collide with (4.1) — so the real
+            // schema name never enters a canonical
+            try (PreparedStatement ps = conn.prepareStatement(PgQueries.get("namespace_owner"))) {
+                ps.setString(1, ns);
+                try (ResultSet rs = ps.executeQuery()) {
+                    while (rs.next()) {
+                        final var owner = rs.getString("owner");
+                        define(new ObjectId(ObjectKind.OWNERSHIP, "<namespace>"),
+                                "owner=" + owner,
+                                Map.of(CREATE_SQL, "ALTER SCHEMA ${namespace}"
+                                        + " OWNER TO " + PgIdentifiers.quote(owner)));
+                    }
+                }
+            }
+            try (PreparedStatement ps = conn.prepareStatement(PgQueries.get("namespace_acl"))) {
+                ps.setString(1, ns);
+                try (ResultSet rs = ps.executeQuery()) {
+                    while (rs.next()) {
+                        final var acl = rs.getString("acl");
+                        if (acl == null) {
+                            // an acl of '{}' unnests to no rows — nothing held
+                            continue;
+                        }
+                        define(new ObjectId(ObjectKind.PRIVILEGES, "<namespace>"),
+                                "privileges=" + acl,
+                                Map.of(GRANT_TARGET, "SCHEMA ${namespace}"));
+                    }
+                }
+            }
             // publication bindings on namespace tables (the publication itself
             // is a cluster-level reference, 4.1; the FOR TABLE edge is the
             // namespace-visible part). The binding's parent is the bound
             // table, so it orders after it; filter/column lists ride in the
             // canonical (pg_publication_rel.prqual/.prattrs, PG15+)
-            final var relBindingCols = serverMajor >= 15;
-            try (PreparedStatement ps = conn.prepareStatement("""
-                    SELECT p.pubname, c.relname, c.oid,
-                           """ + (relBindingCols ? """
-                           pg_get_expr(pr.prqual, pr.prrelid) AS qual,
-                           (SELECT string_agg(a.attname, ',' ORDER BY u.ord)
-                              FROM unnest(string_to_array(pr.prattrs::text, ' ')::smallint[])
-                                   WITH ORDINALITY u(attnum, ord)
-                              JOIN pg_attribute a
-                                ON a.attrelid = pr.prrelid AND a.attnum = u.attnum) AS cols
-                           """ : "NULL AS qual, NULL AS cols\n") + """
-                    FROM pg_publication_rel pr
-                    JOIN pg_class c ON c.oid = pr.prrelid
-                    JOIN pg_namespace n ON n.oid = c.relnamespace AND n.nspname = ?
-                    JOIN pg_publication p ON p.oid = pr.prpubid
-                    ORDER BY 1, 2
-                    """)) {
+            try (PreparedStatement ps = conn.prepareStatement(PgQueries.get(
+                    serverMajor >= 15 ? "publication_rel" : "publication_rel_pre15"))) {
                 ps.setString(1, ns);
                 try (ResultSet rs = ps.executeQuery()) {
                     while (rs.next()) {
@@ -2729,14 +2140,7 @@ public final class PgCatalog {
             // FOR TABLES IN SCHEMA bindings — pg_publication_namespace anchors
             // the publication to the schema itself (PostgreSQL 15+)
             if (serverMajor >= 15) {
-                try (PreparedStatement ps = conn.prepareStatement("""
-                        SELECT p.pubname, NULL AS relname,
-                               NULL AS qual, NULL AS cols
-                        FROM pg_publication_namespace pn
-                        JOIN pg_namespace n ON n.oid = pn.pnnspid AND n.nspname = ?
-                        JOIN pg_publication p ON p.oid = pn.pnpubid
-                        ORDER BY 1
-                        """)) {
+                try (PreparedStatement ps = conn.prepareStatement(PgQueries.get("publication_namespace"))) {
                     ps.setString(1, ns);
                     try (ResultSet rs = ps.executeQuery()) {
                         while (rs.next()) {
@@ -2753,39 +2157,7 @@ public final class PgCatalog {
             // or the cast function stay cluster/namespace references in the
             // canonical; a cast anchored only to unmanaged objects stays
             // cast: OTHER
-            try (PreparedStatement ps = conn.prepareStatement("""
-                    SELECT c.oid, c.castsource, c.casttarget, c.castfunc,
-                           'cast:' || format_type(c.castsource, NULL)
-                            || '->' || format_type(c.casttarget, NULL) AS name,
-                           format_type(c.castsource, NULL)
-                            || '->' || format_type(c.casttarget, NULL) AS bare,
-                           c.castcontext::text || ' ' || c.castmethod::text || ' '
-                               || CASE WHEN c.castfunc = 0 THEN 'none'
-                                       ELSE c.castfunc::regprocedure::text
-                                       END AS canon,
-                           'CREATE CAST (' || format_type(c.castsource, NULL)
-                               || ' AS ' || format_type(c.casttarget, NULL) || ') '
-                               || CASE c.castmethod
-                                      WHEN 'f' THEN 'WITH FUNCTION '
-                                              || c.castfunc::regprocedure::text
-                                      WHEN 'i' THEN 'WITH INOUT' END
-                               || CASE c.castcontext
-                                      WHEN 'a' THEN ' AS ASSIGNMENT'
-                                      WHEN 'i' THEN ' AS IMPLICIT'
-                                      ELSE '' END AS create_sql,
-                           'DROP CAST (' || format_type(c.castsource, NULL)
-                               || ' AS ' || format_type(c.casttarget, NULL)
-                               || ')' AS drop_sql
-                    FROM pg_cast c
-                    WHERE EXISTS (SELECT 1 FROM pg_type t
-                                  JOIN pg_namespace n ON n.oid = t.typnamespace
-                                  WHERE n.nspname = ?
-                                    AND t.oid IN (c.castsource, c.casttarget))
-                       OR EXISTS (SELECT 1 FROM pg_proc f
-                                  JOIN pg_namespace n ON n.oid = f.pronamespace
-                                  WHERE n.nspname = ? AND f.oid = c.castfunc)
-                    ORDER BY c.oid
-                    """)) {
+            try (PreparedStatement ps = conn.prepareStatement(PgQueries.get("casts"))) {
                 bindNamespace(ps, 2);
                 try (ResultSet rs = ps.executeQuery()) {
                     while (rs.next()) {
@@ -2838,45 +2210,7 @@ public final class PgCatalog {
             // a managed TRANSFORM, its identity the type/language pair and
             // the language itself a cluster reference; anything else stays
             // transform: OTHER
-            try (PreparedStatement ps = conn.prepareStatement("""
-                    SELECT t.oid, t.trftype, t.trffromsql, t.trftosql,
-                           'transform:' || format_type(t.trftype, NULL)
-                            || '/' || l.lanname AS name,
-                           format_type(t.trftype, NULL)
-                            || '/' || l.lanname AS bare,
-                           CASE WHEN t.trffromsql = 0 THEN 'none'
-                                ELSE t.trffromsql::regprocedure::text END || ' '
-                            || CASE WHEN t.trftosql = 0 THEN 'none'
-                                    ELSE t.trftosql::regprocedure::text
-                                    END AS canon,
-                           'CREATE TRANSFORM FOR '
-                            || format_type(t.trftype, NULL) || ' LANGUAGE '
-                            || quote_ident(l.lanname)
-                            || ' ('
-                            || CASE WHEN t.trffromsql = 0 THEN ''
-                                    ELSE 'FROM SQL WITH FUNCTION '
-                                         || t.trffromsql::regprocedure::text
-                                         || CASE WHEN t.trftosql <> 0
-                                                 THEN ', ' ELSE '' END
-                                    END
-                            || CASE WHEN t.trftosql = 0 THEN ''
-                                    ELSE 'TO SQL WITH FUNCTION '
-                                         || t.trftosql::regprocedure::text
-                                    END
-                            || ')' AS create_sql,
-                           'DROP TRANSFORM FOR '
-                            || format_type(t.trftype, NULL) || ' LANGUAGE '
-                            || quote_ident(l.lanname) AS drop_sql
-                    FROM pg_transform t JOIN pg_language l ON l.oid = t.trflang
-                    WHERE EXISTS (SELECT 1 FROM pg_type ty
-                                  JOIN pg_namespace n ON n.oid = ty.typnamespace
-                                  WHERE n.nspname = ? AND ty.oid = t.trftype)
-                       OR EXISTS (SELECT 1 FROM pg_proc f
-                                  JOIN pg_namespace n ON n.oid = f.pronamespace
-                                  WHERE n.nspname = ?
-                                    AND f.oid IN (t.trffromsql, t.trftosql))
-                    ORDER BY t.oid
-                    """)) {
+            try (PreparedStatement ps = conn.prepareStatement(PgQueries.get("transforms"))) {
                 bindNamespace(ps, 2);
                 try (ResultSet rs = ps.executeQuery()) {
                     while (rs.next()) {
@@ -2906,16 +2240,7 @@ public final class PgCatalog {
             }
             // languages are database-level; a language whose handlers live in
             // the namespace is part of the desired state
-            try (PreparedStatement ps = conn.prepareStatement("""
-                    SELECT l.oid, 'language:' || l.lanname AS name
-                    FROM pg_language l
-                    WHERE EXISTS (SELECT 1 FROM pg_proc h
-                                  JOIN pg_namespace n ON n.oid = h.pronamespace
-                                  WHERE n.nspname = ?
-                                    AND h.oid IN (l.lanplcallfoid, l.laninline,
-                                                  l.lanvalidator))
-                    ORDER BY l.oid
-                    """)) {
+            try (PreparedStatement ps = conn.prepareStatement(PgQueries.get("languages"))) {
                 ps.setString(1, ns);
                 try (ResultSet rs = ps.executeQuery()) {
                     while (rs.next()) {
@@ -2935,14 +2260,7 @@ public final class PgCatalog {
             // tables) and also expands FOR ALL SEQUENCES flags, which have no
             // per-sequence binding to reconcile — those pubs are filtered out
             if (serverMajor >= 19) {
-                try (PreparedStatement ps = conn.prepareStatement("""
-                        SELECT v.pubname, v.sequencename AS relname,
-                               NULL AS qual, NULL AS cols
-                        FROM pg_publication_sequences v
-                        JOIN pg_publication p ON p.pubname = v.pubname
-                         WHERE v.schemaname = ? AND NOT p.puballsequences
-                        ORDER BY 1
-                        """)) {
+                try (PreparedStatement ps = conn.prepareStatement(PgQueries.get("publication_sequences"))) {
                     ps.setString(1, ns);
                     try (ResultSet rs = ps.executeQuery()) {
                         while (rs.next()) {
@@ -3003,8 +2321,9 @@ public final class PgCatalog {
          * whose {@link ObjectId} mirrors the target (its name, and its parent
          * for child objects); a description on anything else stays the OTHER
          * {@code comment:<name>} object, undeclarable and reported on every
-         * run. pg_extension is not in NS_OBJECTS — an extension's shipped
-         * description is database-wide metadata (COMMENT ON EXTENSION is
+         * run. pg_extension is not in the comments query's object union —
+         * an extension's shipped description is database-wide metadata
+         * (COMMENT ON EXTENSION is
          * rejected), and an anchored object here would poison desired state
          * for the managed EXTENSION object; the extension row itself reports.
          * Comments sharing the mirrored id (a column and a policy with the
@@ -3012,16 +2331,7 @@ public final class PgCatalog {
          * both sides of the diff, so they still converge — documented in A.5.
          */
         void loadComments(Connection conn) throws SQLException {
-            try (PreparedStatement ps = conn.prepareStatement("""
-                    SELECT o.cls::text AS cls, d.objoid, d.objsubid,
-                           o.name AS target, a.attname, d.description
-                    FROM pg_description d
-                    JOIN (""" + NS_OBJECTS + """
-                    ) o ON o.cls = d.classoid AND o.obj = d.objoid
-                    LEFT JOIN pg_attribute a ON d.classoid = 'pg_class'::regclass
-                            AND a.attrelid = d.objoid AND a.attnum = d.objsubid
-                    ORDER BY 1, 2, 3
-                    """)) {
+            try (PreparedStatement ps = conn.prepareStatement(PgQueries.get("comments"))) {
                 bindNamespace(ps, 17);
                 try (ResultSet rs = ps.executeQuery()) {
                     while (rs.next()) {
@@ -3323,17 +2633,7 @@ public final class PgCatalog {
 
         void loadDependencies(Connection conn) throws SQLException {
             // view dependencies via the _RETURN rewrite rule
-            try (PreparedStatement ps = conn.prepareStatement("""
-                    SELECT DISTINCT v.oid AS viewer, d.refobjid AS dep
-                    FROM pg_rewrite r
-                    JOIN pg_depend d ON d.classid = 'pg_rewrite'::regclass AND d.objid = r.oid
-                        AND d.refclassid = 'pg_class'::regclass
-                    JOIN pg_class v ON v.oid = r.ev_class AND v.relkind IN ('v','m')
-                    JOIN pg_namespace vn ON vn.oid = v.relnamespace AND vn.nspname = ?
-                    JOIN pg_class rc ON rc.oid = d.refobjid
-                    JOIN pg_namespace rn ON rn.oid = rc.relnamespace AND rn.nspname = ?
-                    WHERE r.rulename = '_RETURN' AND rc.oid <> v.oid
-                    """)) {
+            try (PreparedStatement ps = conn.prepareStatement(PgQueries.get("dep_view_class"))) {
                 ps.setString(1, ns);
                 ps.setString(2, ns);
                 try (ResultSet rs = ps.executeQuery()) {
@@ -3344,17 +2644,7 @@ public final class PgCatalog {
                 }
             }
             // view-on-routine and view-on-type dependencies
-            try (PreparedStatement ps = conn.prepareStatement("""
-                    SELECT DISTINCT v.oid AS viewer, d.refobjid AS dep
-                    FROM pg_rewrite r
-                    JOIN pg_depend d ON d.classid = 'pg_rewrite'::regclass AND d.objid = r.oid
-                        AND d.refclassid IN ('pg_proc'::regclass, 'pg_type'::regclass,'pg_ts_config'::regclass,'pg_ts_dict'::regclass,
-                                           'pg_ts_parser'::regclass,'pg_ts_template'::regclass,
-                                           'pg_operator'::regclass,'pg_opclass'::regclass,'pg_opfamily'::regclass)
-                    JOIN pg_class v ON v.oid = r.ev_class AND v.relkind IN ('v','m')
-                    JOIN pg_namespace vn ON vn.oid = v.relnamespace AND vn.nspname = ?
-                    WHERE r.rulename = '_RETURN'
-                    """)) {
+            try (PreparedStatement ps = conn.prepareStatement(PgQueries.get("dep_view_other"))) {
                 ps.setString(1, ns);
                 try (ResultSet rs = ps.executeQuery()) {
                     while (rs.next()) {
@@ -3365,18 +2655,7 @@ public final class PgCatalog {
             }
             // routine dependencies on relations, routines and types
             // (SQL-language bodies and argument/return types)
-            try (PreparedStatement ps = conn.prepareStatement("""
-                    SELECT DISTINCT d.objid AS caller, d.refobjid AS dep
-                    FROM pg_depend d
-                    JOIN pg_proc p ON p.oid = d.objid
-                    JOIN pg_namespace pn ON pn.oid = p.pronamespace AND pn.nspname = ?
-                    WHERE d.classid = 'pg_proc'::regclass
-                      AND d.refclassid IN ('pg_class'::regclass, 'pg_proc'::regclass,
-                                           'pg_type'::regclass, 'pg_language'::regclass,
-                                           'pg_ts_config'::regclass,'pg_ts_dict'::regclass,
-                                           'pg_ts_parser'::regclass,'pg_ts_template'::regclass,
-                                           'pg_operator'::regclass,'pg_opclass'::regclass,'pg_opfamily'::regclass)
-                    """)) {
+            try (PreparedStatement ps = conn.prepareStatement(PgQueries.get("dep_routine"))) {
                 ps.setString(1, ns);
                 try (ResultSet rs = ps.executeQuery()) {
                     while (rs.next()) {
@@ -3388,16 +2667,7 @@ public final class PgCatalog {
                 }
             }
             // index-on-routine dependencies (expression indexes)
-            try (PreparedStatement ps = conn.prepareStatement("""
-                    SELECT DISTINCT i.indexrelid AS idx, d.refobjid AS dep
-                    FROM pg_depend d
-                    JOIN pg_class ic ON ic.oid = d.objid AND ic.relkind = 'i'
-                    JOIN pg_index i ON i.indexrelid = ic.oid
-                    JOIN pg_namespace n ON n.oid = ic.relnamespace AND n.nspname = ?
-                    JOIN pg_proc p ON p.oid = d.refobjid
-                    JOIN pg_namespace pn ON pn.oid = p.pronamespace AND pn.nspname = ?
-                    WHERE d.classid = 'pg_class'::regclass AND d.refclassid = 'pg_proc'::regclass
-                    """)) {
+            try (PreparedStatement ps = conn.prepareStatement(PgQueries.get("dep_index_proc"))) {
                 ps.setString(1, ns);
                 ps.setString(2, ns);
                 try (ResultSet rs = ps.executeQuery()) {
@@ -3411,21 +2681,7 @@ public final class PgCatalog {
             // column defaults on our tables -> sequences, routines and types
             // (the edge lands on the column and on its parent table, so that a
             // covered column inside a CREATE TABLE still orders after the ref)
-            try (PreparedStatement ps = conn.prepareStatement("""
-                    SELECT ad.adrelid AS tbl, a.attname AS col, d.refobjid AS dep
-                    FROM pg_depend d
-                    JOIN pg_attrdef ad ON ad.oid = d.objid
-                    JOIN pg_class tc ON tc.oid = ad.adrelid
-                    JOIN pg_namespace tn ON tn.oid = tc.relnamespace AND tn.nspname = ?
-                    JOIN pg_attribute a ON a.attrelid = ad.adrelid AND a.attnum = ad.adnum
-                        AND NOT a.attisdropped
-                    WHERE d.classid = 'pg_attrdef'::regclass AND d.deptype = 'n'
-                      AND d.refclassid IN ('pg_class'::regclass, 'pg_proc'::regclass,
-                                           'pg_type'::regclass,
-                                           'pg_ts_config'::regclass,'pg_ts_dict'::regclass,
-                                           'pg_ts_parser'::regclass,'pg_ts_template'::regclass,
-                                           'pg_operator'::regclass,'pg_opclass'::regclass,'pg_opfamily'::regclass)
-                    """)) {
+            try (PreparedStatement ps = conn.prepareStatement(PgQueries.get("dep_attrdef"))) {
                 ps.setString(1, ns);
                 try (ResultSet rs = ps.executeQuery()) {
                     while (rs.next()) {
@@ -3444,20 +2700,7 @@ public final class PgCatalog {
             // constraints on our tables -> routines, types, the unique
             // constraint backing an FK (a pg_class ref to its index), and
             // other constraints
-            try (PreparedStatement ps = conn.prepareStatement("""
-                    SELECT d.objid AS con, d.refclassid::regclass::text AS refcls,
-                           d.refobjid AS dep
-                    FROM pg_depend d
-                    JOIN pg_constraint co ON co.oid = d.objid
-                    JOIN pg_class cr ON cr.oid = co.conrelid
-                    JOIN pg_namespace cn ON cn.oid = cr.relnamespace AND cn.nspname = ?
-                    WHERE d.classid = 'pg_constraint'::regclass
-                      AND d.refclassid IN ('pg_proc'::regclass, 'pg_type'::regclass,
-                                           'pg_class'::regclass, 'pg_constraint'::regclass,
-                                           'pg_ts_config'::regclass,'pg_ts_dict'::regclass,
-                                           'pg_ts_parser'::regclass,'pg_ts_template'::regclass,
-                                           'pg_operator'::regclass,'pg_opclass'::regclass,'pg_opfamily'::regclass)
-                    """)) {
+            try (PreparedStatement ps = conn.prepareStatement(PgQueries.get("dep_constraint"))) {
                 ps.setString(1, ns);
                 try (ResultSet rs = ps.executeQuery()) {
                     while (rs.next()) {
@@ -3478,28 +2721,7 @@ public final class PgCatalog {
             // domains and ranges -> their base/subtype, canonical and
             // subtype-diff routines; domain check constraints -> the
             // routines, types and relations their expressions use
-            try (PreparedStatement ps = conn.prepareStatement("""
-                    SELECT d.objid AS dom, d.refobjid AS dep
-                    FROM pg_depend d
-                    JOIN pg_type t ON t.oid = d.objid AND t.typtype IN ('d','r')
-                    JOIN pg_namespace n ON n.oid = t.typnamespace AND n.nspname = ?
-                    WHERE d.classid = 'pg_type'::regclass
-                      AND d.refclassid IN ('pg_type'::regclass, 'pg_proc'::regclass,'pg_ts_config'::regclass,'pg_ts_dict'::regclass,
-                                           'pg_ts_parser'::regclass,'pg_ts_template'::regclass,
-                                           'pg_operator'::regclass,'pg_opclass'::regclass,'pg_opfamily'::regclass)
-                    UNION
-                    SELECT c.contypid, d.refobjid
-                    FROM pg_depend d
-                    JOIN pg_constraint c ON c.oid = d.objid AND c.contypid <> 0
-                    JOIN pg_type t ON t.oid = c.contypid
-                    JOIN pg_namespace n ON n.oid = t.typnamespace AND n.nspname = ?
-                    WHERE d.classid = 'pg_constraint'::regclass
-                      AND d.refclassid IN ('pg_proc'::regclass, 'pg_type'::regclass,
-                                           'pg_class'::regclass,
-                                           'pg_ts_config'::regclass,'pg_ts_dict'::regclass,
-                                           'pg_ts_parser'::regclass,'pg_ts_template'::regclass,
-                                           'pg_operator'::regclass,'pg_opclass'::regclass,'pg_opfamily'::regclass)
-                    """)) {
+            try (PreparedStatement ps = conn.prepareStatement(PgQueries.get("dep_type"))) {
                 ps.setString(1, ns);
                 ps.setString(2, ns);
                 try (ResultSet rs = ps.executeQuery()) {
@@ -3510,19 +2732,7 @@ public final class PgCatalog {
             }
             // policies -> the routines, types and relations their
             // USING / WITH CHECK expressions reference
-            try (PreparedStatement ps = conn.prepareStatement("""
-                    SELECT d.objid AS pol, d.refobjid AS dep
-                    FROM pg_depend d
-                    JOIN pg_policy po ON po.oid = d.objid
-                    JOIN pg_class c ON c.oid = po.polrelid
-                    JOIN pg_namespace n ON n.oid = c.relnamespace AND n.nspname = ?
-                    WHERE d.classid = 'pg_policy'::regclass
-                      AND d.refclassid IN ('pg_proc'::regclass, 'pg_type'::regclass,
-                                           'pg_class'::regclass,
-                                           'pg_ts_config'::regclass,'pg_ts_dict'::regclass,
-                                           'pg_ts_parser'::regclass,'pg_ts_template'::regclass,
-                                           'pg_operator'::regclass,'pg_opclass'::regclass,'pg_opfamily'::regclass)
-                    """)) {
+            try (PreparedStatement ps = conn.prepareStatement(PgQueries.get("dep_policy"))) {
                 ps.setString(1, ns);
                 try (ResultSet rs = ps.executeQuery()) {
                     while (rs.next()) {
@@ -3533,19 +2743,7 @@ public final class PgCatalog {
             // column types and collations on our tables -> our domains, enums
             // and collations (objsubid is the column's attnum; a zero objsubid
             // is an object-level edge)
-            try (PreparedStatement ps = conn.prepareStatement("""
-                    SELECT d.objid AS tbl, d.objsubid AS attnum, a.attname AS col,
-                           d.refobjid AS dep
-                    FROM pg_depend d
-                    JOIN pg_class tc ON tc.oid = d.objid
-                    JOIN pg_namespace tn ON tn.oid = tc.relnamespace AND tn.nspname = ?
-                    LEFT JOIN pg_attribute a ON a.attrelid = d.objid AND a.attnum = d.objsubid
-                        AND NOT a.attisdropped
-                    WHERE d.classid = 'pg_class'::regclass AND d.deptype = 'n'
-                      AND d.refclassid IN ('pg_type'::regclass, 'pg_collation'::regclass,'pg_ts_config'::regclass,'pg_ts_dict'::regclass,
-                                           'pg_ts_parser'::regclass,'pg_ts_template'::regclass,
-                                           'pg_operator'::regclass,'pg_opclass'::regclass,'pg_opfamily'::regclass)
-                    """)) {
+            try (PreparedStatement ps = conn.prepareStatement(PgQueries.get("dep_column_type"))) {
                 ps.setString(1, ns);
                 try (ResultSet rs = ps.executeQuery()) {
                     while (rs.next()) {
@@ -3567,14 +2765,7 @@ public final class PgCatalog {
                 }
             }
             // partition children (tables and indexes) -> their parents
-            try (PreparedStatement ps = conn.prepareStatement("""
-                    SELECT d.objid AS child, d.refobjid AS dep
-                    FROM pg_depend d
-                    JOIN pg_class cc ON cc.oid = d.objid
-                    JOIN pg_namespace cn ON cn.oid = cc.relnamespace AND cn.nspname = ?
-                    WHERE d.classid = 'pg_class'::regclass AND d.refclassid = 'pg_class'::regclass
-                      AND d.deptype IN ('a', 'P')
-                    """)) {
+            try (PreparedStatement ps = conn.prepareStatement(PgQueries.get("dep_partition"))) {
                 ps.setString(1, ns);
                 try (ResultSet rs = ps.executeQuery()) {
                     while (rs.next()) {
@@ -3587,23 +2778,7 @@ public final class PgCatalog {
             // block a drop or recreate of what it uses (5.8.3): a rule or an
             // exclusion constraint dies with its table, a cast or a range on
             // our type blocks dropping it, a language blocks its handlers.
-            try (PreparedStatement ps = conn.prepareStatement("""
-                    SELECT d.classid::regclass::text AS cls, d.objid,
-                           d.refclassid::regclass::text AS refcls, d.refobjid AS dep
-                    FROM pg_depend d
-                    WHERE d.classid IN ('pg_type'::regclass,'pg_language'::regclass,
-                                        'pg_rewrite'::regclass,'pg_statistic_ext'::regclass,
-                                        'pg_cast'::regclass,'pg_transform'::regclass,
-                                        'pg_conversion'::regclass,'pg_operator'::regclass,
-                                        'pg_opclass'::regclass,'pg_opfamily'::regclass,
-                                        'pg_ts_config'::regclass,'pg_ts_dict'::regclass,
-                                        'pg_ts_parser'::regclass,'pg_ts_template'::regclass)
-                      AND d.refclassid IN ('pg_class'::regclass,'pg_proc'::regclass,
-                                           'pg_type'::regclass,'pg_collation'::regclass,
-                                           'pg_language'::regclass,'pg_constraint'::regclass,
-                                           'pg_ts_config'::regclass,'pg_ts_dict'::regclass,
-                                           'pg_ts_parser'::regclass,'pg_ts_template'::regclass)
-                    """)) {
+            try (PreparedStatement ps = conn.prepareStatement(PgQueries.get("dep_other"))) {
                 try (ResultSet rs = ps.executeQuery()) {
                     while (rs.next()) {
                         final var map = otherByOid.get(rs.getString("cls"));
@@ -3628,245 +2803,7 @@ public final class PgCatalog {
         }
 
         void loadExternalDependents(Connection conn) throws SQLException {
-            final var sql = """
-                    SELECT DISTINCT d.refobjid AS tgt, rn.nspname AS depns, rc.relname AS depname
-                    FROM pg_depend d
-                    JOIN pg_rewrite r ON r.oid = d.objid
-                    JOIN pg_class rc ON rc.oid = r.ev_class
-                    JOIN pg_namespace rn ON rn.oid = rc.relnamespace
-                    JOIN pg_class tgt ON tgt.oid = d.refobjid
-                    JOIN pg_namespace tn ON tn.oid = tgt.relnamespace AND tn.nspname = ?
-                    WHERE d.classid = 'pg_rewrite'::regclass AND d.refclassid = 'pg_class'::regclass
-                      AND rn.nspname <> ?
-                    UNION
-                    SELECT DISTINCT d.refobjid, rn.nspname, rc.relname
-                    FROM pg_depend d
-                    JOIN pg_constraint co ON co.oid = d.objid
-                    JOIN pg_class rc ON rc.oid = co.conrelid
-                    JOIN pg_namespace rn ON rn.oid = rc.relnamespace
-                    JOIN pg_class tgt ON tgt.oid = d.refobjid
-                    JOIN pg_namespace tn ON tn.oid = tgt.relnamespace AND tn.nspname = ?
-                    WHERE d.classid = 'pg_constraint'::regclass AND d.refclassid = 'pg_class'::regclass
-                      AND rn.nspname <> ?
-                    UNION
-                    SELECT DISTINCT d.refobjid, sn.nspname, sq.relname
-                    FROM pg_depend d
-                    JOIN pg_class sq ON sq.oid = d.objid AND sq.relkind = 'S'
-                    JOIN pg_namespace sn ON sn.oid = sq.relnamespace
-                    JOIN pg_class tgt ON tgt.oid = d.refobjid
-                    JOIN pg_namespace tn ON tn.oid = tgt.relnamespace AND tn.nspname = ?
-                    WHERE d.classid = 'pg_class'::regclass AND d.refclassid = 'pg_class'::regclass
-                      AND d.deptype = 'a' AND sn.nspname <> ?
-                    UNION
-                    SELECT DISTINCT d.refobjid, pn.nspname, p.proname
-                    FROM pg_depend d
-                    JOIN pg_proc p ON p.oid = d.objid
-                    JOIN pg_namespace pn ON pn.oid = p.pronamespace
-                    WHERE d.classid = 'pg_proc'::regclass
-                      AND d.refclassid IN ('pg_class'::regclass, 'pg_proc'::regclass,
-                                           'pg_type'::regclass, 'pg_language'::regclass)
-                      AND pn.nspname <> ?
-                    UNION
-                    SELECT DISTINCT d.refobjid, rn.nspname, rc.relname
-                    FROM pg_depend d
-                    JOIN pg_rewrite r ON r.oid = d.objid
-                    JOIN pg_class rc ON rc.oid = r.ev_class
-                    JOIN pg_namespace rn ON rn.oid = rc.relnamespace
-                    WHERE d.classid = 'pg_rewrite'::regclass
-                      AND d.refclassid IN ('pg_proc'::regclass, 'pg_type'::regclass)
-                      AND rn.nspname <> ?
-                    UNION
-                    SELECT DISTINCT d.refobjid, rn.nspname, rc.relname || '.' || t.tgname
-                    FROM pg_depend d
-                    JOIN pg_trigger t ON t.oid = d.objid
-                    JOIN pg_class rc ON rc.oid = t.tgrelid
-                    JOIN pg_namespace rn ON rn.oid = rc.relnamespace
-                    WHERE d.classid = 'pg_trigger'::regclass
-                      AND d.refclassid = 'pg_proc'::regclass AND rn.nspname <> ?
-                    UNION
-                    SELECT DISTINCT d.refobjid, rn.nspname, rc.relname || '.' || a.attname
-                    FROM pg_depend d
-                    JOIN pg_attrdef ad ON ad.oid = d.objid
-                    JOIN pg_attribute a ON a.attrelid = ad.adrelid AND a.attnum = ad.adnum
-                        AND NOT a.attisdropped
-                    JOIN pg_class rc ON rc.oid = ad.adrelid
-                    JOIN pg_namespace rn ON rn.oid = rc.relnamespace
-                    WHERE d.classid = 'pg_attrdef'::regclass AND d.deptype = 'n'
-                      AND d.refclassid IN ('pg_class'::regclass, 'pg_proc'::regclass,
-                                           'pg_type'::regclass)
-                      AND rn.nspname <> ?
-                    UNION
-                    SELECT DISTINCT d.refobjid, rn.nspname, co.conname
-                    FROM pg_depend d
-                    JOIN pg_constraint co ON co.oid = d.objid
-                    JOIN pg_class rc ON rc.oid = co.conrelid
-                    JOIN pg_namespace rn ON rn.oid = rc.relnamespace
-                    WHERE d.classid = 'pg_constraint'::regclass
-                      AND d.refclassid IN ('pg_proc'::regclass, 'pg_type'::regclass)
-                      AND rn.nspname <> ?
-                    UNION
-                    SELECT DISTINCT d.refobjid, rn.nspname, ic.relname
-                    FROM pg_depend d
-                    JOIN pg_class ic ON ic.oid = d.objid AND ic.relkind = 'i'
-                    JOIN pg_namespace rn ON rn.oid = ic.relnamespace
-                    WHERE d.classid = 'pg_class'::regclass
-                      AND d.refclassid IN ('pg_proc'::regclass, 'pg_type'::regclass)
-                      AND rn.nspname <> ?
-                    UNION
-                    -- columns (objsubid > 0) and typed tables (objsubid = 0) in
-                    -- other namespaces typed by or collated with our objects
-                    SELECT DISTINCT d.refobjid, rn.nspname,
-                           rc.relname || CASE WHEN a.attname IS NULL THEN ''
-                                              ELSE '.' || a.attname END
-                    FROM pg_depend d
-                    JOIN pg_class rc ON rc.oid = d.objid
-                    JOIN pg_namespace rn ON rn.oid = rc.relnamespace AND rn.nspname <> ?
-                    LEFT JOIN pg_attribute a ON a.attrelid = d.objid
-                        AND a.attnum = d.objsubid AND a.attnum > 0
-                        AND NOT a.attisdropped
-                    WHERE d.classid = 'pg_class'::regclass AND d.deptype = 'n'
-                      AND d.refclassid IN ('pg_type'::regclass, 'pg_collation'::regclass)
-                    UNION
-                    -- types (domains, ranges, base types) in other namespaces
-                    -- built on ours or calling our routines in defaults
-                    SELECT DISTINCT d.refobjid, tn.nspname, t.typname
-                    FROM pg_depend d
-                    JOIN pg_type t ON t.oid = d.objid
-                    JOIN pg_namespace tn ON tn.oid = t.typnamespace AND tn.nspname <> ?
-                    WHERE d.classid = 'pg_type'::regclass
-                      AND d.refclassid IN ('pg_type'::regclass, 'pg_proc'::regclass,
-                                           'pg_collation'::regclass)
-                    UNION
-                    -- check constraints on other namespaces' domains whose
-                    -- expressions use our objects
-                    SELECT DISTINCT d.refobjid, dn.nspname,
-                           dt.typname || '.' || c.conname
-                    FROM pg_depend d
-                    JOIN pg_constraint c ON c.oid = d.objid AND c.contypid <> 0
-                    JOIN pg_type dt ON dt.oid = c.contypid
-                    JOIN pg_namespace dn ON dn.oid = dt.typnamespace AND dn.nspname <> ?
-                    WHERE d.classid = 'pg_constraint'::regclass
-                      AND d.refclassid IN ('pg_proc'::regclass, 'pg_type'::regclass,
-                                           'pg_class'::regclass)
-                    UNION
-                    -- policies on other namespaces' tables whose expressions
-                    -- use our objects
-                    SELECT DISTINCT d.refobjid, rn.nspname,
-                           rc.relname || '.' || po.polname
-                    FROM pg_depend d
-                    JOIN pg_policy po ON po.oid = d.objid
-                    JOIN pg_class rc ON rc.oid = po.polrelid
-                    JOIN pg_namespace rn ON rn.oid = rc.relnamespace AND rn.nspname <> ?
-                    WHERE d.classid = 'pg_policy'::regclass
-                      AND d.refclassid IN ('pg_proc'::regclass, 'pg_type'::regclass,
-                                           'pg_class'::regclass)
-                    UNION
-                    -- dependents in other namespaces on our text-search and
-                    -- operator objects — views, column defaults, and the
-                    -- families' own member rows (an external dictionary on our
-                    -- template, an external family member on our operator);
-                    -- no tgt join: byOid resolves in-namespace refs only
-                    SELECT DISTINCT d.refobjid, rn.nspname, rc.relname
-                    FROM pg_depend d
-                    JOIN pg_rewrite r ON r.oid = d.objid
-                    JOIN pg_class rc ON rc.oid = r.ev_class
-                    JOIN pg_namespace rn ON rn.oid = rc.relnamespace AND rn.nspname <> ?
-                    WHERE d.classid = 'pg_rewrite'::regclass
-                      AND d.refclassid IN ('pg_ts_config'::regclass,'pg_ts_dict'::regclass,
-                                           'pg_ts_parser'::regclass,'pg_ts_template'::regclass,
-                                           'pg_operator'::regclass,'pg_opclass'::regclass,
-                                           'pg_opfamily'::regclass)
-                    UNION
-                    SELECT DISTINCT d.refobjid, rn.nspname,
-                           rc.relname || '.' || a.attname
-                    FROM pg_depend d
-                    JOIN pg_attrdef ad ON ad.oid = d.objid
-                    JOIN pg_attribute a ON a.attrelid = ad.adrelid AND a.attnum = ad.adnum
-                        AND NOT a.attisdropped
-                    JOIN pg_class rc ON rc.oid = ad.adrelid
-                    JOIN pg_namespace rn ON rn.oid = rc.relnamespace AND rn.nspname <> ?
-                    WHERE d.classid = 'pg_attrdef'::regclass AND d.deptype = 'n'
-                      AND d.refclassid IN ('pg_ts_config'::regclass,'pg_ts_dict'::regclass,
-                                           'pg_ts_parser'::regclass,'pg_ts_template'::regclass,
-                                           'pg_operator'::regclass,'pg_opclass'::regclass,
-                                           'pg_opfamily'::regclass)
-                    UNION
-                    SELECT DISTINCT d.refobjid, tdn.nspname, td.dictname
-                    FROM pg_depend d
-                    JOIN pg_ts_dict td ON td.oid = d.objid
-                    JOIN pg_namespace tdn ON tdn.oid = td.dictnamespace AND tdn.nspname <> ?
-                    WHERE d.classid = 'pg_ts_dict'::regclass
-                      AND d.refclassid IN ('pg_ts_config'::regclass,'pg_ts_dict'::regclass,
-                                           'pg_ts_parser'::regclass,'pg_ts_template'::regclass)
-                    UNION
-                    -- config mappings record as pg_ts_config -> pg_ts_dict
-                    SELECT DISTINCT d.refobjid, cn.nspname, c.cfgname
-                    FROM pg_depend d
-                    JOIN pg_ts_config c ON c.oid = d.objid
-                    JOIN pg_namespace cn ON cn.oid = c.cfgnamespace AND cn.nspname <> ?
-                    WHERE d.classid = 'pg_ts_config'::regclass
-                      AND d.refclassid IN ('pg_ts_dict'::regclass,'pg_ts_parser'::regclass)
-                    UNION
-                    SELECT DISTINCT d.refobjid, ocn.nspname, oc.opcname
-                    FROM pg_depend d
-                    JOIN pg_opclass oc ON oc.oid = d.objid
-                    JOIN pg_namespace ocn ON ocn.oid = oc.opcnamespace AND ocn.nspname <> ?
-                    WHERE d.classid = 'pg_opclass'::regclass
-                      AND d.refclassid IN ('pg_opfamily'::regclass,'pg_operator'::regclass,
-                                           'pg_type'::regclass)
-                    UNION
-                    SELECT DISTINCT d.refobjid, fn.nspname, f.opfname
-                    FROM pg_depend d
-                    JOIN pg_amop m ON m.oid = d.objid
-                    JOIN pg_opfamily f ON f.oid = m.amopfamily
-                    JOIN pg_namespace fn ON fn.oid = f.opfnamespace AND fn.nspname <> ?
-                    WHERE d.classid = 'pg_amop'::regclass
-                      AND d.refclassid IN ('pg_opfamily'::regclass,'pg_operator'::regclass)
-                    UNION
-                    SELECT DISTINCT d.refobjid, fn.nspname, f.opfname
-                    FROM pg_depend d
-                    JOIN pg_amproc m ON m.oid = d.objid
-                    JOIN pg_opfamily f ON f.oid = m.amprocfamily
-                    JOIN pg_namespace fn ON fn.oid = f.opfnamespace AND fn.nspname <> ?
-                    WHERE d.classid = 'pg_amproc'::regclass
-                      AND d.refclassid IN ('pg_opfamily'::regclass,'pg_proc'::regclass)
-                    UNION
-                    SELECT DISTINCT d.refobjid, ons.nspname, o.oprname
-                    FROM pg_depend d
-                    JOIN pg_operator o ON o.oid = d.objid
-                    JOIN pg_namespace ons ON ons.oid = o.oprnamespace AND ons.nspname <> ?
-                    WHERE d.classid = 'pg_operator'::regclass
-                      AND d.refclassid IN ('pg_operator'::regclass,'pg_proc'::regclass,
-                                           'pg_type'::regclass)
-                    UNION
-                    SELECT DISTINCT d.refobjid, ofn.nspname, of.opfname
-                    FROM pg_depend d
-                    JOIN pg_opfamily of ON of.oid = d.objid
-                    JOIN pg_namespace ofn ON ofn.oid = of.opfnamespace AND ofn.nspname <> ?
-                    WHERE d.classid = 'pg_opfamily'::regclass
-                      AND d.refclassid = 'pg_opfamily'::regclass
-                    UNION
-                    -- casts not anchored to this namespace (by function or by
-                    -- either type — the loadOther anchor rule) that still use
-                    -- our types or routines
-                    SELECT DISTINCT d.refobjid,
-                           coalesce(pn.nspname, sn.nspname, dtn.nspname, '-'),
-                           'cast(' || ca.castsource::regtype::text || ' AS '
-                                  || ca.casttarget::regtype::text || ')'
-                    FROM pg_depend d
-                    JOIN pg_cast ca ON ca.oid = d.objid
-                    LEFT JOIN pg_proc p ON p.oid = ca.castfunc
-                    LEFT JOIN pg_namespace pn ON pn.oid = p.pronamespace
-                    JOIN pg_type st ON st.oid = ca.castsource
-                    JOIN pg_namespace sn ON sn.oid = st.typnamespace
-                    JOIN pg_type tt ON tt.oid = ca.casttarget
-                    JOIN pg_namespace dtn ON dtn.oid = tt.typnamespace
-                    WHERE d.classid = 'pg_cast'::regclass
-                      AND pn.nspname IS DISTINCT FROM ?
-                      AND sn.nspname IS DISTINCT FROM ?
-                      AND dtn.nspname IS DISTINCT FROM ?
-                    """;
-            try (PreparedStatement ps = conn.prepareStatement(sql)) {
+            try (PreparedStatement ps = conn.prepareStatement(PgQueries.get("external_dependents"))) {
                 for (var i = 1; i <= 28; i++) {
                     ps.setString(i, ns);
                 }
@@ -3889,24 +2826,6 @@ public final class PgCatalog {
             }
         }
 
-        /**
-         * SQL for a deterministic rendering of an ACL column: one
-         * {@code grantee:PRIVILEGE[*]} token per distinct entry (PUBLIC for
-         * grantee 0, {@code <owner>} for the object's owner, {@code *} for
-         * grantable), sorted, so grant order cannot cause drift. The
-         * grantor is dropped — who made a grant is provenance, not desired
-         * state: a grant recorded under a different grantor is the same
-         * held privilege, and comparing it would drift forever (a
-         * REVOKE+GRANT pair cannot rename the grantor anyway).
-         */
-        private static String aclTokens(String acl, String owner) {
-            return "(SELECT string_agg(tok, ',' ORDER BY tok) FROM (SELECT DISTINCT"
-                    + " CASE WHEN a.grantee = 0 THEN 'PUBLIC'"
-                    + " WHEN a.grantee = " + owner + " THEN '<owner>'"
-                    + " ELSE a.grantee::regrole::text END || ':' || a.privilege_type ||"
-                    + " CASE WHEN a.is_grantable THEN '*' ELSE '' END AS tok"
-                    + " FROM aclexplode(" + acl + ") a) toks)";
-        }
 
         // ---- helpers ----------------------------------------------------
 

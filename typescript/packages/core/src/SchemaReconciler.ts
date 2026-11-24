@@ -9,6 +9,7 @@ import { Engine } from "./internal/Engine.ts";
 import { registeredDialects } from "./internal/dialects.ts";
 import type { ObjectId } from "./model/ObjectId.ts";
 import type { ReconcilePlan } from "./model/ReconcilePlan.ts";
+import { RenameHint } from "./model/RenameHint.ts";
 import type { Dialect } from "./spi/Dialect.ts";
 import type { SqlDataSource } from "./spi/Sql.ts";
 
@@ -54,6 +55,18 @@ export class SchemaReconciler {
     }
 
     /**
+     * Applies a plan serialised by {@link ReconcilePlan.toJson} — the
+     * machine-readable counterpart of {@link apply}. Fails on invalid
+     * JSON or when the target changed since the plan was issued.
+     */
+    applyJson(serializedPlan: string): Promise<ReconcileReport> {
+        if (serializedPlan == null) {
+            throw new TypeError("serializedPlan is required");
+        }
+        return this.engine.applyJson(serializedPlan);
+    }
+
+    /**
      * Reads the target namespace under the namespace lock and renders it as
      * a namespace-neutral desired-state script — the bootstrap path of spec
      * 3.1. Requires no {@code desiredState}; the target is never mutated.
@@ -75,6 +88,8 @@ export class Builder {
     private statementTimeout_: Duration | undefined;
     private listener_: ReconcileListener = {};
     private objectFilter_: (id: ObjectId) => boolean = () => true;
+    private concurrentIndexes_ = false;
+    private renameHints_: RenameHint[] = [];
 
     dataSource(dataSource: SqlDataSource): this {
         if (dataSource == null) {
@@ -183,6 +198,27 @@ export class Builder {
     }
 
     /**
+     * Renders index creates/drops in their concurrent, non-transactional
+     * form where the dialect supports it (PostgreSQL: `CREATE INDEX
+     * CONCURRENTLY` outside a transaction, spec 5.6). Default `false`.
+     */
+    concurrentIndexes(enabled: boolean): this {
+        this.concurrentIndexes_ = enabled;
+        return this;
+    }
+
+    /**
+     * Declares that {@code from} was renamed to {@code to} — the same
+     * hint the `-- @reconciler rename` script directive gives. An active
+     * hint turns the UNEXPECTED(from)/MISSING(to) pair into an
+     * `ALTER ... RENAME` change instead of a drop+create (spec 5.5.1).
+     */
+    rename(from: ObjectId, to: ObjectId): this {
+        this.renameHints_.push(new RenameHint(from, to));
+        return this;
+    }
+
+    /**
      * Validates required properties and, when no dialect is set, that at
      * least one dialect is registered ({@link registerDialect}). Opens no
      * connection: dialect selection happens on first use (spec 3.1, 3.4).
@@ -209,6 +245,7 @@ export class Builder {
         return new SchemaReconciler(new Engine(
                 this.dataSource_, this.scratchDataSource_, this.targetNamespace_,
                 this.desiredState_, this.dialect_, this.policy_, this.lockTimeout_,
-                this.statementTimeout_, this.listener_, this.objectFilter_));
+                this.statementTimeout_, this.listener_, this.objectFilter_,
+                this.concurrentIndexes_, this.renameHints_));
     }
 }

@@ -29,6 +29,7 @@ import studio.epicquest.schema.reconciler.postgresql.internal.PgScriptCheck;
 import studio.epicquest.schema.reconciler.postgresql.internal.PgSql;
 import studio.epicquest.schema.reconciler.spi.Dialect;
 import studio.epicquest.schema.reconciler.spi.DialectCapabilities;
+import studio.epicquest.schema.reconciler.spi.RenderOptions;
 
 /**
  * The PostgreSQL dialect of spec Appendix A — the reference implementation.
@@ -264,6 +265,19 @@ public final class PostgreSqlDialect implements Dialect {
     public List<PlannedChange> render(Difference difference, SchemaSnapshot desired,
                                       String targetNamespace) {
         return PgRender.render(difference, desired, targetNamespace);
+    }
+
+    @Override
+    public List<PlannedChange> render(Difference difference, SchemaSnapshot snapshot,
+                                      String targetNamespace, RenderOptions options) {
+        return PgRender.render(difference, snapshot, targetNamespace, options);
+    }
+
+    @Override
+    public List<PlannedChange> renderRename(ObjectId from, ObjectId to,
+                                            SchemaSnapshot actual, SchemaSnapshot desired,
+                                            String targetNamespace) {
+        return PgRender.renderRename(from, to, actual, desired, targetNamespace);
     }
 
     @Override

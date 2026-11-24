@@ -22,6 +22,24 @@ export const PlanRenderer = {
             if (change.isManual) {
                 out.push(" MANUAL");
             }
+            const hazard = change.hazard;
+            if (change.nonTransactional || !hazard.isTrivial) {
+                const parts: string[] = [];
+                if (hazard.lockLevel !== "NONE") {
+                    parts.push("lock " + hazard.lockLevel);
+                }
+                if (hazard.rewritesTable) {
+                    parts.push("rewrites table");
+                }
+                if (hazard.validatesRows) {
+                    parts.push("validates rows");
+                }
+                if (change.nonTransactional) {
+                    parts.push("non-transactional");
+                }
+                parts.push(...hazard.notes);
+                out.push("; hazard: " + parts.join("; "));
+            }
             out.push("\n");
             out.push("-- " + change.reason + "\n");
             for (const statement of change.statements) {

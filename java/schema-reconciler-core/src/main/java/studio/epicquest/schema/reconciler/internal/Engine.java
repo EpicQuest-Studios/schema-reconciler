@@ -34,10 +34,13 @@ import studio.epicquest.schema.reconciler.model.Definition;
 import studio.epicquest.schema.reconciler.model.Difference;
 import studio.epicquest.schema.reconciler.model.DifferenceType;
 import studio.epicquest.schema.reconciler.model.ObjectId;
+import studio.epicquest.schema.reconciler.model.ChangeAction;
 import studio.epicquest.schema.reconciler.model.PlannedChange;
 import studio.epicquest.schema.reconciler.model.ReconcilePlan;
+import studio.epicquest.schema.reconciler.model.RenameHint;
 import studio.epicquest.schema.reconciler.model.SchemaSnapshot;
 import studio.epicquest.schema.reconciler.spi.Dialect;
+import studio.epicquest.schema.reconciler.spi.RenderOptions;
 
 /**
  * The shared step machine of spec 5.1 behind {@code plan()}, {@code reconcile()}
@@ -106,14 +109,27 @@ public final class Engine {
     private final Duration statementTimeout;
     private final ReconcileListener listener;
     private final Predicate<ObjectId> objectFilter;
+    private final boolean concurrentIndexes;
+    private final List<RenameHint> renameHints;
     private final DialectResolver resolver;
     private final Map<IdentityKey, PlanMeta> planMeta = new HashMap<>();
     private final ReferenceQueue<ReconcilePlan> collectedPlans = new ReferenceQueue<>();
+    private List<RenameHint> scriptHints = List.of();
 
     public Engine(DataSource dataSource, DataSource scratchDataSource, String namespace,
                   DesiredState desiredState, Dialect dialect, ReconcilePolicy policy,
                   Duration lockTimeout, Duration statementTimeout,
                   ReconcileListener listener, Predicate<ObjectId> objectFilter) {
+        this(dataSource, scratchDataSource, namespace, desiredState, dialect,
+                policy, lockTimeout, statementTimeout, listener, objectFilter,
+                false, List.of());
+    }
+
+    public Engine(DataSource dataSource, DataSource scratchDataSource, String namespace,
+                  DesiredState desiredState, Dialect dialect, ReconcilePolicy policy,
+                  Duration lockTimeout, Duration statementTimeout,
+                  ReconcileListener listener, Predicate<ObjectId> objectFilter,
+                  boolean concurrentIndexes, List<RenameHint> renameHints) {
         this.dataSource = dataSource;
         this.scratchDataSource = scratchDataSource;
         this.namespace = namespace;
@@ -123,6 +139,8 @@ public final class Engine {
         this.statementTimeout = statementTimeout;
         this.listener = listener;
         this.objectFilter = objectFilter;
+        this.concurrentIndexes = concurrentIndexes;
+        this.renameHints = renameHints;
         this.resolver = new DialectResolver(dialect);
     }
 
@@ -216,7 +234,7 @@ public final class Engine {
                     new PolicyEvaluator(session.dialect, policy)
                             .evaluate(built.plan(), actual, desired);
             final var outcome = applyAndVerify(session, built.plan(), evaluation,
-                    built.coveredByParent(), clock);
+                    built.coveredByParent(), clock, desired);
             session.commit();
             final var unexpected = unexpected(built.plan());
             final var unsupported = unsupported(built.plan());
@@ -276,7 +294,8 @@ public final class Engine {
                             .orElseGet(() -> PlanBuilder.coverageOf(
                                     session.dialect, namespace, plan.differences(),
                                     plan.changes(), desired));
-            final var outcome = applyAndVerify(session, plan, evaluation, covered, clock);
+            final var outcome = applyAndVerify(session, plan, evaluation, covered, clock,
+                    desired);
             session.commit();
             final var unexpected = unexpected(plan);
             final var unsupported = unsupported(plan);
@@ -333,36 +352,38 @@ public final class Engine {
     private record RunOutcome(ReconcileOutcome outcome, List<PlannedChange> applied,
                               List<PlannedChange> reported) { }
 
+    /** Spec 3.1 {@code applyJson()}: applies a plan serialised by {@code toJson()}. */
+    public ReconcileReport applyJson(String serializedPlan) {
+        return apply(ReconcilePlan.fromJson(serializedPlan));
+    }
+
     private RunOutcome applyAndVerify(Session session, ReconcilePlan plan,
                                       PolicyEvaluator.Evaluation evaluation,
                                       Map<ObjectId, Map<ObjectId, Definition>> coveredByParent,
-                                      PhaseClock clock) {
+                                      PhaseClock clock, SchemaSnapshot desired) {
         final var applied = new ArrayList<PlannedChange>();
         final var reported = new ArrayList<PlannedChange>();
+        // non-transactional APPLY changes (CREATE INDEX CONCURRENTLY and
+        // friends) run in a second phase, after the transactional work
+        // verifies and commits
+        final var deferred = new ArrayList<PlannedChange>();
         session.bindNamespace();
         final var applyStart = clock.now();
         try {
             for (var change : plan.changes()) {
                 if (evaluation.decisions().get(change) == Decision.APPLY) {
-                    notifyApplying(change, applied);
-                    final var t0 = System.nanoTime();
-                    for (final var sql : change.statements()) {
-                        try {
-                            session.execute(sql);
-                        } catch (SQLException e) {
-                            throw new ApplyException("namespace '" + namespace + "': change "
-                                    + change.order() + " failed: " + e.getMessage(), e,
-                                    List.copyOf(applied), change);
-                        }
+                    if (change.nonTransactional()) {
+                        deferred.add(change);
+                        continue;
                     }
-                    applied.add(change);
-                    notifyApplied(change, Duration.ofNanos(System.nanoTime() - t0), applied);
+                    executeChange(session, change, applied);
                 } else {
                     final var blocker = evaluation.demotedBy().get(change);
                     if (blocker != null) {
                         change = new PlannedChange(change.order(), change.target(), change.action(),
                                 change.safety(), change.statements(), change.expected(),
-                                change.reason() + " (blocked by " + blocker + ")");
+                                change.reason() + " (blocked by " + blocker + ")",
+                                change.nonTransactional(), change.hazard());
                     }
                     reported.add(change);
                     LOG.log(System.Logger.Level.WARNING,
@@ -377,9 +398,32 @@ public final class Engine {
         }
         final var verifyStart = clock.now();
         try {
-            verify(session, applied, coveredByParent);
+            verify(session, applied, coveredByParent, desired);
         } finally {
             clock.verify = clock.since(verifyStart);
+        }
+        if (!deferred.isEmpty()) {
+            // commit the transactional work first: a non-transactional
+            // statement cannot run inside a transaction
+            session.commit();
+            session.autoCommit(true);
+            final var phase1Count = applied.size();
+            try {
+                for (final var change : deferred) {
+                    executeChange(session, change, applied);
+                }
+            } finally {
+                // restore the transactional session mode before the
+                // outer commit/close handling
+                session.autoCommit(false);
+            }
+            final var deferredVerifyStart = clock.now();
+            try {
+                verify(session, applied.subList(phase1Count, applied.size()),
+                        coveredByParent, desired);
+            } finally {
+                clock.verify = clock.verify.plus(clock.since(deferredVerifyStart));
+            }
         }
         final var outcome = applied.isEmpty()
                 ? (plan.changes().isEmpty() ? ReconcileOutcome.UP_TO_DATE
@@ -388,17 +432,41 @@ public final class Engine {
         return new RunOutcome(outcome, List.copyOf(applied), List.copyOf(reported));
     }
 
+    private void executeChange(Session session, PlannedChange change,
+                               List<PlannedChange> applied) {
+        notifyApplying(change, applied);
+        final var t0 = System.nanoTime();
+        for (final var sql : change.statements()) {
+            try {
+                session.execute(sql);
+            } catch (SQLException e) {
+                throw new ApplyException("namespace '" + namespace + "': change "
+                        + change.order() + " failed: " + e.getMessage(), e,
+                        List.copyOf(applied), change);
+            }
+        }
+        applied.add(change);
+        notifyApplied(change, Duration.ofNanos(System.nanoTime() - t0), applied);
+    }
+
     private void verify(Session session, List<PlannedChange> applied,
-                        Map<ObjectId, Map<ObjectId, Definition>> coveredByParent) {
+                        Map<ObjectId, Map<ObjectId, Definition>> coveredByParent,
+                        SchemaSnapshot desired) {
         final var expectations = new LinkedHashMap<ObjectId, Definition>();
+        final var droppedTargets = new ArrayList<ObjectId>();
         for (final var change : applied) {
             change.expected().ifPresent(d -> expectations.put(change.target(), d));
+            if (change.action() == ChangeAction.DROP
+                    && !desired.objects().containsKey(change.target())) {
+                // a standalone (pruning) DROP — the target must be gone
+                droppedTargets.add(change.target());
+            }
             final var covered = coveredByParent.get(change.target());
             if (covered != null) {
                 expectations.putAll(covered);
             }
         }
-        if (expectations.isEmpty()) {
+        if (expectations.isEmpty() && droppedTargets.isEmpty()) {
             return;
         }
         final var after = session.readActual();
@@ -413,6 +481,13 @@ public final class Engine {
                         Optional.of(expected), Optional.of(object.definition())));
             }
         });
+        for (final var id : droppedTargets) {
+            final var object = after.objects().get(id);
+            if (object != null) {
+                remaining.add(new Difference(id, DifferenceType.UNEXPECTED,
+                        Optional.empty(), Optional.of(object.definition())));
+            }
+        }
         if (!remaining.isEmpty()) {
             throw new VerificationException("namespace '" + namespace + "': " + remaining.size()
                     + " object(s) did not converge after apply: " + remaining.stream()
@@ -473,7 +548,12 @@ public final class Engine {
 
     private PlanBuilder.Built buildPlan(Session session, SchemaSnapshot actual, SchemaSnapshot desired) {
         final var differences = Differ.diff(actual, desired, session.dialect);
-        return new PlanBuilder(session.dialect, namespace, actual, desired).build(differences);
+        final var hints = new ArrayList<RenameHint>(renameHints.size() + scriptHints.size());
+        hints.addAll(renameHints);
+        hints.addAll(scriptHints);
+        return new PlanBuilder(session.dialect, namespace, actual, desired,
+                policy.prune(), hints, new RenderOptions(concurrentIndexes, Map.of()))
+                .build(differences);
     }
 
     private SchemaSnapshot loadDesired(Session session) {
@@ -515,6 +595,7 @@ public final class Engine {
             try {
                 ScriptProcessor processor =
                         new ScriptProcessor(desiredState.script(), namespace, scratchNamespace, session.dialect);
+                this.scriptHints = processor.renameHints();
                 if (!processor.hasPlaceholder()
                         && !session.dialect.capabilities().sessionDefaultNamespace()) {
                     throw new DesiredStateException("namespace '" + namespace
@@ -725,6 +806,19 @@ public final class Engine {
             } catch (SQLException e) {
                 throw new SchemaReconcilerException(
                         "namespace '" + namespace + "': commit failed", e);
+            }
+        }
+
+        /** Switches the connection's auto-commit mode for the non-transactional phase. */
+        void autoCommit(boolean on) {
+            try {
+                if (conn.getAutoCommit() != on) {
+                    conn.setAutoCommit(on);
+                }
+            } catch (SQLException e) {
+                throw new SchemaReconcilerException(
+                        "namespace '" + namespace + "': could not switch auto-commit for the"
+                                + " non-transactional phase", e);
             }
         }
 

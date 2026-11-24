@@ -17,12 +17,14 @@ import { StalePlanException } from "../StalePlanException.ts";
 import { TimedPlan } from "../TimedPlan.ts";
 import { VerificationException } from "../VerificationException.ts";
 import type { Definition } from "../model/Definition.ts";
+import { ChangeAction } from "../model/ChangeAction.ts";
 import { Difference } from "../model/Difference.ts";
 import { DifferenceType } from "../model/DifferenceType.ts";
 import type { ObjectId } from "../model/ObjectId.ts";
 import { ObjectMap } from "../model/ObjectMap.ts";
 import { PlannedChange } from "../model/PlannedChange.ts";
-import type { ReconcilePlan } from "../model/ReconcilePlan.ts";
+import { ReconcilePlan } from "../model/ReconcilePlan.ts";
+import type { RenameHint } from "../model/RenameHint.ts";
 import type { SchemaSnapshot } from "../model/SchemaSnapshot.ts";
 import type { Dialect } from "../spi/Dialect.ts";
 import type { SqlConnection, SqlDataSource } from "../spi/Sql.ts";
@@ -73,6 +75,9 @@ export class Engine {
     private readonly statementTimeout: Duration | undefined;
     private readonly listener: ReconcileListener;
     private readonly objectFilter: (id: ObjectId) => boolean;
+    private readonly concurrentIndexes: boolean;
+    private readonly renameHints: readonly RenameHint[];
+    private scriptHints: readonly RenameHint[] = [];
 
     constructor(dataSource: SqlDataSource,
                 scratchDataSource: SqlDataSource | undefined,
@@ -83,7 +88,9 @@ export class Engine {
                 lockTimeout: Duration,
                 statementTimeout: Duration | undefined,
                 listener: ReconcileListener,
-                objectFilter: (id: ObjectId) => boolean) {
+                objectFilter: (id: ObjectId) => boolean,
+                concurrentIndexes = false,
+                renameHints: readonly RenameHint[] = []) {
         this.dataSource = dataSource;
         this.scratchDataSource = scratchDataSource;
         this.namespace = namespace;
@@ -93,6 +100,8 @@ export class Engine {
         this.statementTimeout = statementTimeout;
         this.listener = listener;
         this.objectFilter = objectFilter;
+        this.concurrentIndexes = concurrentIndexes;
+        this.renameHints = renameHints;
         this.resolver = new DialectResolver(dialect);
     }
 
@@ -193,7 +202,7 @@ export class Engine {
                     new PolicyEvaluator(session.dialect, this.policy)
                             .evaluate(built.plan, actual, desired);
             const outcome = await this.applyAndVerify(session, built.plan, evaluation,
-                    built.coveredByParent, clock);
+                    built.coveredByParent, clock, desired);
             await session.commit();
             const unexpected = this.unexpected(built.plan);
             const unsupported = this.unsupported(built.plan);
@@ -260,7 +269,7 @@ export class Engine {
                             session.dialect, this.namespace, plan.differences, desired,
                             plan.changes);
             const outcome = await this.applyAndVerify(session, plan, evaluation,
-                    covered, clock);
+                    covered, clock, desired);
             await session.commit();
             const unexpected = this.unexpected(plan);
             const unsupported = this.unsupported(plan);
@@ -304,34 +313,30 @@ export class Engine {
     private async applyAndVerify(session: Session, plan: ReconcilePlan,
                                  evaluation: Evaluation,
                                  coveredByParent: ObjectMap<ObjectMap<Definition>>,
-                                 clock: PhaseClock): Promise<RunOutcome> {
+                                 clock: PhaseClock, desired: SchemaSnapshot): Promise<RunOutcome> {
         const applied: PlannedChange[] = [];
         const reported: PlannedChange[] = [];
+        // non-transactional APPLY changes (CREATE INDEX CONCURRENTLY and
+        // friends) run in a second phase, after the transactional work
+        // verifies and commits
+        const deferred: PlannedChange[] = [];
         await session.bindNamespace();
         const applyStart = clock.now();
         try {
             for (let change of plan.changes) {
                 if (evaluation.decisions.get(change) === Decision.APPLY) {
-                    await this.notifyApplying(change, applied);
-                    const t0 = performance.now();
-                    for (const sql of change.statements) {
-                        try {
-                            await session.execute(sql);
-                        } catch (e) {
-                            throw new ApplyException("namespace '" + this.namespace
-                                    + "': change " + change.order + " failed: " + messageOf(e),
-                                    [...applied], change, e);
-                        }
+                    if (change.nonTransactional) {
+                        deferred.push(change);
+                        continue;
                     }
-                    applied.push(change);
-                    await this.notifyApplied(change,
-                            Duration.ofMillis(performance.now() - t0), applied);
+                    await this.executeChange(session, change, applied);
                 } else {
                     const blocker = evaluation.demotedBy.get(change);
                     if (blocker !== undefined) {
                         change = new PlannedChange(change.order, change.target, change.action,
                                 change.safety, change.statements, change.expected,
-                                change.reason + " (blocked by " + blocker + ")");
+                                change.reason + " (blocked by " + blocker + ")",
+                                change.nonTransactional, change.hazard);
                     }
                     reported.push(change);
                     warn("namespace '" + this.namespace + "': change " + change.order
@@ -345,9 +350,33 @@ export class Engine {
         }
         const verifyStart = clock.now();
         try {
-            await this.verify(session, applied, coveredByParent);
+            await this.verify(session, applied, coveredByParent, desired);
         } finally {
             clock.verify = clock.since(verifyStart);
+        }
+        if (deferred.length > 0) {
+            // commit the transactional work first: a non-transactional
+            // statement cannot run inside a transaction
+            await session.commit();
+            await session.autoCommit(true);
+            const phase1Count = applied.length;
+            try {
+                for (const change of deferred) {
+                    await this.executeChange(session, change, applied);
+                }
+            } finally {
+                // restore the transactional session mode before the
+                // outer commit/close handling
+                await session.autoCommit(false);
+            }
+            const deferredVerifyStart = clock.now();
+            try {
+                await this.verify(session, applied.slice(phase1Count),
+                        coveredByParent, desired);
+            } finally {
+                clock.verify = Duration.ofMillis(
+                        clock.verify.toMillis() + clock.since(deferredVerifyStart).toMillis());
+            }
         }
         const outcome = applied.length === 0
                 ? (plan.changes.length === 0 ? ReconcileOutcome.UP_TO_DATE
@@ -356,12 +385,36 @@ export class Engine {
         return { outcome, applied, reported };
     }
 
+    private async executeChange(session: Session, change: PlannedChange,
+                                applied: PlannedChange[]): Promise<void> {
+        await this.notifyApplying(change, applied);
+        const t0 = performance.now();
+        for (const sql of change.statements) {
+            try {
+                await session.execute(sql);
+            } catch (e) {
+                throw new ApplyException("namespace '" + this.namespace
+                        + "': change " + change.order + " failed: " + messageOf(e),
+                        [...applied], change, e);
+            }
+        }
+        applied.push(change);
+        await this.notifyApplied(change,
+                Duration.ofMillis(performance.now() - t0), applied);
+    }
+
     private async verify(session: Session, applied: readonly PlannedChange[],
-                         coveredByParent: ObjectMap<ObjectMap<Definition>>): Promise<void> {
+                         coveredByParent: ObjectMap<ObjectMap<Definition>>,
+                         desired: SchemaSnapshot): Promise<void> {
         const expectations = new ObjectMap<Definition>();
+        const droppedTargets: ObjectId[] = [];
         for (const change of applied) {
             if (change.expected !== undefined) {
                 expectations.set(change.target, change.expected);
+            }
+            if (change.action === ChangeAction.DROP && !desired.objects.has(change.target)) {
+                // a standalone (pruning) DROP — the target must be gone
+                droppedTargets.push(change.target);
             }
             const covered = coveredByParent.get(change.target);
             if (covered !== undefined) {
@@ -370,7 +423,7 @@ export class Engine {
                 }
             }
         }
-        if (expectations.size === 0) {
+        if (expectations.size === 0 && droppedTargets.length === 0) {
             return;
         }
         const after = await session.readActual();
@@ -383,6 +436,12 @@ export class Engine {
             } else if (!object.definition.equals(expected)) {
                 remaining.push(new Difference(id, DifferenceType.DRIFTED,
                         expected, object.definition));
+            }
+        }
+        for (const id of droppedTargets) {
+            if (after.objects.has(id)) {
+                remaining.push(new Difference(id, DifferenceType.UNEXPECTED,
+                        undefined, after.objects.get(id)!.definition));
             }
         }
         if (remaining.length > 0) {
@@ -439,9 +498,16 @@ export class Engine {
         }
     }
 
+    /** Spec 3.1 {@code applyJson()}: applies a plan serialised by {@code toJson()}. */
+    async applyJson(serializedPlan: string): Promise<ReconcileReport> {
+        return this.apply(ReconcilePlan.fromJson(serializedPlan));
+    }
+
     private buildPlan(session: Session, actual: SchemaSnapshot, desired: SchemaSnapshot): Built {
         const differences = Differ.diff(actual, desired, session.dialect);
-        return new PlanBuilder(session.dialect, this.namespace, actual, desired).build(differences);
+        return new PlanBuilder(session.dialect, this.namespace, actual, desired,
+                this.policy.prune, [...this.renameHints, ...this.scriptHints],
+                { concurrentIndexes: this.concurrentIndexes }).build(differences);
     }
 
     private async loadDesired(session: Session): Promise<SchemaSnapshot> {
@@ -487,6 +553,7 @@ export class Engine {
                 const processor =
                         new ScriptProcessor(this.desiredState!.script, this.namespace,
                                 scratchNamespace, session.dialect);
+                this.scriptHints = processor.renameHints;
                 if (!processor.hasPlaceholder
                         && !session.dialect.capabilities().sessionDefaultNamespace) {
                     throw new DesiredStateException("namespace '" + this.namespace
@@ -775,6 +842,20 @@ class Session {
         } catch (e) {
             throw new SchemaReconcilerException(
                     "namespace '" + this.config.namespace + "': commit failed", e);
+        }
+    }
+
+    /** Switches the connection's auto-commit mode for the non-transactional phase. */
+    async autoCommit(on: boolean): Promise<void> {
+        try {
+            if (this.conn.getAutoCommit() !== on) {
+                await this.conn.setAutoCommit(on);
+            }
+        } catch (e) {
+            throw new SchemaReconcilerException(
+                    "namespace '" + this.config.namespace
+                            + "': could not switch auto-commit for the"
+                            + " non-transactional phase", e);
         }
     }
 

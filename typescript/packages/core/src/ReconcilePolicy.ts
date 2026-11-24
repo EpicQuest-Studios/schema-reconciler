@@ -21,10 +21,13 @@ export class ReconcilePolicy {
     readonly destructive: Decision;
     readonly unsupported: Decision;
     readonly unsupportedCategories: ReadonlyMap<string, Decision>;
+    /** Opt-in deletion of objects absent from the desired state (spec 5.5). */
+    readonly prune: boolean;
 
     constructor(additive: Decision, rebuild: Decision, destructive: Decision,
                 unsupported: Decision,
-                unsupportedCategories?: ReadonlyMap<string, Decision>) {
+                unsupportedCategories?: ReadonlyMap<string, Decision>,
+                prune = false) {
         for (const [name, v] of Object.entries({ additive, rebuild, destructive, unsupported })) {
             if (v == null) {
                 throw new TypeError(name + " is required");
@@ -44,6 +47,7 @@ export class ReconcilePolicy {
         this.destructive = destructive;
         this.unsupported = unsupported;
         this.unsupportedCategories = categories;
+        this.prune = prune;
         Object.freeze(this);
     }
 
@@ -58,22 +62,22 @@ export class ReconcilePolicy {
 
     withAdditive(decision: Decision): ReconcilePolicy {
         return new ReconcilePolicy(decision, this.rebuild, this.destructive,
-                this.unsupported, this.unsupportedCategories);
+                this.unsupported, this.unsupportedCategories, this.prune);
     }
 
     withRebuild(decision: Decision): ReconcilePolicy {
         return new ReconcilePolicy(this.additive, decision, this.destructive,
-                this.unsupported, this.unsupportedCategories);
+                this.unsupported, this.unsupportedCategories, this.prune);
     }
 
     withDestructive(decision: Decision): ReconcilePolicy {
         return new ReconcilePolicy(this.additive, this.rebuild, decision,
-                this.unsupported, this.unsupportedCategories);
+                this.unsupported, this.unsupportedCategories, this.prune);
     }
 
     withUnsupported(decision: Decision): ReconcilePolicy {
         return new ReconcilePolicy(this.additive, this.rebuild, this.destructive,
-                decision, this.unsupportedCategories);
+                decision, this.unsupportedCategories, this.prune);
     }
 
     /** Overrides the {@code unsupported} decision for one difference category. */
@@ -87,7 +91,13 @@ export class ReconcilePolicy {
         const categories = new Map(this.unsupportedCategories);
         categories.set(category, decision);
         return new ReconcilePolicy(this.additive, this.rebuild, this.destructive,
-                this.unsupported, categories);
+                this.unsupported, categories, this.prune);
+    }
+
+    /** Opt-in deletion of {@code UNEXPECTED} objects (spec 5.5). */
+    withPrune(prune: boolean): ReconcilePolicy {
+        return new ReconcilePolicy(this.additive, this.rebuild, this.destructive,
+                this.unsupported, this.unsupportedCategories, prune);
     }
 
     /** The decision governing a change of the given safety class. */

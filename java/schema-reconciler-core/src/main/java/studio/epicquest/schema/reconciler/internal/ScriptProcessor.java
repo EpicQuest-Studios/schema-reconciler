@@ -1,14 +1,17 @@
 package studio.epicquest.schema.reconciler.internal;
 
+import java.util.List;
 import java.util.Locale;
 import java.util.regex.Pattern;
 import studio.epicquest.schema.reconciler.DesiredStateException;
+import studio.epicquest.schema.reconciler.model.RenameHint;
 import studio.epicquest.schema.reconciler.spi.Dialect;
 
 /**
  * Prepares the desired script for execution in the scratch namespace (spec 3.2):
- * the literal-target scan (rule 5), the quoted-placeholder rejection, and the
- * {@code ${namespace}} substitution with {@code $${namespace}} escaping.
+ * the literal-target scan (rule 5), the quoted-placeholder rejection, the
+ * {@code ${namespace}} substitution with {@code $${namespace}} escaping,
+ * and the {@code -- @reconciler rename} directive harvest.
  */
 public final class ScriptProcessor {
 
@@ -17,6 +20,7 @@ public final class ScriptProcessor {
 
     private final String substituted;
     private final boolean hasPlaceholder;
+    private final List<RenameHint> renameHints;
 
     /**
      * @param script the raw script
@@ -50,6 +54,7 @@ public final class ScriptProcessor {
         }
         this.substituted = out.toString().replace("\0", TOKEN);
         this.hasPlaceholder = found;
+        this.renameHints = RenameHints.parse(script);
     }
 
     /** The script with every placeholder replaced by the quoted scratch namespace. */
@@ -60,6 +65,11 @@ public final class ScriptProcessor {
     /** Whether the script contained at least one {@code ${namespace}} placeholder. */
     public boolean hasPlaceholder() {
         return hasPlaceholder;
+    }
+
+    /** The {@code -- @reconciler rename} directives found in the script (spec 5.5.1). */
+    public List<RenameHint> renameHints() {
+        return renameHints;
     }
 
     /**

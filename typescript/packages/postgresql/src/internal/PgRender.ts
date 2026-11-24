@@ -1,6 +1,7 @@
 import { PlanningException } from "@epicquest-studios/schema-reconciler-core";
 import { ChangeAction, ChangeSafety, Definition } from "@epicquest-studios/schema-reconciler-core";
-import type { Difference, ObjectId } from "@epicquest-studios/schema-reconciler-core";
+import { ChangeHazard, LockLevel } from "@epicquest-studios/schema-reconciler-core";
+import type { Difference, ObjectId, RenderOptions } from "@epicquest-studios/schema-reconciler-core";
 import { ObjectIds, ObjectKind, PlannedChange } from "@epicquest-studios/schema-reconciler-core";
 import type { SchemaObject, SchemaSnapshot } from "@epicquest-studios/schema-reconciler-core";
 import * as PgCatalog from "./PgCatalog.ts";
@@ -9,15 +10,33 @@ import * as PgSql from "./PgSql.ts";
 
 const TOKEN = "${namespace}";
 
-export function render(difference: Difference, desired: SchemaSnapshot,
-        targetNamespace: string): PlannedChange[] {
+/** Full-table lock of a DROP/recreate or a destructive ALTER. */
+const LOCK_EXCLUSIVE = new ChangeHazard(LockLevel.ACCESS_EXCLUSIVE, false, false);
+/** `SHARE ROW EXCLUSIVE` — constraint/index adds that still allow writes. */
+const LOCK_ROW_EXCLUSIVE = new ChangeHazard(LockLevel.SHARE_ROW_EXCLUSIVE, false, false);
+/** A CHECK/FOREIGN KEY add scans existing rows to validate them. */
+const VALIDATES = new ChangeHazard(LockLevel.SHARE_ROW_EXCLUSIVE, false, true);
+/** `CREATE INDEX` (plain) — SHARE on the table: reads pass, writes block. */
+const INDEX_BUILD = new ChangeHazard(LockLevel.SHARE, false, false);
+/** `CREATE/DROP INDEX CONCURRENTLY` — SHARE UPDATE EXCLUSIVE, off-transaction. */
+const INDEX_CONCURRENT = new ChangeHazard(LockLevel.SHARE_UPDATE_EXCLUSIVE, false, false);
+/** An `ALTER COLUMN TYPE` whose cast is not binary-compatible rewrites the table. */
+const REWRITES = new ChangeHazard(LockLevel.ACCESS_EXCLUSIVE, true, false);
+
+export function render(difference: Difference, snapshot: SchemaSnapshot,
+        targetNamespace: string, options?: RenderOptions): PlannedChange[] {
     const id = difference.id;
-    const want = desired.objects.get(id)!;
+    const want = snapshot.objects.get(id)!;
     switch (difference.type) {
         case "MISSING":
-            return missing(id, want, desired, targetNamespace);
+            return missing(id, want, snapshot, targetNamespace, options);
         case "DRIFTED":
-            return drifted(id, want, difference, desired, targetNamespace);
+            return drifted(id, want, difference, snapshot, targetNamespace, options);
+        // under a pruning policy the second parameter is the ACTUAL
+        // snapshot (spec 5.5): the unexpected object's drop fragments
+        // live there — nothing desired exists to read
+        case "UNEXPECTED":
+            return unexpected(id, want, snapshot, targetNamespace, options);
         default:
             throw new PlanningException("difference " + difference.id
                     + " of type " + difference.type + " is not renderable");
@@ -27,7 +46,8 @@ export function render(difference: Difference, desired: SchemaSnapshot,
 // ---- MISSING ---------------------------------------------------------
 
 function missing(id: ObjectId, want: SchemaObject,
-        desired: SchemaSnapshot, ns: string): PlannedChange[] {
+        desired: SchemaSnapshot, ns: string,
+        options?: RenderOptions): PlannedChange[] {
     switch (id.kind) {
         case ObjectKind.TABLE:
             return [new PlannedChange(0, id, ChangeAction.CREATE,
@@ -39,12 +59,17 @@ function missing(id: ObjectId, want: SchemaObject,
                     want.definition, "missing " + id)];
         case ObjectKind.COLUMN:
             return missingColumn(id, want, desired, ns);
+        case ObjectKind.INDEX:
+            return [indexCreate(id, want, desired, ns, "missing " + id, options)];
         case ObjectKind.PRIMARY_KEY:
         case ObjectKind.UNIQUE:
         case ObjectKind.FOREIGN_KEY:
         case ObjectKind.CHECK:
         case ObjectKind.EXCLUSION:
-        case ObjectKind.INDEX:
+            return [additive(id, want, ns, "missing " + id, false,
+                    id.kind === ObjectKind.FOREIGN_KEY
+                            || id.kind === ObjectKind.CHECK
+                            ? VALIDATES : LOCK_ROW_EXCLUSIVE)];
         case ObjectKind.VIEW:
         case ObjectKind.TRIGGER:
         case ObjectKind.TYPE:
@@ -59,7 +84,9 @@ function missing(id: ObjectId, want: SchemaObject,
         case ObjectKind.PUBLICATION:
         case ObjectKind.CAST:
         case ObjectKind.TRANSFORM:
-            return [additive(id, want, ns, "missing " + id)];
+            return [additive(id, want, ns, "missing " + id, false,
+                    id.kind === ObjectKind.PARTITION
+                            ? LOCK_EXCLUSIVE : ChangeHazard.NONE)];
         case ObjectKind.MATERIALIZED_VIEW:
             return [new PlannedChange(0, id, ChangeAction.CREATE,
                     ChangeSafety.ADDITIVE, matviewCreateStatements(want, ns),
@@ -228,14 +255,16 @@ function missingColumn(id: ObjectId, want: SchemaObject,
     if (!notnull) {
         return [new PlannedChange(0, id, ChangeAction.CREATE,
                 ChangeSafety.ADDITIVE, [bind(alter, ns)],
-                want.definition, "missing nullable column " + id.name)];
+                want.definition, "missing nullable column " + id.name,
+                false, LOCK_EXCLUSIVE)];
     }
     const defexpr = want.attributes.get(PgCatalog.DEFAULT);
     if (defexpr !== undefined && PgIdentifiers.isConstantDefault(defexpr)) {
         return [new PlannedChange(0, id, ChangeAction.CREATE,
                 ChangeSafety.ADDITIVE, [bind(alter, ns)],
                 want.definition,
-                "missing NOT NULL column " + id.name + " with a constant default")];
+                "missing NOT NULL column " + id.name + " with a constant default",
+                false, LOCK_EXCLUSIVE)];
     }
     return [new PlannedChange(0, id, ChangeAction.ALTER,
             ChangeSafety.DESTRUCTIVE, [], undefined,
@@ -258,9 +287,11 @@ function driftedMatview(id: ObjectId, want: SchemaObject, ns: string): PlannedCh
     const reason = "drifted " + id + " (stored rows are dropped)";
     return [
         new PlannedChange(0, id, ChangeAction.DROP, ChangeSafety.DESTRUCTIVE,
-                [bindObj(want, PgCatalog.DROP_SQL, ns)], undefined, reason),
+                [bindObj(want, PgCatalog.DROP_SQL, ns)], undefined, reason,
+                false, LOCK_EXCLUSIVE),
         new PlannedChange(0, id, ChangeAction.CREATE, ChangeSafety.DESTRUCTIVE,
-                statements, want.definition, reason)];
+                statements, want.definition, reason,
+                false, LOCK_EXCLUSIVE)];
 }
 
 /**
@@ -331,7 +362,8 @@ function driftedTable(id: ObjectId, want: SchemaObject,
     }
     return [new PlannedChange(0, id, ChangeAction.ALTER, ChangeSafety.REBUILD,
             statements.map(s => bind(s, ns)),
-            want.definition, "drifted " + id + " (row-level security flag)")];
+            want.definition, "drifted " + id + " (row-level security flag)",
+            false, LOCK_EXCLUSIVE)];
 }
 
 function manual(id: ObjectId, reason: string): PlannedChange[] {
@@ -405,14 +437,16 @@ function driftedDomain(id: ObjectId, want: SchemaObject,
                         .map(([k, v]) => k + "=" + v).join(";"));
         changes.push(new PlannedChange(0, id, ChangeAction.ALTER, ChangeSafety.REBUILD,
                 safe.map(s => bind(s, ns)),
-                expected, "drifted " + id));
+                expected, "drifted " + id, false, LOCK_EXCLUSIVE));
     }
     if (validating.length > 0) {
         changes.push(new PlannedChange(0, id, ChangeAction.ALTER,
                 ChangeSafety.DESTRUCTIVE,
                 validating.map(s => bind(s, ns)),
                 want.definition,
-                "drifted " + id + " (validates existing values)"));
+                "drifted " + id + " (validates existing values)",
+                false, new ChangeHazard(LockLevel.ACCESS_EXCLUSIVE,
+                        false, true)));
     }
     return changes;
 }
@@ -430,18 +464,21 @@ function domainChecks(fields: Map<string, string>): Map<string, string> {
 
 function drifted(id: ObjectId, want: SchemaObject,
         difference: Difference, desired: SchemaSnapshot,
-        ns: string): PlannedChange[] {
+        ns: string, options?: RenderOptions): PlannedChange[] {
     switch (id.kind) {
         case ObjectKind.COLUMN:
             return driftedColumn(id, want, difference, desired, ns);
         case ObjectKind.TABLE:
             return driftedTable(id, want, difference, ns);
+        case ObjectKind.INDEX:
+            return indexRecreate(id, want, desired, ns, "drifted " + id, options);
         case ObjectKind.PRIMARY_KEY:
         case ObjectKind.UNIQUE:
         case ObjectKind.FOREIGN_KEY:
         case ObjectKind.CHECK:
         case ObjectKind.EXCLUSION:
-        case ObjectKind.INDEX:
+            return recreate(id, want, ns, "drifted " + id, false,
+                    LOCK_ROW_EXCLUSIVE);
         case ObjectKind.VIEW:
         case ObjectKind.TRIGGER:
         case ObjectKind.POLICY:
@@ -458,19 +495,19 @@ function drifted(id: ObjectId, want: SchemaObject,
             return [
                 new PlannedChange(0, id, ChangeAction.DROP, ChangeSafety.DESTRUCTIVE,
                         [bindObj(want, PgCatalog.DROP_SQL, ns)],
-                        undefined, "drifted " + id),
+                        undefined, "drifted " + id, false, LOCK_EXCLUSIVE),
                 new PlannedChange(0, id, ChangeAction.CREATE, ChangeSafety.DESTRUCTIVE,
                         [bindObj(want, PgCatalog.CREATE_SQL, ns)],
-                        want.definition, "drifted " + id)];
+                        want.definition, "drifted " + id, false, LOCK_EXCLUSIVE)];
         // no local data — a server/options change is a plain drop+create
         case ObjectKind.FOREIGN_TABLE:
             return [
                 new PlannedChange(0, id, ChangeAction.DROP, ChangeSafety.REBUILD,
                         [bindObj(want, PgCatalog.DROP_SQL, ns)],
-                        undefined, "drifted " + id),
+                        undefined, "drifted " + id, false, LOCK_EXCLUSIVE),
                 new PlannedChange(0, id, ChangeAction.CREATE, ChangeSafety.REBUILD,
                         createForeignTableStatements(id, desired, ns),
-                        want.definition, "drifted " + id)];
+                        want.definition, "drifted " + id, false, LOCK_EXCLUSIVE)];
         case ObjectKind.MATERIALIZED_VIEW:
             return driftedMatview(id, want, ns);
         // a composite's attribute drift and a range's pg_range drift
@@ -519,7 +556,7 @@ function drifted(id: ObjectId, want: SchemaObject,
             }
             return [new PlannedChange(0, id, ChangeAction.ALTER,
                     ChangeSafety.DESTRUCTIVE, statements, want.definition,
-                    "drifted " + id)];
+                    "drifted " + id, false, LOCK_EXCLUSIVE)];
         }
         case ObjectKind.ROUTINE: {
             const haveDef = difference.actual?.canonical ?? "";
@@ -737,16 +774,22 @@ function driftedColumn(id: ObjectId, want: SchemaObject,
                 ? new Definition(canonicalWith(wantFields, "notnull",
                         haveFields.get("notnull")!))
                 : want.definition;
+        // an ALTER COLUMN TYPE can rewrite the table even on the
+        // widening allowlist (e.g. integer -> bigint)
+        const hazard = wantType !== haveFields.get("type")
+                ? REWRITES : LOCK_EXCLUSIVE;
         changes.push(new PlannedChange(0, id, ChangeAction.ALTER, ChangeSafety.REBUILD,
                 safe.map(s => bind(s, ns)),
-                expected, "drifted " + id));
+                expected, "drifted " + id, false, hazard));
     }
     if (setNotNull) {
         changes.push(new PlannedChange(0, id, ChangeAction.ALTER,
                 ChangeSafety.DESTRUCTIVE,
                 [bind(alter + "SET NOT NULL", ns)],
                 want.definition,
-                "drifted " + id + " (SET NOT NULL validates existing rows)"));
+                "drifted " + id + " (SET NOT NULL validates existing rows)",
+                false, new ChangeHazard(LockLevel.ACCESS_EXCLUSIVE,
+                        false, true)));
     }
     return changes;
 }
@@ -893,9 +936,11 @@ function typmod(type: string): number[] {
 }
 
 function additive(id: ObjectId, want: SchemaObject, ns: string,
-        reason: string): PlannedChange {
+        reason: string, nonTransactional = false,
+        hazard: ChangeHazard = ChangeHazard.NONE): PlannedChange {
     return new PlannedChange(0, id, ChangeAction.CREATE, ChangeSafety.ADDITIVE,
-            createStatements(want, ns), want.definition, reason);
+            createStatements(want, ns), want.definition, reason,
+            nonTransactional, hazard);
 }
 
 /** The CREATE statement plus its post-create fragment (trigger enablement, replica identity). */
@@ -911,12 +956,15 @@ function createStatements(want: SchemaObject, ns: string): string[] {
 
 /** A DROP change plus a CREATE change — the two halves of a recreate (4.4). */
 function recreate(id: ObjectId, want: SchemaObject, ns: string,
-        reason: string): PlannedChange[] {
+        reason: string, nonTransactional = false,
+        hazard: ChangeHazard = LOCK_EXCLUSIVE): PlannedChange[] {
     return [
         new PlannedChange(0, id, ChangeAction.DROP, ChangeSafety.REBUILD,
-                [bindObj(want, PgCatalog.DROP_SQL, ns)], undefined, reason),
+                [bindObj(want, PgCatalog.DROP_SQL, ns)], undefined, reason,
+                nonTransactional, hazard),
         new PlannedChange(0, id, ChangeAction.CREATE, ChangeSafety.REBUILD,
-                createStatements(want, ns), want.definition, reason)];
+                createStatements(want, ns), want.definition, reason,
+                nonTransactional, hazard)];
 }
 
 function seqRef(id: ObjectId): string {
@@ -935,6 +983,288 @@ function bind(sql: string, ns: string): string {
 function returnTypeOf(functionDef: string): string | null {
     const m = /\bRETURNS (.+?) LANGUAGE\b/.exec(functionDef);
     return m !== null ? m[1]! : null;
+}
+
+// ---- UNEXPECTED (5.5 pruning) -------------------------------------------
+
+/**
+ * Data-bearing kinds: their standalone drop is DESTRUCTIVE because the
+ * rows are lost. Every other kind's standalone drop is a REBUILD —
+ * removing it cannot destroy stored data.
+ */
+const DESTRUCTIVE_PRUNE = new Set<ObjectKind>([
+        ObjectKind.TABLE, ObjectKind.COLUMN, ObjectKind.MATERIALIZED_VIEW,
+        ObjectKind.PARTITION, ObjectKind.SEQUENCE]);
+
+/**
+ * A standalone DROP for an object absent from the desired state (5.5).
+ * {@code have} is the ACTUAL object — its attributes hold the drop
+ * fragments. An unexpected {@code COLUMN} on an expected table renders
+ * `ALTER TABLE ... DROP COLUMN`; one on an unexpected table is
+ * suppressed upstream (the parent's own drop covers it). Mirrored kinds
+ * map to their null/revoke/owner-reset forms; COMMENT and OWNERSHIP
+ * have no {@code DROP_SQL} so their statements derive from the create
+ * fragment.
+ */
+function unexpected(id: ObjectId, have: SchemaObject,
+        actual: SchemaSnapshot, ns: string,
+        options?: RenderOptions): PlannedChange[] {
+    const safety = DESTRUCTIVE_PRUNE.has(id.kind)
+            ? ChangeSafety.DESTRUCTIVE : ChangeSafety.REBUILD;
+    const reason = "unexpected " + id;
+    switch (id.kind) {
+        case ObjectKind.COLUMN: {
+            // a pruned column on a renamed parent drops through the new
+            // name — the old one no longer exists once the rename ran
+            const parent = options?.renamedParents?.get(id.parent ?? "")
+                    ?? id.parent ?? "";
+            const routed = partitionParent(parent, actual);
+            return [new PlannedChange(0, id, ChangeAction.DROP, safety,
+                    [bind("ALTER TABLE " + TOKEN + "."
+                            + PgIdentifiers.quote(routed ?? parent)
+                            + " DROP COLUMN " + PgIdentifiers.quote(id.name), ns)],
+                    undefined, reason, false, LOCK_EXCLUSIVE)];
+        }
+        case ObjectKind.TABLE:
+            // a plain table never carries DROP_SQL — its drift path is
+            // the destructive manual one, so the prune drop is built here
+            return [new PlannedChange(0, id, ChangeAction.DROP, safety,
+                    [bind("DROP TABLE " + TOKEN + "."
+                            + PgIdentifiers.quote(id.name), ns)],
+                    undefined, reason, false, LOCK_EXCLUSIVE)];
+        case ObjectKind.INDEX:
+            return [indexDrop(id, have, actual, ns, reason, options)];
+        case ObjectKind.COMMENT: {
+            // COMMENT ON <target> IS NULL — the create fragment's
+            // literal is always the statement's tail
+            const create = have.attributes.get(PgCatalog.CREATE_SQL) ?? "";
+            return [new PlannedChange(0, id, ChangeAction.ALTER, safety,
+                    [bind(create.replace(/ IS '(?:[^']|'')*'$/, " IS NULL"), ns)],
+                    undefined, reason)];
+        }
+        case ObjectKind.SECURITY_LABEL:
+            return [new PlannedChange(0, id, ChangeAction.ALTER, safety,
+                    [bindObj(have, PgCatalog.DROP_SQL, ns)],
+                    undefined, reason)];
+        case ObjectKind.OWNERSHIP: {
+            // ALTER <target> OWNER TO CURRENT_USER — surrender the
+            // scripted owner to whoever runs the reconcile
+            const create = have.attributes.get(PgCatalog.CREATE_SQL) ?? "";
+            return [new PlannedChange(0, id, ChangeAction.ALTER, safety,
+                    [bind(create.replace(/ OWNER TO "(?:[^"]|"")*"$/,
+                            " OWNER TO CURRENT_USER"), ns)],
+                    undefined, reason)];
+        }
+        case ObjectKind.PRIVILEGES:
+        case ObjectKind.DEFAULT_PRIVILEGES: {
+            const target = bindObj(have, PgCatalog.GRANT_TARGET, ns);
+            const prefix = have.attributes.get(PgCatalog.GRANT_PREFIX);
+            const pfx = prefix === undefined ? "" : bind(prefix, ns) + " ";
+            const stmts: string[] = [];
+            for (const tok of aclTokens(have.definition.canonical)) {
+                const g = grantee(tok);
+                if (g === "<owner>") {
+                    continue;
+                }
+                stmts.push(pfx + "REVOKE ALL PRIVILEGES ON " + target
+                        + " FROM " + granteeSql(g));
+            }
+            if (stmts.length === 0) {
+                return [];
+            }
+            return [new PlannedChange(0, id, ChangeAction.ALTER, safety,
+                    stmts, undefined, reason)];
+        }
+        default: {
+            const drop = have.attributes.get(PgCatalog.DROP_SQL);
+            if (drop === undefined) {
+                throw new PlanningException("unexpected " + id
+                        + " has no drop statement");
+            }
+            return [new PlannedChange(0, id, ChangeAction.DROP, safety,
+                    [bind(drop, ns)], undefined, reason,
+                    false, safety === ChangeSafety.DESTRUCTIVE
+                            ? LOCK_EXCLUSIVE : ChangeHazard.NONE)];
+        }
+    }
+}
+
+// ---- concurrent indexes (5.6) -------------------------------------------
+
+/**
+ * Whether the index's parent relation is a partitioned table —
+ * PostgreSQL rejects `CREATE INDEX CONCURRENTLY` on one (the partitioned
+ * index build is transactional anyway).
+ */
+function parentPartitioned(id: ObjectId, snapshot: SchemaSnapshot): boolean {
+    for (const o of snapshot.objects.values()) {
+        if (o.id.name === id.parent && o.id.parent === undefined
+                && (o.id.kind === ObjectKind.TABLE
+                        || o.id.kind === ObjectKind.PARTITION)
+                && o.attributes.get(PgCatalog.PARTKEY) !== undefined) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/** Whether concurrent index DDL applies to this index under the options. */
+function concurrentIndex(id: ObjectId, snapshot: SchemaSnapshot,
+        options?: RenderOptions): boolean {
+    return options?.concurrentIndexes === true
+            && !parentPartitioned(id, snapshot);
+}
+
+/**
+ * `CREATE [UNIQUE] INDEX CONCURRENTLY` — the concurrently variant of a
+ * missing index (5.6). The statement runs outside a transaction
+ * ({@code nonTransactional}) under a SHARE UPDATE EXCLUSIVE lock; on a
+ * partitioned parent it degrades to the plain transactional form.
+ */
+function indexCreate(id: ObjectId, want: SchemaObject,
+        snapshot: SchemaSnapshot, ns: string, reason: string,
+        options?: RenderOptions): PlannedChange {
+    if (!concurrentIndex(id, snapshot, options)) {
+        return new PlannedChange(0, id, ChangeAction.CREATE,
+                ChangeSafety.ADDITIVE, createStatements(want, ns),
+                want.definition, reason, false, INDEX_BUILD);
+    }
+    const statements = createStatements(want, ns)
+            .map(s => s.replace(/^(CREATE\s+(?:UNIQUE\s+)?INDEX)\s/,
+                    "$1 CONCURRENTLY "));
+    return new PlannedChange(0, id, ChangeAction.CREATE,
+            ChangeSafety.ADDITIVE, statements, want.definition, reason,
+            true, INDEX_CONCURRENT);
+}
+
+/**
+ * `DROP INDEX CONCURRENTLY` — the concurrently variant of an index drop,
+ * whether from a drifted recreate pair or a prune of an unexpected index.
+ */
+function indexDrop(id: ObjectId, have: SchemaObject,
+        snapshot: SchemaSnapshot, ns: string, reason: string,
+        options?: RenderOptions): PlannedChange {
+    const drop = bindObj(have, PgCatalog.DROP_SQL, ns);
+    if (!concurrentIndex(id, snapshot, options)) {
+        return new PlannedChange(0, id, ChangeAction.DROP,
+                ChangeSafety.REBUILD, [drop], undefined, reason,
+                false, LOCK_EXCLUSIVE);
+    }
+    return new PlannedChange(0, id, ChangeAction.DROP, ChangeSafety.REBUILD,
+            [drop.replace(/^DROP\s+INDEX\s/, "DROP INDEX CONCURRENTLY ")],
+            undefined, reason, true, INDEX_CONCURRENT);
+}
+
+/** The DROP+CREATE pair of a drifted index — concurrent when allowed. */
+function indexRecreate(id: ObjectId, want: SchemaObject,
+        snapshot: SchemaSnapshot, ns: string, reason: string,
+        options?: RenderOptions): PlannedChange[] {
+    if (!concurrentIndex(id, snapshot, options)) {
+        return recreate(id, want, ns, reason, false, INDEX_BUILD);
+    }
+    return [
+        indexDrop(id, want, snapshot, ns, reason, options),
+        indexCreate(id, want, snapshot, ns, reason, options)];
+}
+
+// ---- RENAME (5.5.1) ------------------------------------------------------
+
+/**
+ * An `ALTER ... RENAME` statement per kind; returns `null` when the
+ * kind has no rename form — the caller falls back to drop+create.
+ */
+function renameSql(from: ObjectId, to: ObjectId): string | null {
+    const qFrom = TOKEN + "." + PgIdentifiers.quote(from.name);
+    const qNew = PgIdentifiers.quote(to.name);
+    const qParent = from.parent === undefined ? null
+            : TOKEN + "." + PgIdentifiers.quote(from.parent);
+    switch (from.kind) {
+        case ObjectKind.TABLE:
+        case ObjectKind.PARTITION:
+            return "ALTER TABLE " + qFrom + " RENAME TO " + qNew;
+        case ObjectKind.FOREIGN_TABLE:
+            return "ALTER FOREIGN TABLE " + qFrom + " RENAME TO " + qNew;
+        case ObjectKind.VIEW:
+            return "ALTER VIEW " + qFrom + " RENAME TO " + qNew;
+        case ObjectKind.MATERIALIZED_VIEW:
+            return "ALTER MATERIALIZED VIEW " + qFrom + " RENAME TO " + qNew;
+        case ObjectKind.SEQUENCE:
+            return "ALTER SEQUENCE " + qFrom + " RENAME TO " + qNew;
+        case ObjectKind.INDEX:
+            return "ALTER INDEX " + qFrom + " RENAME TO " + qNew;
+        case ObjectKind.TYPE:
+        case ObjectKind.DOMAIN:
+            return "ALTER TYPE " + qFrom + " RENAME TO " + qNew;
+        case ObjectKind.STATISTICS:
+            return "ALTER STATISTICS " + qFrom + " RENAME TO " + qNew;
+        case ObjectKind.COLLATION:
+            return "ALTER COLLATION " + qFrom + " RENAME TO " + qNew;
+        case ObjectKind.CONVERSION:
+            return "ALTER CONVERSION " + qFrom + " RENAME TO " + qNew;
+        case ObjectKind.COLUMN:
+            return "ALTER TABLE " + qParent + " RENAME COLUMN "
+                    + PgIdentifiers.quote(from.name) + " TO " + qNew;
+        case ObjectKind.PRIMARY_KEY:
+        case ObjectKind.UNIQUE:
+        case ObjectKind.FOREIGN_KEY:
+        case ObjectKind.CHECK:
+        case ObjectKind.EXCLUSION:
+            return "ALTER TABLE " + qParent + " RENAME CONSTRAINT "
+                    + PgIdentifiers.quote(from.name) + " TO " + qNew;
+        case ObjectKind.TRIGGER:
+            return "ALTER TRIGGER " + PgIdentifiers.quote(from.name)
+                    + " ON " + qParent + " RENAME TO " + qNew;
+        case ObjectKind.POLICY:
+            return "ALTER POLICY " + PgIdentifiers.quote(from.name)
+                    + " ON " + qParent + " RENAME TO " + qNew;
+        case ObjectKind.ROUTINE:
+        case ObjectKind.AGGREGATE: {
+            // the signature rides the name — ALTER FUNCTION
+            // <ns>.<name>(<sig>) RENAME TO <newname>
+            const sig = signatureOf(from.name);
+            const word = from.kind === ObjectKind.AGGREGATE
+                    ? "AGGREGATE" : "FUNCTION";
+            return "ALTER " + word + " " + TOKEN + "."
+                    + PgIdentifiers.quote(baseName(from.name)) + sig
+                    + " RENAME TO " + PgIdentifiers.quote(baseName(to.name));
+        }
+        default:
+            return null;
+    }
+}
+
+/** The `(args)` tail of a routine id name, or `""`. */
+function signatureOf(name: string): string {
+    const p = name.indexOf("(");
+    return p < 0 ? "" : name.substring(p);
+}
+
+/** The name without a `(args)` signature tail. */
+function baseName(name: string): string {
+    const p = name.indexOf("(");
+    return p < 0 ? name : name.substring(0, p);
+}
+
+/**
+ * 5.5.1: an explicit rename hint renders `ALTER ... RENAME` as a
+ * single ALTER change targeting the NEW name — a rename is a
+ * metadata-only, data-safe operation (REBUILD). The change's expected
+ * definition is the actual one (a rename does not alter the
+ * definition); when the desired definition also changed, the plan adds
+ * a following DRIFTED change on the new name.
+ */
+export function renderRename(from: ObjectId, to: ObjectId,
+        actual: SchemaSnapshot, _desired: SchemaSnapshot,
+        targetNamespace: string): PlannedChange[] {
+    const sql = renameSql(from, to);
+    if (sql === null) {
+        throw new PlanningException("rename of " + from.kind + " " + from
+                + " is not supported");
+    }
+    const have = actual.objects.get(from)!;
+    return [new PlannedChange(0, to, ChangeAction.ALTER, ChangeSafety.REBUILD,
+            [bind(sql, targetNamespace)], have.definition,
+            "renamed " + from + " to " + to, false, LOCK_EXCLUSIVE)];
 }
 
 // ---- SPI helpers -------------------------------------------------------

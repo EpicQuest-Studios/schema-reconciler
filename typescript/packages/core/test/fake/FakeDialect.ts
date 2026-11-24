@@ -4,7 +4,9 @@ import { Dialect } from "../../src/spi/Dialect.ts";
 import { DialectCapabilities } from "../../src/spi/DialectCapabilities.ts";
 import type { DatabaseMetadata, SqlConnection } from "../../src/spi/Sql.ts";
 import { ChangeAction } from "../../src/model/ChangeAction.ts";
+import { ChangeHazard } from "../../src/model/ChangeHazard.ts";
 import { ChangeSafety } from "../../src/model/ChangeSafety.ts";
+import { LockLevel } from "../../src/model/LockLevel.ts";
 import { Difference } from "../../src/model/Difference.ts";
 import { DifferenceType } from "../../src/model/DifferenceType.ts";
 import type { ObjectId } from "../../src/model/ObjectId.ts";
@@ -13,6 +15,7 @@ import { ObjectKind } from "../../src/model/ObjectKind.ts";
 import { PlannedChange } from "../../src/model/PlannedChange.ts";
 import type { SchemaObject } from "../../src/model/SchemaObject.ts";
 import { SchemaSnapshot } from "../../src/model/SchemaSnapshot.ts";
+import type { RenderOptions } from "../../src/spi/RenderOptions.ts";
 import { FakeDb, FakeConnection } from "./FakeDb.ts";
 import type { Duration } from "../../src/Duration.ts";
 
@@ -93,29 +96,36 @@ export class FakeDialect implements Dialect {
         return SchemaSnapshot.of(this.db.stateOf(handle(connection), namespace));
     }
 
-    render(difference: Difference, desired: SchemaSnapshot,
-           _targetNamespace: string): PlannedChange[] {
+    render(difference: Difference, snapshot: SchemaSnapshot,
+           _targetNamespace: string, options?: RenderOptions): PlannedChange[] {
         const id = difference.id;
         switch (difference.type) {
             case DifferenceType.MISSING: {
-                const want = desired.objects.get(id)!;
+                const want = snapshot.objects.get(id)!;
                 const statements: string[] = [FakeDb.createStatement(want)];
-                const children = [...(this.coveredChildren(difference, desired) ?? [])];
+                const children = [...(this.coveredChildren(difference, snapshot) ?? [])];
                 children.sort(ObjectIds.ORDER);
                 for (const child of children) {
-                    statements.push(FakeDb.createStatement(desired.objects.get(child)!));
+                    statements.push(FakeDb.createStatement(snapshot.objects.get(child)!));
                 }
                 return [new PlannedChange(0, id, ChangeAction.CREATE,
                         ChangeSafety.ADDITIVE, statements, want.definition,
-                        "missing " + id)];
+                        "missing " + id,
+                        options?.concurrentIndexes === true
+                                && id.kind === ObjectKind.INDEX,
+                        options?.concurrentIndexes === true
+                                && id.kind === ObjectKind.INDEX
+                                ? new ChangeHazard(LockLevel.SHARE_UPDATE_EXCLUSIVE,
+                                        false, false)
+                                : ChangeHazard.NONE)];
             }
             case DifferenceType.DRIFTED:
                 switch (id.kind) {
                     case ObjectKind.TABLE:
-                        return this.recreate(desired, id, ChangeSafety.DESTRUCTIVE,
+                        return this.recreate(snapshot, id, ChangeSafety.DESTRUCTIVE,
                                 "drifted table");
                     case ObjectKind.SEQUENCE: {
-                        const want = desired.objects.get(id)!;
+                        const want = snapshot.objects.get(id)!;
                         return [new PlannedChange(0, id, ChangeAction.ALTER,
                                 ChangeSafety.DESTRUCTIVE, [FakeDb.alterStatement(want)],
                                 want.definition, "drifted sequence")];
@@ -125,12 +135,33 @@ export class FakeDialect implements Dialect {
                                 ChangeSafety.DESTRUCTIVE, [], undefined,
                                 "drifted column requires manual change")];
                     default:
-                        return this.recreate(desired, id, ChangeSafety.REBUILD,
+                        return this.recreate(snapshot, id, ChangeSafety.REBUILD,
                                 "drifted " + id.kind);
                 }
+            // pruning passes the ACTUAL snapshot (spec 5.5): the
+            // unexpected object drops; data-bearing kinds are DESTRUCTIVE
+            case DifferenceType.UNEXPECTED:
+                return [new PlannedChange(0, id, ChangeAction.DROP,
+                        id.kind === ObjectKind.TABLE || id.kind === ObjectKind.COLUMN
+                                ? ChangeSafety.DESTRUCTIVE : ChangeSafety.REBUILD,
+                        [FakeDb.dropStatement(id)], undefined,
+                        "unexpected " + id)];
             default:
                 return [];
         }
+    }
+
+    renderRename(from: ObjectId, to: ObjectId, actual: SchemaSnapshot,
+                 _desired: SchemaSnapshot, _targetNamespace: string): PlannedChange[] {
+        const have = actual.objects.get(from);
+        if (have === undefined) {
+            throw new IllegalArgumentError("rename source missing: " + from);
+        }
+        return [new PlannedChange(0, to, ChangeAction.ALTER,
+                ChangeSafety.REBUILD,
+                ["RENAME " + from.kind + " " + FakeDb.qualified(from)
+                        + " TO " + to.name],
+                have.definition, "renamed " + from + " to " + to)];
     }
 
     private recreate(desired: SchemaSnapshot, id: ObjectId, safety: ChangeSafety,

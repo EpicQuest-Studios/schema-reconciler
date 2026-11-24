@@ -7,7 +7,7 @@
     <parent>
         <groupId>studio.epicquest.schema</groupId>
         <artifactId>schema-reconciler-parent</artifactId>
-        <version>0.9.0</version>
+        <version>0.10.0</version>
         <relativePath>../pom.xml</relativePath>
     </parent>
 
@@ -49,6 +49,18 @@
     </dependencies>
 
     <build>
+        <resources>
+            <resource>
+                <directory>src/main/resources</directory>
+            </resource>
+            <!-- the shared catalog queries, kept 1:1 with the TypeScript
+                 port — land in the internal package under both JPMS and the
+                 class path -->
+            <resource>
+                <directory>../../sql/postgresql</directory>
+                <targetPath>studio/epicquest/schema/reconciler/postgresql/internal/sql</targetPath>
+            </resource>
+        </resources>
         <!-- corpus + deployment fixtures live in java/fixtures, shared with the
              TypeScript port — they land on the test classpath unchanged -->
         <testResources>

@@ -6,6 +6,7 @@ import { SchemaObject, SchemaSnapshot } from "@epicquest-studios/schema-reconcil
 import type { SqlConnection } from "@epicquest-studios/schema-reconciler-core";
 import * as PgIdentifiers from "./PgIdentifiers.ts";
 import * as PgSql from "./PgSql.ts";
+import * as PgQueries from "./PgQueries.ts";
 
 /**
  * The catalog snapshot reader of spec A.5. Reads with `search_path` bound
@@ -149,50 +150,6 @@ function reloptions(text: string | null): string[] {
     return [...new Set(inner.split(",").map(s => s.trim()))].sort();
 }
 
-/** Namespace-scoped catalog rows resolved to a stable display name, for
- *  locating comments and security labels. Every SELECT emits
- *  (classid, objoid, name); the parameter order matches the SELECTs. */
-const NS_OBJECTS = `
-        SELECT 'pg_class'::regclass AS cls, c.oid AS obj, c.relname AS name
-        FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace AND n.nspname = $1
-        UNION ALL SELECT 'pg_proc', p.oid,
-                p.proname || '(' || pg_get_function_identity_arguments(p.oid) || ')'
-        FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace AND n.nspname = $2
-        UNION ALL SELECT 'pg_type', t.oid, t.typname
-        FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace AND n.nspname = $3
-        UNION ALL SELECT 'pg_constraint', c.oid, rel.relname || '.' || c.conname
-        FROM pg_constraint c JOIN pg_class rel ON rel.oid = c.conrelid
-        JOIN pg_namespace n ON n.oid = rel.relnamespace AND n.nspname = $4
-        UNION ALL SELECT 'pg_rewrite', r.oid, c.relname || '.' || r.rulename
-        FROM pg_rewrite r JOIN pg_class c ON c.oid = r.ev_class
-        JOIN pg_namespace n ON n.oid = c.relnamespace AND n.nspname = $5
-        UNION ALL SELECT 'pg_namespace', n.oid, 'namespace'
-        FROM pg_namespace n WHERE n.nspname = $6
-        UNION ALL SELECT 'pg_policy', p.oid, c.relname || '.' || p.polname
-        FROM pg_policy p JOIN pg_class c ON c.oid = p.polrelid
-        JOIN pg_namespace n ON n.oid = c.relnamespace AND n.nspname = $7
-        UNION ALL SELECT 'pg_collation', cl.oid, cl.collname
-        FROM pg_collation cl JOIN pg_namespace n ON n.oid = cl.collnamespace AND n.nspname = $8
-        UNION ALL SELECT 'pg_statistic_ext', s.oid, s.stxname
-        FROM pg_statistic_ext s JOIN pg_namespace n ON n.oid = s.stxnamespace AND n.nspname = $9
-        UNION ALL SELECT 'pg_ts_config', g.oid, g.cfgname
-        FROM pg_ts_config g JOIN pg_namespace n ON n.oid = g.cfgnamespace AND n.nspname = $10
-        UNION ALL SELECT 'pg_ts_dict', g.oid, g.dictname
-        FROM pg_ts_dict g JOIN pg_namespace n ON n.oid = g.dictnamespace AND n.nspname = $11
-        UNION ALL SELECT 'pg_ts_parser', g.oid, g.prsname
-        FROM pg_ts_parser g JOIN pg_namespace n ON n.oid = g.prsnamespace AND n.nspname = $12
-        UNION ALL SELECT 'pg_ts_template', g.oid, g.tmplname
-        FROM pg_ts_template g JOIN pg_namespace n ON n.oid = g.tmplnamespace AND n.nspname = $13
-        UNION ALL SELECT 'pg_operator', g.oid, g.oprname
-        FROM pg_operator g JOIN pg_namespace n ON n.oid = g.oprnamespace AND n.nspname = $14
-        UNION ALL SELECT 'pg_opclass', g.oid, g.opcname
-        FROM pg_opclass g JOIN pg_namespace n ON n.oid = g.opcnamespace AND n.nspname = $15
-        UNION ALL SELECT 'pg_opfamily', g.oid, g.opfname
-        FROM pg_opfamily g JOIN pg_namespace n ON n.oid = g.opfnamespace AND n.nspname = $16
-        UNION ALL SELECT 'pg_trigger', t.oid, c.relname || '.' || t.tgname
-        FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid
-        JOIN pg_namespace n ON n.oid = c.relnamespace AND n.nspname = $17
-        `;
 
 function nsParams(ns: string, count: number): string[] {
     return new Array(count).fill(ns);
@@ -241,24 +198,6 @@ function textArray(v: unknown): string[] {
     return s === "{}" ? [] : out;
 }
 
-/**
- * SQL for a deterministic rendering of an ACL column: one
- * `grantee:PRIVILEGE[*]` token per distinct entry (PUBLIC for
- * grantee 0, `<owner>` for the object's owner, `*` for
- * grantable), sorted, so grant order cannot cause drift. The
- * grantor is dropped — who made a grant is provenance, not desired
- * state: a grant recorded under a different grantor is the same
- * held privilege, and comparing it would drift forever (a
- * REVOKE+GRANT pair cannot rename the grantor anyway).
- */
-function aclTokens(acl: string, owner: string): string {
-    return "(SELECT string_agg(tok, ',' ORDER BY tok) FROM (SELECT DISTINCT"
-            + " CASE WHEN a.grantee = 0 THEN 'PUBLIC'"
-            + " WHEN a.grantee = " + owner + " THEN '<owner>'"
-            + " ELSE a.grantee::regrole::text END || ':' || a.privilege_type ||"
-            + " CASE WHEN a.is_grantable THEN '*' ELSE '' END AS tok"
-            + " FROM aclexplode(" + acl + ") a) toks)";
-}
 
 /** The mirrored COMMENT id for a managed target, with the optional
  *  name suffix used to break collisions. */
@@ -558,16 +497,7 @@ class Data {
         // PostGIS install owns thousands), so only those in this
         // namespace are read; other classes are few and read whole
         for (const row of await conn.query<Row>(
-                "SELECT d.objid FROM pg_depend d"
-                        + " WHERE d.refclassid = 'pg_extension'::regclass AND d.deptype = 'e'"
-                        + " AND CASE d.classid"
-                        + " WHEN 'pg_class'::regclass THEN EXISTS (SELECT 1 FROM pg_class o"
-                        + "   WHERE o.oid = d.objid AND o.relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = $1))"
-                        + " WHEN 'pg_proc'::regclass THEN EXISTS (SELECT 1 FROM pg_proc o"
-                        + "   WHERE o.oid = d.objid AND o.pronamespace = (SELECT oid FROM pg_namespace WHERE nspname = $2))"
-                        + " WHEN 'pg_type'::regclass THEN EXISTS (SELECT 1 FROM pg_type o"
-                        + "   WHERE o.oid = d.objid AND o.typnamespace = (SELECT oid FROM pg_namespace WHERE nspname = $3))"
-                        + " ELSE true END",
+                PgQueries.get("extension_owned"),
                 [this.ns, this.ns, this.ns])) {
             this.extOwned.add(num(row.objid));
         }
@@ -585,11 +515,7 @@ class Data {
      */
     async loadAutoTypeFamily(conn: SqlConnection): Promise<void> {
         for (const row of await conn.query<Row>(
-                `SELECT t.oid, t.typname, r.rngmultitypid
-                 FROM pg_range r
-                 JOIN pg_type t ON t.oid = r.rngtypid
-                 JOIN pg_namespace n ON n.oid = t.typnamespace
-                 WHERE n.nspname = $1`, [this.ns])) {
+                PgQueries.get("range_types"), [this.ns])) {
             const oid = num(row.oid);
             if (this.extMember(oid)) {
                 continue;
@@ -601,28 +527,12 @@ class Data {
             this.foldedMembers.add(mr);
         }
         for (const row of await conn.query<Row>(
-                `SELECT d.objid, coalesce(rg.rngtypid, d.refobjid) AS rng
-                 FROM pg_depend d
-                 JOIN pg_type t ON t.oid = d.refobjid
-                 JOIN pg_namespace n ON n.oid = t.typnamespace
-                 LEFT JOIN pg_range rg ON rg.rngmultitypid = d.refobjid
-                 WHERE n.nspname = $1 AND t.typtype IN ('r','m')
-                   AND d.classid = 'pg_proc'::regclass
-                   AND d.refclassid = 'pg_type'::regclass
-                   AND d.deptype = 'i'`, [this.ns])) {
+                PgQueries.get("auto_type_procs"), [this.ns])) {
             this.autoProcs.set(num(row.objid), num(row.rng));
             this.foldedMembers.add(num(row.objid));
         }
         for (const row of await conn.query<Row>(
-                `SELECT d.objid, coalesce(rg.rngtypid, d.refobjid) AS rng
-                 FROM pg_depend d
-                 JOIN pg_type t ON t.oid = d.refobjid
-                 JOIN pg_namespace n ON n.oid = t.typnamespace
-                 LEFT JOIN pg_range rg ON rg.rngmultitypid = d.refobjid
-                 WHERE n.nspname = $1 AND t.typtype IN ('r','m')
-                   AND d.classid = 'pg_cast'::regclass
-                   AND d.refclassid = 'pg_type'::regclass
-                   AND d.deptype = 'i'`, [this.ns])) {
+                PgQueries.get("auto_type_casts"), [this.ns])) {
             this.autoCasts.set(num(row.objid), num(row.rng));
             this.foldedMembers.add(num(row.objid));
         }
@@ -630,28 +540,7 @@ class Data {
 
     async loadRelations(conn: SqlConnection): Promise<void> {
         for (const row of await conn.query<Row>(
-                `SELECT c.oid, c.relname, c.relkind, c.relpersistence,
-                        c.reloptions::text AS options, c.relreplident,
-                        c.relrowsecurity, c.relforcerowsecurity,
-                        pg_get_partkeydef(c.oid) AS partkey,
-                        pg_get_expr(c.relpartbound, c.oid) AS partbound,
-                        (SELECT p.relname FROM pg_inherits i
-                           JOIN pg_class p ON p.oid = i.inhparent
-                          WHERE i.inhrelid = c.oid AND p.relkind = 'p'
-                          LIMIT 1) AS pparent,
-                        (SELECT string_agg(p.relkind, '') FROM pg_inherits i
-                           JOIN pg_class p ON p.oid = i.inhparent
-                          WHERE i.inhrelid = c.oid) AS parentkinds,
-                        (SELECT ic.relname FROM pg_index ix JOIN pg_class ic ON ic.oid = ix.indexrelid
-                          WHERE ix.indrelid = c.oid AND ix.indisreplident) AS replindex,
-                        (SELECT t.oid FROM pg_type t
-                          WHERE t.typrelid = c.oid) AS typeoid,
-                        s.srvname AS ftserver, f.ftoptions::text AS ftoptions
-                 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
-                 LEFT JOIN pg_foreign_table f ON f.ftrelid = c.oid
-                 LEFT JOIN pg_foreign_server s ON s.oid = f.ftserver
-                 WHERE n.nspname = $1 AND c.relkind IN ('r','v','m','f','p','c','t','I','S')
-                 ORDER BY c.oid`, [this.ns])) {
+                PgQueries.get("relations"), [this.ns])) {
             const oid = num(row.oid);
             if (this.extMember(oid)) {
                 continue;
@@ -803,37 +692,7 @@ class Data {
 
     async loadColumns(conn: SqlConnection): Promise<void> {
         for (const row of await conn.query<Row>(
-                `SELECT c.relname AS parent, c.oid AS reloid, a.attnum,
-                        a.attname, format_type(a.atttypid, a.atttypmod) AS typ,
-                        a.attgenerated, a.attcollation, t.typcollation, a.attidentity,
-                        a.attstorage, t.typstorage, a.attcompression,
-                        co.collname,
-                        (a.attnotnull OR EXISTS (
-                            SELECT 1 FROM pg_constraint cn
-                            WHERE cn.conrelid = a.attrelid AND cn.contype = 'n'
-                              AND a.attnum = ANY(cn.conkey))) AS notnull,
-                        pg_get_expr(d.adbin, d.adrelid) AS defexpr,
-                        format_type(ids.seqtypid, NULL) AS idtype,
-                        ids.seqincrement, ids.seqmin, ids.seqmax,
-                        ids.seqstart, ids.seqcache, ids.seqcycle
-                 FROM pg_attribute a
-                 JOIN pg_class c ON c.oid = a.attrelid AND c.relkind IN ('r', 'p', 'f')
-                 JOIN pg_namespace n ON n.oid = c.relnamespace
-                 JOIN pg_type t ON t.oid = a.atttypid
-                 LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum
-                 LEFT JOIN pg_collation co ON co.oid = a.attcollation
-                 LEFT JOIN LATERAL (
-                     SELECT ps.* FROM pg_depend dep
-                     JOIN pg_class sq ON sq.oid = dep.objid AND sq.relkind = 'S'
-                     JOIN pg_sequence ps ON ps.seqrelid = sq.oid
-                     WHERE dep.classid = 'pg_class'::regclass
-                       AND dep.refclassid = 'pg_class'::regclass
-                       AND dep.refobjid = a.attrelid
-                       AND dep.refobjsubid = a.attnum
-                       AND dep.deptype = 'i'
-                 ) ids ON true
-                 WHERE n.nspname = $1 AND a.attnum > 0 AND NOT a.attisdropped
-                 ORDER BY c.oid, a.attnum`, [this.ns])) {
+                PgQueries.get("columns"), [this.ns])) {
             if (this.extMember(num(row.reloid))) {
                 continue;
             }
@@ -901,19 +760,7 @@ class Data {
 
     async loadConstraints(conn: SqlConnection): Promise<void> {
         for (const row of await conn.query<Row>(
-                `SELECT c.oid, c.conname, c.contype, rel.relname AS parent,
-                        pg_get_constraintdef(c.oid) AS def,
-                        ref.oid AS refoid, c.conindid,
-                        EXISTS (SELECT 1 FROM pg_index ix
-                                 WHERE ix.indexrelid = c.conindid AND ix.indisreplident
-                                   AND c.contype IN ('p','u')) AS replident
-                 FROM pg_constraint c
-                 JOIN pg_class rel ON rel.oid = c.conrelid
-                 JOIN pg_namespace n ON n.oid = rel.relnamespace
-                 LEFT JOIN pg_class ref ON ref.oid = c.confrelid
-                 WHERE n.nspname = $1 AND c.contype IN ('p','u','f','c','x')
-                   AND c.conislocal
-                 ORDER BY c.oid`, [this.ns])) {
+                PgQueries.get("constraints"), [this.ns])) {
             if (this.extMember(num(row.oid))) {
                 continue;
             }
@@ -959,18 +806,7 @@ class Data {
 
     async loadIndexes(conn: SqlConnection): Promise<void> {
         for (const row of await conn.query<Row>(
-                `SELECT i.indexrelid AS oid, ic.relname, tc.relname AS parent,
-                        pg_get_indexdef(i.indexrelid) AS def, i.indisreplident AS replident
-                 FROM pg_index i
-                 JOIN pg_class ic ON ic.oid = i.indexrelid
-                 JOIN pg_class tc ON tc.oid = i.indrelid
-                 JOIN pg_namespace n ON n.oid = ic.relnamespace
-                 WHERE n.nspname = $1 AND ic.relkind = 'i'
-                   AND NOT EXISTS (SELECT 1 FROM pg_constraint co
-                                   WHERE co.conindid = i.indexrelid
-                                     AND co.contype IN ('p','u','x'))
-                   AND NOT EXISTS (SELECT 1 FROM pg_inherits inh WHERE inh.inhrelid = i.indexrelid)
-                 ORDER BY i.indexrelid`, [this.ns])) {
+                PgQueries.get("indexes"), [this.ns])) {
             if (this.extMember(num(row.oid))) {
                 continue;
             }
@@ -992,16 +828,7 @@ class Data {
 
     async loadViews(conn: SqlConnection): Promise<void> {
         for (const row of await conn.query<Row>(
-                `SELECT c.oid, c.relname, c.relkind, c.relpersistence, c.relispopulated,
-                        pg_get_viewdef(c.oid, true) AS def,
-                        c.reloptions::text AS options,
-                        (SELECT string_agg(a.attname || ' ' || format_type(a.atttypid, a.atttypmod),
-                                           ', ' ORDER BY a.attnum)
-                           FROM pg_attribute a
-                          WHERE a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped) AS cols
-                 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
-                 WHERE n.nspname = $1 AND c.relkind IN ('v','m')
-                 ORDER BY c.oid`, [this.ns])) {
+                PgQueries.get("views"), [this.ns])) {
             if (this.extMember(num(row.oid))) {
                 continue;
             }
@@ -1038,19 +865,7 @@ class Data {
 
     async loadSequences(conn: SqlConnection): Promise<void> {
         for (const row of await conn.query<Row>(
-                `SELECT c.oid, c.relname, c.relpersistence,
-                        format_type(s.seqtypid, NULL) AS stype,
-                        s.seqincrement, s.seqmin, s.seqmax, s.seqstart, s.seqcache, s.seqcycle
-                 FROM pg_class c
-                 JOIN pg_namespace n ON n.oid = c.relnamespace
-                 JOIN pg_sequence s ON s.seqrelid = c.oid
-                 WHERE n.nspname = $1 AND c.relkind = 'S'
-                   AND NOT EXISTS (
-                       SELECT 1 FROM pg_depend d
-                       WHERE d.classid = 'pg_class'::regclass
-                         AND d.refclassid = 'pg_class'::regclass
-                         AND d.objid = c.oid AND d.deptype = 'i')
-                 ORDER BY c.oid`, [this.ns])) {
+                PgQueries.get("sequences"), [this.ns])) {
             if (this.extMember(num(row.oid))) {
                 continue;
             }
@@ -1087,18 +902,7 @@ class Data {
         }
         // serial-style ownership (deptype 'a')
         for (const row of await conn.query<Row>(
-                `SELECT dep.objid AS seq_oid, dep.refobjid AS tbl_oid,
-                        rc.relname AS tbl, ra.attname AS col,
-                        rn.nspname AS tblns
-                 FROM pg_depend dep
-                 JOIN pg_class sq ON sq.oid = dep.objid AND sq.relkind = 'S'
-                 JOIN pg_namespace sn ON sn.oid = sq.relnamespace
-                 JOIN pg_class rc ON rc.oid = dep.refobjid
-                 JOIN pg_namespace rn ON rn.oid = rc.relnamespace
-                 JOIN pg_attribute ra ON ra.attrelid = dep.refobjid AND ra.attnum = dep.refobjsubid
-                 WHERE dep.classid = 'pg_class'::regclass
-                   AND dep.refclassid = 'pg_class'::regclass
-                   AND dep.deptype = 'a' AND sn.nspname = $1`, [this.ns])) {
+                PgQueries.get("sequence_owners"), [this.ns])) {
             const seq = this.relByOid.get(num(row.seq_oid));
             if (seq === undefined) {
                 continue;
@@ -1137,17 +941,7 @@ class Data {
 
     async loadRoutines(conn: SqlConnection): Promise<void> {
         for (const row of await conn.query<Row>(
-                `SELECT p.oid, p.proname, p.prokind,
-                        coalesce((SELECT string_agg(format_type(a, NULL), ', '
-                                                  ORDER BY x.i)
-                                    FROM unnest(string_to_array(p.proargtypes::text, ' ')::oid[])
-                                         WITH ORDINALITY AS x(a, i)), '') AS sigargs,
-                        (CASE WHEN p.proretset THEN 'SETOF ' ELSE '' END)
-                            || format_type(p.prorettype, NULL) AS rettype,
-                        pg_get_functiondef(p.oid) AS def
-                 FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
-                 WHERE n.nspname = $1 AND p.prokind IN ('f','p','w')
-                 ORDER BY p.oid`, [this.ns])) {
+                PgQueries.get("routines"), [this.ns])) {
             const oid = num(row.oid);
             if (this.extMember(oid)) {
                 continue;
@@ -1193,34 +987,7 @@ class Data {
      */
     async loadAggregates(conn: SqlConnection): Promise<void> {
         for (const row of await conn.query<Row>(
-                `SELECT p.oid, p.proname,
-                        pg_get_function_identity_arguments(p.oid) AS idargs,
-                        pg_get_function_arguments(p.oid) AS args,
-                        a.aggkind,
-                        a.aggtransfn::regprocedure::text AS sfunc,
-                        CASE WHEN a.aggtranstype = 0 THEN 'internal'
-                             ELSE format_type(a.aggtranstype, NULL) END AS stype,
-                        NULLIF(a.aggtransspace, 0) AS sspace,
-                        NULLIF(a.aggfinalfn, 0)::regprocedure::text AS ffunc,
-                        a.aggfinalextra, a.aggfinalmodify,
-                        NULLIF(a.aggcombinefn, 0)::regprocedure::text AS combine,
-                        NULLIF(a.aggserialfn, 0)::regprocedure::text AS serial,
-                        NULLIF(a.aggdeserialfn, 0)::regprocedure::text AS deserial,
-                        a.agginitval,
-                        NULLIF(a.aggmtransfn, 0)::regprocedure::text AS msfunc,
-                        NULLIF(a.aggminvtransfn, 0)::regprocedure::text AS minv,
-                        CASE WHEN a.aggmtransfn::text = '-' THEN NULL
-                             WHEN a.aggmtranstype = 0 THEN 'internal'
-                             ELSE format_type(a.aggmtranstype, NULL) END AS mstype,
-                        NULLIF(a.aggmtransspace, 0) AS msspace,
-                        NULLIF(a.aggmfinalfn, 0)::regprocedure::text AS mffunc,
-                        a.aggmfinalextra, a.aggmfinalmodify,
-                        a.aggminitval,
-                        NULLIF(a.aggsortop, 0)::regoper::text AS sortop
-                 FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
-                 JOIN pg_aggregate a ON a.aggfnoid = p.oid
-                 WHERE n.nspname = $1 AND p.prokind = 'a'
-                 ORDER BY p.oid`, [this.ns])) {
+                PgQueries.get("aggregates"), [this.ns])) {
             const oid = num(row.oid);
             if (this.extMember(oid) || this.autoProcs.has(oid)) {
                 continue;
@@ -1285,13 +1052,7 @@ class Data {
 
     async loadTriggers(conn: SqlConnection): Promise<void> {
         for (const row of await conn.query<Row>(
-                `SELECT t.oid, t.tgname, c.relname AS parent, t.tgenabled,
-                        pg_get_triggerdef(t.oid, true) AS def, t.tgfoid
-                 FROM pg_trigger t
-                 JOIN pg_class c ON c.oid = t.tgrelid
-                 JOIN pg_namespace n ON n.oid = c.relnamespace
-                 WHERE n.nspname = $1 AND NOT t.tgisinternal AND t.tgparentid = 0
-                 ORDER BY t.oid`, [this.ns])) {
+                PgQueries.get("triggers"), [this.ns])) {
             if (this.extMember(num(row.oid))) {
                 continue;
             }
@@ -1322,12 +1083,7 @@ class Data {
      *  edges to the managed `TYPE` object. */
     async loadEnums(conn: SqlConnection): Promise<void> {
         for (const row of await conn.query<Row>(
-                `SELECT t.oid, t.typname,
-                        (SELECT array_agg(e.enumlabel ORDER BY e.enumsortorder, e.oid)
-                           FROM pg_enum e WHERE e.enumtypid = t.oid) AS labels
-                 FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace
-                 WHERE n.nspname = $1 AND t.typtype = 'e'
-                 ORDER BY t.oid`, [this.ns])) {
+                PgQueries.get("enums"), [this.ns])) {
             const oid = num(row.oid);
             if (this.extMember(oid)) {
                 continue;
@@ -1357,26 +1113,14 @@ class Data {
     async loadDomains(conn: SqlConnection): Promise<void> {
         const checks = new Map<number, string[]>();
         for (const row of await conn.query<Row>(
-                `SELECT c.contypid AS dom, c.conname, pg_get_constraintdef(c.oid) AS def
-                 FROM pg_constraint c
-                 JOIN pg_type t ON t.oid = c.contypid
-                 JOIN pg_namespace n ON n.oid = t.typnamespace AND n.nspname = $1
-                 WHERE c.contype = 'c'
-                 ORDER BY c.contypid, c.conname`, [this.ns])) {
+                PgQueries.get("domain_checks"), [this.ns])) {
             const dom = num(row.dom);
             const list = checks.get(dom) ?? [];
             list.push(str(row.conname) + "\u0000" + str(row.def));
             checks.set(dom, list);
         }
         for (const row of await conn.query<Row>(
-                `SELECT t.oid, t.typname,
-                        format_type(t.typbasetype, t.typtypmod) AS basetype,
-                        t.typnotnull, pg_get_expr(t.typdefaultbin, 0) AS dflt,
-                        NULLIF(t.typcollation, 0)::regcollation::text AS coll,
-                        t.typbasetype
-                 FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace
-                 WHERE n.nspname = $1 AND t.typtype = 'd'
-                 ORDER BY t.oid`, [this.ns])) {
+                PgQueries.get("domains"), [this.ns])) {
             const oid = num(row.oid);
             if (this.extMember(oid)) {
                 continue;
@@ -1430,23 +1174,7 @@ class Data {
      */
     async loadComposites(conn: SqlConnection): Promise<void> {
         for (const row of await conn.query<Row>(
-                `SELECT t.oid, t.typname, t.typrelid,
-                        (SELECT string_agg(quote_ident(a.attname) || ' '
-                                 || format_type(a.atttypid, a.atttypmod)
-                                 || CASE WHEN a.attcollation <> at.typcollation
-                                         THEN ' collate '
-                                              || a.attcollation::regcollation::text
-                                         ELSE '' END,
-                                 ', ' ORDER BY a.attnum)
-                           FROM pg_attribute a
-                           JOIN pg_type at ON at.oid = a.atttypid
-                           WHERE a.attrelid = t.typrelid
-                             AND a.attnum > 0 AND NOT a.attisdropped) AS attrs
-                 FROM pg_type t
-                 JOIN pg_class c ON c.oid = t.typrelid AND c.relkind = 'c'
-                 JOIN pg_namespace n ON n.oid = t.typnamespace
-                 WHERE n.nspname = $1 AND t.typtype = 'c'
-                 ORDER BY t.oid`, [this.ns])) {
+                PgQueries.get("composites"), [this.ns])) {
             const oid = num(row.oid);
             const relid = num(row.typrelid);
             if (this.extMember(oid) || this.extMember(relid)) {
@@ -1477,34 +1205,7 @@ class Data {
      */
     async loadRanges(conn: SqlConnection): Promise<void> {
         for (const row of await conn.query<Row>(
-                `SELECT t.oid, t.typname,
-                        format_type(r.rngsubtype, NULL) AS subtype,
-                        NULLIF(r.rngcollation, 0)::regcollation::text AS coll,
-                        -- SUBTYPE_OPCLASS takes a bare name and pg_range
-                        -- always stores the resolved class, so it is
-                        -- reported only when it is not the subtype's
-                        -- default btree operator class
-                        CASE WHEN EXISTS (
-                                 SELECT 1 FROM pg_opclass d
-                                 JOIN pg_opfamily f
-                                   ON f.oid = d.opcfamily
-                                 JOIN pg_am am
-                                   ON am.oid = f.opfmethod
-                                 WHERE am.amname = 'btree'
-                                   AND d.opcintype = r.rngsubtype
-                                   AND d.opcdefault
-                                   AND d.oid = r.rngsubopc)
-                             THEN NULL
-                             ELSE (SELECT o.opcname FROM pg_opclass o
-                                   WHERE o.oid = r.rngsubopc)
-                        END AS opc,
-                        NULLIF(r.rngcanonical, 0)::regproc::text AS canonical,
-                        NULLIF(r.rngsubdiff, 0)::regproc::text AS diff
-                 FROM pg_range r
-                 JOIN pg_type t ON t.oid = r.rngtypid
-                 JOIN pg_namespace n ON n.oid = t.typnamespace
-                 WHERE n.nspname = $1
-                 ORDER BY t.oid`, [this.ns])) {
+                PgQueries.get("ranges"), [this.ns])) {
             const oid = num(row.oid);
             if (this.extMember(oid)) {
                 continue;
@@ -1556,19 +1257,7 @@ class Data {
      */
     async loadPolicies(conn: SqlConnection): Promise<void> {
         for (const row of await conn.query<Row>(
-                `SELECT po.oid, po.polname, po.polrelid, c.relname, po.polcmd,
-                        po.polpermissive,
-                        (SELECT array_agg(x ORDER BY x)
-                           FROM (SELECT DISTINCT CASE WHEN u = 0 THEN 'PUBLIC'
-                                                      ELSE r.rolname END AS x
-                                   FROM unnest(po.polroles) u
-                                   LEFT JOIN pg_roles r ON r.oid = u) s) AS roles,
-                        pg_get_expr(po.polqual, po.polrelid) AS using,
-                        pg_get_expr(po.polwithcheck, po.polrelid) AS wcheck
-                 FROM pg_policy po
-                 JOIN pg_class c ON c.oid = po.polrelid
-                 JOIN pg_namespace n ON n.oid = c.relnamespace AND n.nspname = $1
-                 ORDER BY po.oid`, [this.ns])) {
+                PgQueries.get("policies"), [this.ns])) {
             const oid = num(row.oid);
             if (this.extMember(oid)) {
                 continue;
@@ -1626,11 +1315,7 @@ class Data {
      */
     async loadStatistics(conn: SqlConnection): Promise<void> {
         for (const row of await conn.query<Row>(
-                `SELECT s.oid, s.stxname, s.stxrelid,
-                        pg_get_statisticsobjdef(s.oid) AS def
-                 FROM pg_statistic_ext s
-                 JOIN pg_namespace n ON n.oid = s.stxnamespace AND n.nspname = $1
-                 ORDER BY s.oid`, [this.ns])) {
+                PgQueries.get("statistics"), [this.ns])) {
             const oid = num(row.oid);
             if (this.extMember(oid)) {
                 continue;
@@ -1663,13 +1348,7 @@ class Data {
      */
     async loadRules(conn: SqlConnection): Promise<void> {
         for (const row of await conn.query<Row>(
-                `SELECT r.oid, r.rulename, c.relname AS parent, r.ev_class,
-                        r.ev_enabled, pg_get_ruledef(r.oid, true) AS def
-                 FROM pg_rewrite r
-                 JOIN pg_class c ON c.oid = r.ev_class
-                 JOIN pg_namespace n ON n.oid = c.relnamespace AND n.nspname = $1
-                 WHERE r.rulename <> '_RETURN'
-                 ORDER BY r.oid`, [this.ns])) {
+                PgQueries.get("rules"), [this.ns])) {
             const oid = num(row.oid);
             if (this.extMember(oid)) {
                 continue;
@@ -1714,18 +1393,7 @@ class Data {
      */
     async loadCollations(conn: SqlConnection): Promise<void> {
         for (const row of await conn.query<Row>(
-                `SELECT cl.oid, cl.collname, cl.collprovider, cl.collisdeterministic,
-                        cl.collencoding, cl.collcollate, cl.collctype,
-                        COALESCE(to_json(cl)->>'colllocale',
-                                 to_json(cl)->>'colliculocale') AS colllocale,
-                        cl.collicurules
-                 FROM pg_collation cl
-                 JOIN pg_namespace n ON n.oid = cl.collnamespace AND n.nspname = $1
-                 WHERE cl.collprovider IN ('c', 'i')
-                   AND cl.collencoding IN (-1,
-                       (SELECT encoding FROM pg_database
-                        WHERE datname = current_database()))
-                 ORDER BY cl.oid`, [this.ns])) {
+                PgQueries.get("collations"), [this.ns])) {
             if (this.extMember(num(row.oid))) {
                 continue;
             }
@@ -1776,15 +1444,7 @@ class Data {
      */
     async loadConversions(conn: SqlConnection): Promise<void> {
         for (const row of await conn.query<Row>(
-                `SELECT cv.oid, cv.conname,
-                        pg_encoding_to_char(cv.conforencoding) AS forenc,
-                        pg_encoding_to_char(cv.contoencoding) AS toenc,
-                        cv.conproc::regproc::text AS procname,
-                        cv.conproc::oid AS conproc
-                 FROM pg_conversion cv
-                 JOIN pg_namespace n ON n.oid = cv.connamespace AND n.nspname = $1
-                 WHERE NOT cv.condefault
-                 ORDER BY cv.oid`, [this.ns])) {
+                PgQueries.get("conversions"), [this.ns])) {
             if (this.extMember(num(row.oid))) {
                 continue;
             }
@@ -1827,15 +1487,7 @@ class Data {
     async loadTextSearch(conn: SqlConnection): Promise<void> {
         // templates: the two support functions are the whole body
         for (const row of await conn.query<Row>(
-                `SELECT t.oid, t.tmplname,
-                        t.tmplinit::regproc::text AS init,
-                        t.tmpllexize::regproc::text AS lexize,
-                        t.tmplinit::oid AS init_oid,
-                        t.tmpllexize::oid AS lexize_oid
-                 FROM pg_ts_template t
-                 JOIN pg_namespace n ON n.oid = t.tmplnamespace
-                 WHERE n.nspname = $1
-                 ORDER BY t.oid`, [this.ns])) {
+                PgQueries.get("ts_templates"), [this.ns])) {
             const oid = num(row.oid);
             if (this.extMember(oid)) {
                 continue;
@@ -1864,21 +1516,7 @@ class Data {
         }
         // parsers: five support functions; prsheadline is optional ('-')
         for (const row of await conn.query<Row>(
-                `SELECT p.oid, p.prsname,
-                        p.prsstart::regproc::text AS start,
-                        p.prstoken::regproc::text AS token,
-                        p.prsend::regproc::text AS end,
-                        p.prsheadline::regproc::text AS headline,
-                        p.prslextype::regproc::text AS lextype,
-                        p.prsstart::oid AS start_oid,
-                        p.prstoken::oid AS token_oid,
-                        p.prsend::oid AS end_oid,
-                        p.prsheadline::oid AS headline_oid,
-                        p.prslextype::oid AS lextype_oid
-                 FROM pg_ts_parser p
-                 JOIN pg_namespace n ON n.oid = p.prsnamespace
-                 WHERE n.nspname = $1
-                 ORDER BY p.oid`, [this.ns])) {
+                PgQueries.get("ts_parsers"), [this.ns])) {
             const oid = num(row.oid);
             if (this.extMember(oid)) {
                 continue;
@@ -1916,15 +1554,7 @@ class Data {
         }
         // dictionaries: template reference + free-form init option text
         for (const row of await conn.query<Row>(
-                `SELECT d.oid, d.dictname, d.dicttemplate,
-                        tn.nspname || '.' || t.tmplname AS tmplref,
-                        d.dictinitoption
-                 FROM pg_ts_dict d
-                 JOIN pg_ts_template t ON t.oid = d.dicttemplate
-                 JOIN pg_namespace tn ON tn.oid = t.tmplnamespace
-                 JOIN pg_namespace n ON n.oid = d.dictnamespace
-                 WHERE n.nspname = $1
-                 ORDER BY d.oid`, [this.ns])) {
+                PgQueries.get("ts_dictionaries"), [this.ns])) {
             const oid = num(row.oid);
             if (this.extMember(oid)) {
                 continue;
@@ -1955,14 +1585,7 @@ class Data {
         // map chain; each map row renders an ALTER ... ADD MAPPING in
         // mapseqno order inside POST_SQL
         for (const row of await conn.query<Row>(
-                `SELECT c.oid, c.cfgname, c.cfgparser,
-                        pn.nspname || '.' || p.prsname AS prsref
-                 FROM pg_ts_config c
-                 JOIN pg_ts_parser p ON p.oid = c.cfgparser
-                 JOIN pg_namespace pn ON pn.oid = p.prsnamespace
-                 JOIN pg_namespace n ON n.oid = c.cfgnamespace
-                 WHERE n.nspname = $1
-                 ORDER BY c.oid`, [this.ns])) {
+                PgQueries.get("ts_configurations"), [this.ns])) {
             const oid = num(row.oid);
             if (this.extMember(oid)) {
                 continue;
@@ -2013,19 +1636,7 @@ class Data {
         const out: { alias: string; seq: number; dictoid: number;
                 dictref: string }[] = [];
         for (const row of await conn.query<Row>(
-                `SELECT m.maptokentype, m.mapseqno, m.mapdict,
-                        dn.nspname || '.' || d.dictname AS dictref,
-                        tt.alias
-                 FROM pg_ts_config_map m
-                 JOIN pg_ts_config c ON c.oid = m.mapcfg
-                 JOIN pg_ts_dict d ON d.oid = m.mapdict
-                 JOIN pg_namespace dn ON dn.oid = d.dictnamespace
-                 LEFT JOIN LATERAL (
-                     SELECT alias FROM ts_token_type(c.cfgparser)
-                     WHERE tokid = m.maptokentype
-                 ) tt ON true
-                 WHERE m.mapcfg = $1
-                 ORDER BY m.mapseqno`, [cfgoid])) {
+                PgQueries.get("ts_config_maps"), [cfgoid])) {
             let alias = strOrNull(row.alias);
             if (alias === null) {
                 alias = "tok" + num(row.maptokentype);
@@ -2059,29 +1670,7 @@ class Data {
      */
     async loadOperators(conn: SqlConnection): Promise<void> {
         for (const row of await conn.query<Row>(
-                `SELECT o.oid, o.oprname, o.oprleft, o.oprright,
-                        o.oprleft::regtype::text AS leftt,
-                        o.oprright::regtype::text AS rightt,
-                        o.oprresult::regtype::text AS result,
-                        o.oprcode::regproc::text AS proc,
-                        o.oprcode::oid AS proc_oid,
-                        o.oprrest::regproc::text AS rest,
-                        o.oprrest::oid AS rest_oid,
-                        o.oprjoin::regproc::text AS joinsel,
-                        o.oprjoin::oid AS join_oid,
-                        cn.nspname || '.' || co.oprname AS comref,
-                        nn.nspname || '.' || no.oprname AS negref,
-                        o.oprcom, o.oprnegate,
-                        o.oprresult AS result_oid,
-                        o.oprcanhash, o.oprcanmerge
-                 FROM pg_operator o
-                 JOIN pg_namespace n ON n.oid = o.oprnamespace
-                 LEFT JOIN pg_operator co ON co.oid = o.oprcom
-                 LEFT JOIN pg_namespace cn ON cn.oid = co.oprnamespace
-                 LEFT JOIN pg_operator no ON no.oid = o.oprnegate
-                 LEFT JOIN pg_namespace nn ON nn.oid = no.oprnamespace
-                 WHERE n.nspname = $1
-                 ORDER BY o.oid`, [this.ns])) {
+                PgQueries.get("operators"), [this.ns])) {
             const oid = num(row.oid);
             if (this.extMember(oid)) {
                 continue;
@@ -2155,12 +1744,7 @@ class Data {
         // families: name + access method only — standalone members are
         // not modeled (ALTER FAMILY member mutations stay rejected)
         for (const row of await conn.query<Row>(
-                `SELECT f.oid, f.opfname, a.amname
-                 FROM pg_opfamily f
-                 JOIN pg_am a ON a.oid = f.opfmethod
-                 JOIN pg_namespace n ON n.oid = f.opfnamespace
-                 WHERE n.nspname = $1
-                 ORDER BY f.oid`, [this.ns])) {
+                PgQueries.get("opfamilies"), [this.ns])) {
             const oid = num(row.oid);
             if (this.extMember(oid)) {
                 continue;
@@ -2181,18 +1765,7 @@ class Data {
         // amop/amproc member list (members where the row's left type is
         // the class's indexed type — cross-type members included)
         for (const row of await conn.query<Row>(
-                `SELECT c.oid, c.opcname, a.amname, c.opcfamily,
-                        fn.nspname || '.' || f.opfname AS famref,
-                        format_type(c.opcintype, NULL) AS intype,
-                        format_type(c.opckeytype, NULL) AS storage,
-                        c.opcintype, c.opckeytype, c.opcdefault
-                 FROM pg_opclass c
-                 JOIN pg_am a ON a.oid = c.opcmethod
-                 JOIN pg_opfamily f ON f.oid = c.opcfamily
-                 JOIN pg_namespace fn ON fn.oid = f.opfnamespace
-                 JOIN pg_namespace n ON n.oid = c.opcnamespace
-                 WHERE n.nspname = $1
-                 ORDER BY c.oid`, [this.ns])) {
+                PgQueries.get("opclasses"), [this.ns])) {
             const oid = num(row.oid);
             if (this.extMember(oid)) {
                 continue;
@@ -2248,16 +1821,7 @@ class Data {
             intype: number, id: ObjectId): Promise<string[]> {
         const out: string[] = [];
         for (const row of await conn.query<Row>(
-                `SELECT m.amopstrategy, m.amoppurpose,
-                        m.amopopr::regoperator::text AS opref,
-                        m.amopopr::oid AS amopopr_oid,
-                        sn.nspname || '.' || sf.opfname AS sortref,
-                        m.amopsortfamily
-                 FROM pg_amop m
-                 LEFT JOIN pg_opfamily sf ON sf.oid = m.amopsortfamily
-                 LEFT JOIN pg_namespace sn ON sn.oid = sf.opfnamespace
-                 WHERE m.amopfamily = $1 AND m.amoplefttype = $2
-                 ORDER BY m.amopstrategy, m.amoprighttype, m.oid`,
+                PgQueries.get("opclass_amop_members"),
                 [family, intype])) {
             let spec = "OPERATOR " + num(row.amopstrategy) + " "
                     + str(row.opref);
@@ -2269,14 +1833,7 @@ class Data {
             this.dep(id, this.opfByOid.get(num(row.amopsortfamily)));
         }
         for (const row of await conn.query<Row>(
-                `SELECT m.amprocnum,
-                        format_type(m.amproclefttype, NULL) AS lt,
-                        format_type(m.amprocrighttype, NULL) AS rt,
-                        m.amproc::regprocedure::text AS fn,
-                        m.amproc::oid AS amproc_oid
-                 FROM pg_amproc m
-                 WHERE m.amprocfamily = $1 AND m.amproclefttype = $2
-                 ORDER BY m.amprocnum, m.oid`, [family, intype])) {
+                PgQueries.get("opclass_amproc_members"), [family, intype])) {
             out.push("FUNCTION " + num(row.amprocnum) + " ("
                     + str(row.lt) + "," + str(row.rt)
                     + ") " + str(row.fn));
@@ -2297,14 +1854,7 @@ class Data {
      */
     async loadSecLabels(conn: SqlConnection): Promise<void> {
         for (const row of await conn.query<Row>(
-                `SELECT o.name AS target, d.objoid, o.cls::text AS cls, d.objsubid,
-                        a.attname, d.provider, d.label
-                 FROM pg_seclabel d
-                 JOIN (${NS_OBJECTS}
-                 ) o ON o.cls = d.classoid AND o.obj = d.objoid
-                 LEFT JOIN pg_attribute a ON d.classoid = 'pg_class'::regclass
-                         AND a.attrelid = d.objoid AND a.attnum = d.objsubid
-                 ORDER BY 1, 2, 3`, nsParams(this.ns, 17))) {
+                PgQueries.get("seclabels"), nsParams(this.ns, 17))) {
             if (this.extMember(num(row.objoid))) {
                 continue;
             }
@@ -2350,10 +1900,7 @@ class Data {
         // composites and ranges are managed TYPE objects, domains
         // managed DOMAIN, and a range's multirange folds into it)
         for (const row of await conn.query<Row>(
-                `SELECT t.oid, t.typname, t.typtype
-                 FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace
-                 WHERE n.nspname = $1 AND t.typtype = 'b' AND t.typelem = 0
-                 ORDER BY t.oid`, [this.ns])) {
+                PgQueries.get("other_base_types"), [this.ns])) {
             if (this.extMember(num(row.oid))) {
                 continue;
             }
@@ -2369,10 +1916,7 @@ class Data {
         // of scope). The name keeps the extension: prefix so the id
         // stays stable across the promotion from OTHER.
         for (const row of await conn.query<Row>(
-                `SELECT e.oid, e.extname
-                 FROM pg_extension e JOIN pg_namespace n ON n.oid = e.extnamespace
-                 WHERE n.nspname = $1
-                 ORDER BY e.oid`, [this.ns])) {
+                PgQueries.get("other_extensions"), [this.ns])) {
             const extname = str(row.extname);
             this.define(new ObjectId(ObjectKind.EXTENSION, "extension:" + extname),
                     "extension",
@@ -2385,10 +1929,7 @@ class Data {
         // encoding conversions a desired script cannot express
         // (DEFAULT CONVERSION is a database-wide object word)
         for (const row of await conn.query<Row>(
-                `SELECT cv.oid, cv.conname
-                 FROM pg_conversion cv JOIN pg_namespace n ON n.oid = cv.connamespace
-                 WHERE n.nspname = $1 AND cv.condefault
-                 ORDER BY cv.oid`, [this.ns])) {
+                PgQueries.get("other_default_conversions"), [this.ns])) {
             if (this.extMember(num(row.oid))) {
                 continue;
             }
@@ -2404,15 +1945,7 @@ class Data {
         // NOT NULL constraints ('n') fold into their COLUMN; non-local
         // rows are partition/inheritance copies of the parent.
         for (const row of await conn.query<Row>(
-                `SELECT c.oid, rel.relname AS parent, c.conname
-                 FROM pg_constraint c
-                 JOIN pg_class rel ON rel.oid = c.conrelid
-                 JOIN pg_namespace n ON n.oid = rel.relnamespace
-                 WHERE n.nspname = $1 AND c.conislocal
-                   AND c.contype NOT IN ('p','u','f','c','x','n')
-                   AND NOT EXISTS (SELECT 1 FROM pg_trigger t
-                                   WHERE t.tgconstraint = c.oid)
-                 ORDER BY c.oid`, [this.ns])) {
+                PgQueries.get("other_constraints"), [this.ns])) {
             const oid = num(row.oid);
             if (this.extMember(oid)) {
                 continue;
@@ -2427,14 +1960,7 @@ class Data {
         // collations the managed loader cannot express (default provider,
         // bound encoding) stay OTHER
         for (const row of await conn.query<Row>(
-                `SELECT cl.oid, cl.collname
-                 FROM pg_collation cl JOIN pg_namespace n ON n.oid = cl.collnamespace
-                 WHERE n.nspname = $1
-                   AND (cl.collprovider NOT IN ('c', 'i')
-                        OR cl.collencoding NOT IN (-1,
-                            (SELECT encoding FROM pg_database
-                             WHERE datname = current_database())))
-                 ORDER BY cl.oid`, [this.ns])) {
+                PgQueries.get("other_collations"), [this.ns])) {
             if (this.extMember(num(row.oid))) {
                 continue;
             }
@@ -2453,37 +1979,7 @@ class Data {
         // definition is the sorted grantee:PRIVILEGE[*] token list with
         // the owner written <owner> and the grantor dropped.
         for (const row of await conn.query<Row>(
-                `SELECT 'pg_class' AS cls, 'privileges:' || c.relname AS name,
-                        c.oid, '' AS attname,
-                        ${aclTokens("c.relacl", "c.relowner")}
-                        AS acl
-                 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
-                 WHERE n.nspname = $1 AND c.relacl IS NOT NULL
-                 UNION ALL
-                 SELECT 'pg_proc', 'privileges:' || p.proname || '('
-                         || pg_get_function_identity_arguments(p.oid) || ')',
-                         p.oid, '',
-                        ${aclTokens("p.proacl", "p.proowner")}
-                        AS acl
-                 FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
-                 WHERE n.nspname = $2 AND p.proacl IS NOT NULL
-                 UNION ALL
-                 SELECT 'pg_type', 'privileges:' || t.typname, t.oid, '',
-                        ${aclTokens("t.typacl", "t.typowner")}
-                        AS acl
-                 FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace
-                 WHERE n.nspname = $3 AND t.typacl IS NOT NULL
-                 UNION ALL
-                 SELECT 'pg_attribute', 'privileges:' || c.relname
-                         || '.' || a.attname, a.attrelid, a.attname,
-                        ${aclTokens("a.attacl", "c.relowner")}
-                        AS acl
-                 FROM pg_attribute a
-                 JOIN pg_class c ON c.oid = a.attrelid
-                 JOIN pg_namespace n ON n.oid = c.relnamespace
-                 WHERE n.nspname = $4 AND a.attacl IS NOT NULL
-                   AND a.attnum > 0 AND NOT a.attisdropped
-                 ORDER BY 2, 1`, nsParams(this.ns, 4))) {
+                PgQueries.get("privileges"), nsParams(this.ns, 4))) {
             const oid = num(row.oid);
             if (this.extMember(oid)) {
                 continue;
@@ -2525,14 +2021,7 @@ class Data {
         // Global rows (defaclnamespace = 0) belong to no namespace and
         // stay invisible like every other cluster object (A.5).
         for (const row of await conn.query<Row>(
-                `SELECT d.oid, r.rolname AS role, d.defaclobjtype AS objtype,
-                        ${aclTokens("d.defaclacl", "d.defaclrole")}
-                        AS acl
-                 FROM pg_default_acl d
-                 JOIN pg_roles r ON r.oid = d.defaclrole
-                 JOIN pg_namespace n ON n.oid = d.defaclnamespace
-                 WHERE n.nspname = $1
-                 ORDER BY 2, 3`, [this.ns])) {
+                PgQueries.get("default_acl"), [this.ns])) {
             const oid = num(row.oid);
             if (this.extMember(oid)) {
                 continue;
@@ -2561,36 +2050,7 @@ class Data {
         // An index's relowner always follows its table's — it cannot
         // diverge, so index rows are skipped outright.
         for (const row of await conn.query<Row>(
-                `-- an index's relowner always follows its table's — it
-                 -- cannot diverge — and a composite's 'c' or a toast 't'
-                 -- row follows its type/table, so 'i'/'I'/'c'/'t' are out
-                 SELECT 'pg_class' AS cls, 'ownership:' || c.relname AS name,
-                        c.oid, c.relowner::regrole::text AS owner
-                 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
-                 WHERE n.nspname = $1 AND c.relkind NOT IN ('i', 'I', 'c', 't')
-                   AND c.relowner::regrole::text <> current_user
-                 UNION ALL
-                 SELECT 'pg_proc', 'ownership:' || p.proname || '('
-                         || pg_get_function_identity_arguments(p.oid) || ')',
-                        p.oid, p.proowner::regrole::text
-                 FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
-                 WHERE n.nspname = $2 AND p.proowner::regrole::text <> current_user
-                 UNION ALL
-                 SELECT 'pg_type', 'ownership:' || t.typname,
-                        t.oid, t.typowner::regrole::text
-                 FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace
-                 WHERE n.nspname = $3 AND t.typowner::regrole::text <> current_user
-                   -- a table's implicit rowtype and its array type flip
-                   -- owner with the table — neither is a type object of
-                   -- its own; only a standalone composite's 'c' relation
-                   -- counts. A multirange follows its range (ALTER TYPE on
-                   -- it is rejected outright), so 'm' is out too
-                   AND t.typtype <> 'm'
-                   AND t.typelem = 0
-                   AND NOT EXISTS (SELECT 1 FROM pg_class rt
-                                   WHERE rt.oid = t.typrelid
-                                     AND rt.relkind <> 'c')
-                 ORDER BY 2`, nsParams(this.ns, 3))) {
+                PgQueries.get("ownership"), nsParams(this.ns, 3))) {
             const oid = num(row.oid);
             if (this.extMember(oid)) {
                 continue;
@@ -2619,27 +2079,41 @@ class Data {
                             + " OWNER TO " + PgIdentifiers.quote(owner)]]));
             this.dep(wid, target);
         }
+        // the reconcile unit itself: the schema's own owner and acl.
+        // nspowner follows the same session-role "don't care" rule as
+        // every other owner leg; nspacl is NULL until a GRANT (the
+        // default acl then), and an empty acl means nothing held. Both
+        // mirror onto the neutral "<namespace>" name — a managed name
+        // no table, view or type can collide with (4.1) — so the real
+        // schema name never enters a canonical
+        for (const row of await conn.query<Row>(
+                PgQueries.get("namespace_owner"), [this.ns])) {
+            const owner = str(row.owner);
+            this.define(new ObjectId(ObjectKind.OWNERSHIP, "<namespace>"),
+                    "owner=" + owner,
+                    new Map([[CREATE_SQL, "ALTER SCHEMA ${namespace} OWNER TO "
+                            + PgIdentifiers.quote(owner)]]));
+        }
+        for (const row of await conn.query<Row>(
+                PgQueries.get("namespace_acl"), [this.ns])) {
+            const acl = strOrNull(row.acl);
+            if (acl === null) {
+                // an acl of '{}' unnests to no rows — nothing held
+                continue;
+            }
+            this.define(new ObjectId(ObjectKind.PRIVILEGES, "<namespace>"),
+                    "privileges=" + acl,
+                    new Map([[GRANT_TARGET, "SCHEMA ${namespace}"]]));
+        }
         // publication bindings on namespace tables (the publication itself
         // is a cluster-level reference, 4.1; the FOR TABLE edge is the
         // namespace-visible part). The binding's parent is the bound
         // table, so it orders after it; filter/column lists ride in the
         // canonical (pg_publication_rel.prqual/.prattrs, PG15+)
-        const relBindingCols = this.serverMajor >= 15;
         for (const row of await conn.query<Row>(
-                `SELECT p.pubname, c.relname, c.oid,
-                        ${relBindingCols ? `
-                        pg_get_expr(pr.prqual, pr.prrelid) AS qual,
-                        (SELECT string_agg(a.attname, ',' ORDER BY u.ord)
-                           FROM unnest(string_to_array(pr.prattrs::text, ' ')::smallint[])
-                                WITH ORDINALITY u(attnum, ord)
-                           JOIN pg_attribute a
-                             ON a.attrelid = pr.prrelid AND a.attnum = u.attnum) AS cols
-                        ` : "NULL AS qual, NULL AS cols\n"}
-                 FROM pg_publication_rel pr
-                 JOIN pg_class c ON c.oid = pr.prrelid
-                 JOIN pg_namespace n ON n.oid = c.relnamespace AND n.nspname = $1
-                 JOIN pg_publication p ON p.oid = pr.prpubid
-                 ORDER BY 1, 2`, [this.ns])) {
+                PgQueries.get(this.serverMajor >= 15
+                        ? "publication_rel" : "publication_rel_pre15"),
+                [this.ns])) {
             if (this.extMember(num(row.oid))) {
                 continue;
             }
@@ -2649,12 +2123,7 @@ class Data {
         // the publication to the schema itself (PostgreSQL 15+)
         if (this.serverMajor >= 15) {
             for (const row of await conn.query<Row>(
-                    `SELECT p.pubname, NULL AS relname,
-                            NULL AS qual, NULL AS cols
-                     FROM pg_publication_namespace pn
-                     JOIN pg_namespace n ON n.oid = pn.pnnspid AND n.nspname = $1
-                     JOIN pg_publication p ON p.oid = pn.pnpubid
-                     ORDER BY 1`, [this.ns])) {
+                    PgQueries.get("publication_namespace"), [this.ns])) {
                 this.publicationBinding(row, "TABLES IN SCHEMA", "schema");
             }
         }
@@ -2667,37 +2136,7 @@ class Data {
         // canonical; a cast anchored only to unmanaged objects stays
         // cast: OTHER
         for (const row of await conn.query<Row>(
-                `SELECT c.oid, c.castsource, c.casttarget, c.castfunc,
-                        'cast:' || format_type(c.castsource, NULL)
-                         || '->' || format_type(c.casttarget, NULL) AS name,
-                        format_type(c.castsource, NULL)
-                         || '->' || format_type(c.casttarget, NULL) AS bare,
-                        c.castcontext::text || ' ' || c.castmethod::text || ' '
-                            || CASE WHEN c.castfunc = 0 THEN 'none'
-                                    ELSE c.castfunc::regprocedure::text
-                                    END AS canon,
-                        'CREATE CAST (' || format_type(c.castsource, NULL)
-                            || ' AS ' || format_type(c.casttarget, NULL) || ') '
-                            || CASE c.castmethod
-                                   WHEN 'f' THEN 'WITH FUNCTION '
-                                           || c.castfunc::regprocedure::text
-                                   WHEN 'i' THEN 'WITH INOUT' END
-                            || CASE c.castcontext
-                                   WHEN 'a' THEN ' AS ASSIGNMENT'
-                                   WHEN 'i' THEN ' AS IMPLICIT'
-                                   ELSE '' END AS create_sql,
-                        'DROP CAST (' || format_type(c.castsource, NULL)
-                            || ' AS ' || format_type(c.casttarget, NULL)
-                            || ')' AS drop_sql
-                 FROM pg_cast c
-                 WHERE EXISTS (SELECT 1 FROM pg_type t
-                               JOIN pg_namespace n ON n.oid = t.typnamespace
-                               WHERE n.nspname = $1
-                                 AND t.oid IN (c.castsource, c.casttarget))
-                    OR EXISTS (SELECT 1 FROM pg_proc f
-                               JOIN pg_namespace n ON n.oid = f.pronamespace
-                               WHERE n.nspname = $2 AND f.oid = c.castfunc)
-                 ORDER BY c.oid`, nsParams(this.ns, 2))) {
+                PgQueries.get("casts"), nsParams(this.ns, 2))) {
             const oid = num(row.oid);
             if (this.extMember(oid)) {
                 continue;
@@ -2744,43 +2183,7 @@ class Data {
         // the language itself a cluster reference; anything else stays
         // transform: OTHER
         for (const row of await conn.query<Row>(
-                `SELECT t.oid, t.trftype, t.trffromsql, t.trftosql,
-                        'transform:' || format_type(t.trftype, NULL)
-                         || '/' || l.lanname AS name,
-                        format_type(t.trftype, NULL)
-                         || '/' || l.lanname AS bare,
-                        CASE WHEN t.trffromsql = 0 THEN 'none'
-                             ELSE t.trffromsql::regprocedure::text END || ' '
-                         || CASE WHEN t.trftosql = 0 THEN 'none'
-                                 ELSE t.trftosql::regprocedure::text
-                                 END AS canon,
-                        'CREATE TRANSFORM FOR '
-                         || format_type(t.trftype, NULL) || ' LANGUAGE '
-                         || quote_ident(l.lanname)
-                         || ' ('
-                         || CASE WHEN t.trffromsql = 0 THEN ''
-                                 ELSE 'FROM SQL WITH FUNCTION '
-                                      || t.trffromsql::regprocedure::text
-                                      || CASE WHEN t.trftosql <> 0
-                                              THEN ', ' ELSE '' END
-                                 END
-                         || CASE WHEN t.trftosql = 0 THEN ''
-                                 ELSE 'TO SQL WITH FUNCTION '
-                                      || t.trftosql::regprocedure::text
-                                 END
-                         || ')' AS create_sql,
-                        'DROP TRANSFORM FOR '
-                         || format_type(t.trftype, NULL) || ' LANGUAGE '
-                         || quote_ident(l.lanname) AS drop_sql
-                 FROM pg_transform t JOIN pg_language l ON l.oid = t.trflang
-                 WHERE EXISTS (SELECT 1 FROM pg_type ty
-                               JOIN pg_namespace n ON n.oid = ty.typnamespace
-                               WHERE n.nspname = $1 AND ty.oid = t.trftype)
-                    OR EXISTS (SELECT 1 FROM pg_proc f
-                               JOIN pg_namespace n ON n.oid = f.pronamespace
-                               WHERE n.nspname = $2
-                                 AND f.oid IN (t.trffromsql, t.trftosql))
-                 ORDER BY t.oid`, nsParams(this.ns, 2))) {
+                PgQueries.get("transforms"), nsParams(this.ns, 2))) {
             const oid = num(row.oid);
             if (this.extMember(oid)) {
                 continue;
@@ -2804,14 +2207,7 @@ class Data {
         // languages are database-level; a language whose handlers live in
         // the namespace is part of the desired state
         for (const row of await conn.query<Row>(
-                `SELECT l.oid, 'language:' || l.lanname AS name
-                 FROM pg_language l
-                 WHERE EXISTS (SELECT 1 FROM pg_proc h
-                               JOIN pg_namespace n ON n.oid = h.pronamespace
-                               WHERE n.nspname = $1
-                                 AND h.oid IN (l.lanplcallfoid, l.laninline,
-                                               l.lanvalidator))
-                 ORDER BY l.oid`, [this.ns])) {
+                PgQueries.get("languages"), [this.ns])) {
             if (this.extMember(num(row.oid))) {
                 continue;
             }
@@ -2826,12 +2222,7 @@ class Data {
         // per-sequence binding to reconcile — those pubs are filtered out
         if (this.serverMajor >= 19) {
             for (const row of await conn.query<Row>(
-                    `SELECT v.pubname, v.sequencename AS relname,
-                            NULL AS qual, NULL AS cols
-                     FROM pg_publication_sequences v
-                     JOIN pg_publication p ON p.pubname = v.pubname
-                      WHERE v.schemaname = $1 AND NOT p.puballsequences
-                     ORDER BY 1`, [this.ns])) {
+                    PgQueries.get("publication_sequences"), [this.ns])) {
                 this.publicationBinding(row, "SEQUENCE", "sequence");
             }
         }
@@ -2921,14 +2312,7 @@ class Data {
      */
     async loadComments(conn: SqlConnection): Promise<void> {
         for (const row of await conn.query<Row>(
-                `SELECT o.cls::text AS cls, d.objoid, d.objsubid,
-                        o.name AS target, a.attname, d.description
-                 FROM pg_description d
-                 JOIN (${NS_OBJECTS}
-                 ) o ON o.cls = d.classoid AND o.obj = d.objoid
-                 LEFT JOIN pg_attribute a ON d.classoid = 'pg_class'::regclass
-                         AND a.attrelid = d.objoid AND a.attnum = d.objsubid
-                 ORDER BY 1, 2, 3`, nsParams(this.ns, 17))) {
+                PgQueries.get("comments"), nsParams(this.ns, 17))) {
             if (this.extMember(num(row.objoid))) {
                 continue;
             }
@@ -3163,46 +2547,21 @@ class Data {
     async loadDependencies(conn: SqlConnection): Promise<void> {
         // view dependencies via the _RETURN rewrite rule
         for (const row of await conn.query<Row>(
-                `SELECT DISTINCT v.oid AS viewer, d.refobjid AS dep
-                 FROM pg_rewrite r
-                 JOIN pg_depend d ON d.classid = 'pg_rewrite'::regclass AND d.objid = r.oid
-                     AND d.refclassid = 'pg_class'::regclass
-                 JOIN pg_class v ON v.oid = r.ev_class AND v.relkind IN ('v','m')
-                 JOIN pg_namespace vn ON vn.oid = v.relnamespace AND vn.nspname = $1
-                 JOIN pg_class rc ON rc.oid = d.refobjid
-                 JOIN pg_namespace rn ON rn.oid = rc.relnamespace AND rn.nspname = $2
-                 WHERE r.rulename = '_RETURN' AND rc.oid <> v.oid`,
+                PgQueries.get("dep_view_class"),
                 [this.ns, this.ns])) {
             const viewer = this.relByOid.get(num(row.viewer));
             this.depOid(viewer!, num(row.dep));
         }
         // view-on-routine and view-on-type dependencies
         for (const row of await conn.query<Row>(
-                `SELECT DISTINCT v.oid AS viewer, d.refobjid AS dep
-                 FROM pg_rewrite r
-                 JOIN pg_depend d ON d.classid = 'pg_rewrite'::regclass AND d.objid = r.oid
-                     AND d.refclassid IN ('pg_proc'::regclass, 'pg_type'::regclass,'pg_ts_config'::regclass,'pg_ts_dict'::regclass,
-                                        'pg_ts_parser'::regclass,'pg_ts_template'::regclass,
-                                        'pg_operator'::regclass,'pg_opclass'::regclass,'pg_opfamily'::regclass)
-                 JOIN pg_class v ON v.oid = r.ev_class AND v.relkind IN ('v','m')
-                 JOIN pg_namespace vn ON vn.oid = v.relnamespace AND vn.nspname = $1
-                 WHERE r.rulename = '_RETURN'`, [this.ns])) {
+                PgQueries.get("dep_view_other"), [this.ns])) {
             const viewer = this.relByOid.get(num(row.viewer));
             this.depOid(viewer!, num(row.dep));
         }
         // routine dependencies on relations, routines and types
         // (SQL-language bodies and argument/return types)
         for (const row of await conn.query<Row>(
-                `SELECT DISTINCT d.objid AS caller, d.refobjid AS dep
-                 FROM pg_depend d
-                 JOIN pg_proc p ON p.oid = d.objid
-                 JOIN pg_namespace pn ON pn.oid = p.pronamespace AND pn.nspname = $1
-                 WHERE d.classid = 'pg_proc'::regclass
-                   AND d.refclassid IN ('pg_class'::regclass, 'pg_proc'::regclass,
-                                        'pg_type'::regclass, 'pg_language'::regclass,
-                                        'pg_ts_config'::regclass,'pg_ts_dict'::regclass,
-                                        'pg_ts_parser'::regclass,'pg_ts_template'::regclass,
-                                        'pg_operator'::regclass,'pg_opclass'::regclass,'pg_opfamily'::regclass)`,
+                PgQueries.get("dep_routine"),
                 [this.ns])) {
             const caller = this.procByOid.get(num(row.caller));
             if (caller !== undefined) {
@@ -3211,14 +2570,7 @@ class Data {
         }
         // index-on-routine dependencies (expression indexes)
         for (const row of await conn.query<Row>(
-                `SELECT DISTINCT i.indexrelid AS idx, d.refobjid AS dep
-                 FROM pg_depend d
-                 JOIN pg_class ic ON ic.oid = d.objid AND ic.relkind = 'i'
-                 JOIN pg_index i ON i.indexrelid = ic.oid
-                 JOIN pg_namespace n ON n.oid = ic.relnamespace AND n.nspname = $1
-                 JOIN pg_proc p ON p.oid = d.refobjid
-                 JOIN pg_namespace pn ON pn.oid = p.pronamespace AND pn.nspname = $2
-                 WHERE d.classid = 'pg_class'::regclass AND d.refclassid = 'pg_proc'::regclass`,
+                PgQueries.get("dep_index_proc"),
                 [this.ns, this.ns])) {
             const idx = this.relByOid.get(num(row.idx));
             const proc = this.procByOid.get(num(row.dep));
@@ -3228,19 +2580,7 @@ class Data {
         // (the edge lands on the column and on its parent table, so that a
         // covered column inside a CREATE TABLE still orders after the ref)
         for (const row of await conn.query<Row>(
-                `SELECT ad.adrelid AS tbl, a.attname AS col, d.refobjid AS dep
-                 FROM pg_depend d
-                 JOIN pg_attrdef ad ON ad.oid = d.objid
-                 JOIN pg_class tc ON tc.oid = ad.adrelid
-                 JOIN pg_namespace tn ON tn.oid = tc.relnamespace AND tn.nspname = $1
-                 JOIN pg_attribute a ON a.attrelid = ad.adrelid AND a.attnum = ad.adnum
-                     AND NOT a.attisdropped
-                 WHERE d.classid = 'pg_attrdef'::regclass AND d.deptype = 'n'
-                   AND d.refclassid IN ('pg_class'::regclass, 'pg_proc'::regclass,
-                                        'pg_type'::regclass,
-                                        'pg_ts_config'::regclass,'pg_ts_dict'::regclass,
-                                        'pg_ts_parser'::regclass,'pg_ts_template'::regclass,
-                                        'pg_operator'::regclass,'pg_opclass'::regclass,'pg_opfamily'::regclass)`,
+                PgQueries.get("dep_attrdef"),
                 [this.ns])) {
             const table = this.relByOid.get(num(row.tbl));
             if (table === undefined) {
@@ -3256,18 +2596,7 @@ class Data {
         // constraint backing an FK (a pg_class ref to its index), and
         // other constraints
         for (const row of await conn.query<Row>(
-                `SELECT d.objid AS con, d.refclassid::regclass::text AS refcls,
-                        d.refobjid AS dep
-                 FROM pg_depend d
-                 JOIN pg_constraint co ON co.oid = d.objid
-                 JOIN pg_class cr ON cr.oid = co.conrelid
-                 JOIN pg_namespace cn ON cn.oid = cr.relnamespace AND cn.nspname = $1
-                 WHERE d.classid = 'pg_constraint'::regclass
-                   AND d.refclassid IN ('pg_proc'::regclass, 'pg_type'::regclass,
-                                        'pg_class'::regclass, 'pg_constraint'::regclass,
-                                        'pg_ts_config'::regclass,'pg_ts_dict'::regclass,
-                                        'pg_ts_parser'::regclass,'pg_ts_template'::regclass,
-                                        'pg_operator'::regclass,'pg_opclass'::regclass,'pg_opfamily'::regclass)`,
+                PgQueries.get("dep_constraint"),
                 [this.ns])) {
             const from = this.conByOid.get(num(row.con));
             const ref = num(row.dep);
@@ -3282,43 +2611,14 @@ class Data {
         // subtype-diff routines; domain check constraints -> the
         // routines, types and relations their expressions use
         for (const row of await conn.query<Row>(
-                `SELECT d.objid AS dom, d.refobjid AS dep
-                 FROM pg_depend d
-                 JOIN pg_type t ON t.oid = d.objid AND t.typtype IN ('d','r')
-                 JOIN pg_namespace n ON n.oid = t.typnamespace AND n.nspname = $1
-                 WHERE d.classid = 'pg_type'::regclass
-                   AND d.refclassid IN ('pg_type'::regclass, 'pg_proc'::regclass,'pg_ts_config'::regclass,'pg_ts_dict'::regclass,
-                                        'pg_ts_parser'::regclass,'pg_ts_template'::regclass,
-                                        'pg_operator'::regclass,'pg_opclass'::regclass,'pg_opfamily'::regclass)
-                 UNION
-                 SELECT c.contypid, d.refobjid
-                 FROM pg_depend d
-                 JOIN pg_constraint c ON c.oid = d.objid AND c.contypid <> 0
-                 JOIN pg_type t ON t.oid = c.contypid
-                 JOIN pg_namespace n ON n.oid = t.typnamespace AND n.nspname = $2
-                 WHERE d.classid = 'pg_constraint'::regclass
-                   AND d.refclassid IN ('pg_proc'::regclass, 'pg_type'::regclass,
-                                        'pg_class'::regclass,
-                                        'pg_ts_config'::regclass,'pg_ts_dict'::regclass,
-                                        'pg_ts_parser'::regclass,'pg_ts_template'::regclass,
-                                        'pg_operator'::regclass,'pg_opclass'::regclass,'pg_opfamily'::regclass)`,
+                PgQueries.get("dep_type"),
                 [this.ns, this.ns])) {
             this.depOid(this.typeByOid.get(num(row.dom))!, num(row.dep));
         }
         // policies -> the routines, types and relations their
         // USING / WITH CHECK expressions reference
         for (const row of await conn.query<Row>(
-                `SELECT d.objid AS pol, d.refobjid AS dep
-                 FROM pg_depend d
-                 JOIN pg_policy po ON po.oid = d.objid
-                 JOIN pg_class c ON c.oid = po.polrelid
-                 JOIN pg_namespace n ON n.oid = c.relnamespace AND n.nspname = $1
-                 WHERE d.classid = 'pg_policy'::regclass
-                   AND d.refclassid IN ('pg_proc'::regclass, 'pg_type'::regclass,
-                                        'pg_class'::regclass,
-                                        'pg_ts_config'::regclass,'pg_ts_dict'::regclass,
-                                        'pg_ts_parser'::regclass,'pg_ts_template'::regclass,
-                                        'pg_operator'::regclass,'pg_opclass'::regclass,'pg_opfamily'::regclass)`,
+                PgQueries.get("dep_policy"),
                 [this.ns])) {
             this.depOid(this.polByOid.get(num(row.pol))!, num(row.dep));
         }
@@ -3326,17 +2626,7 @@ class Data {
         // and collations (objsubid is the column's attnum; a zero objsubid
         // is an object-level edge)
         for (const row of await conn.query<Row>(
-                `SELECT d.objid AS tbl, d.objsubid AS attnum, a.attname AS col,
-                        d.refobjid AS dep
-                 FROM pg_depend d
-                 JOIN pg_class tc ON tc.oid = d.objid
-                 JOIN pg_namespace tn ON tn.oid = tc.relnamespace AND tn.nspname = $1
-                 LEFT JOIN pg_attribute a ON a.attrelid = d.objid AND a.attnum = d.objsubid
-                     AND NOT a.attisdropped
-                 WHERE d.classid = 'pg_class'::regclass AND d.deptype = 'n'
-                   AND d.refclassid IN ('pg_type'::regclass, 'pg_collation'::regclass,'pg_ts_config'::regclass,'pg_ts_dict'::regclass,
-                                        'pg_ts_parser'::regclass,'pg_ts_template'::regclass,
-                                        'pg_operator'::regclass,'pg_opclass'::regclass,'pg_opfamily'::regclass)`,
+                PgQueries.get("dep_column_type"),
                 [this.ns])) {
             const table = this.relByOid.get(num(row.tbl));
             if (table === undefined) {
@@ -3355,12 +2645,7 @@ class Data {
         }
         // partition children (tables and indexes) -> their parents
         for (const row of await conn.query<Row>(
-                `SELECT d.objid AS child, d.refobjid AS dep
-                 FROM pg_depend d
-                 JOIN pg_class cc ON cc.oid = d.objid
-                 JOIN pg_namespace cn ON cn.oid = cc.relnamespace AND cn.nspname = $1
-                 WHERE d.classid = 'pg_class'::regclass AND d.refclassid = 'pg_class'::regclass
-                   AND d.deptype IN ('a', 'P')`, [this.ns])) {
+                PgQueries.get("dep_partition"), [this.ns])) {
             this.depOid(this.relByOid.get(num(row.child))!, num(row.dep));
         }
         // unsupported objects -> the managed objects they depend on.
@@ -3369,21 +2654,7 @@ class Data {
         // exclusion constraint dies with its table, a cast or a range on
         // our type blocks dropping it, a language blocks its handlers.
         for (const row of await conn.query<Row>(
-                `SELECT d.classid::regclass::text AS cls, d.objid,
-                        d.refclassid::regclass::text AS refcls, d.refobjid AS dep
-                 FROM pg_depend d
-                 WHERE d.classid IN ('pg_type'::regclass,'pg_language'::regclass,
-                                     'pg_rewrite'::regclass,'pg_statistic_ext'::regclass,
-                                     'pg_cast'::regclass,'pg_transform'::regclass,
-                                     'pg_conversion'::regclass,'pg_operator'::regclass,
-                                     'pg_opclass'::regclass,'pg_opfamily'::regclass,
-                                     'pg_ts_config'::regclass,'pg_ts_dict'::regclass,
-                                     'pg_ts_parser'::regclass,'pg_ts_template'::regclass)
-                   AND d.refclassid IN ('pg_class'::regclass,'pg_proc'::regclass,
-                                        'pg_type'::regclass,'pg_collation'::regclass,
-                                        'pg_language'::regclass,'pg_constraint'::regclass,
-                                        'pg_ts_config'::regclass,'pg_ts_dict'::regclass,
-                                        'pg_ts_parser'::regclass,'pg_ts_template'::regclass)`)) {
+                PgQueries.get("dep_other"))) {
             const map = this.otherByOid.get(str(row.cls));
             const from = map?.get(num(row.objid));
             if (from === undefined || from === null) {
@@ -3403,244 +2674,7 @@ class Data {
     }
 
     async loadExternalDependents(conn: SqlConnection): Promise<void> {
-        const sql = `
-            SELECT DISTINCT d.refobjid AS tgt, rn.nspname AS depns, rc.relname AS depname
-            FROM pg_depend d
-            JOIN pg_rewrite r ON r.oid = d.objid
-            JOIN pg_class rc ON rc.oid = r.ev_class
-            JOIN pg_namespace rn ON rn.oid = rc.relnamespace
-            JOIN pg_class tgt ON tgt.oid = d.refobjid
-            JOIN pg_namespace tn ON tn.oid = tgt.relnamespace AND tn.nspname = $1
-            WHERE d.classid = 'pg_rewrite'::regclass AND d.refclassid = 'pg_class'::regclass
-              AND rn.nspname <> $2
-            UNION
-            SELECT DISTINCT d.refobjid, rn.nspname, rc.relname
-            FROM pg_depend d
-            JOIN pg_constraint co ON co.oid = d.objid
-            JOIN pg_class rc ON rc.oid = co.conrelid
-            JOIN pg_namespace rn ON rn.oid = rc.relnamespace
-            JOIN pg_class tgt ON tgt.oid = d.refobjid
-            JOIN pg_namespace tn ON tn.oid = tgt.relnamespace AND tn.nspname = $3
-            WHERE d.classid = 'pg_constraint'::regclass AND d.refclassid = 'pg_class'::regclass
-              AND rn.nspname <> $4
-            UNION
-            SELECT DISTINCT d.refobjid, sn.nspname, sq.relname
-            FROM pg_depend d
-            JOIN pg_class sq ON sq.oid = d.objid AND sq.relkind = 'S'
-            JOIN pg_namespace sn ON sn.oid = sq.relnamespace
-            JOIN pg_class tgt ON tgt.oid = d.refobjid
-            JOIN pg_namespace tn ON tn.oid = tgt.relnamespace AND tn.nspname = $5
-            WHERE d.classid = 'pg_class'::regclass AND d.refclassid = 'pg_class'::regclass
-              AND d.deptype = 'a' AND sn.nspname <> $6
-            UNION
-            SELECT DISTINCT d.refobjid, pn.nspname, p.proname
-            FROM pg_depend d
-            JOIN pg_proc p ON p.oid = d.objid
-            JOIN pg_namespace pn ON pn.oid = p.pronamespace
-            WHERE d.classid = 'pg_proc'::regclass
-              AND d.refclassid IN ('pg_class'::regclass, 'pg_proc'::regclass,
-                                   'pg_type'::regclass, 'pg_language'::regclass)
-              AND pn.nspname <> $7
-            UNION
-            SELECT DISTINCT d.refobjid, rn.nspname, rc.relname
-            FROM pg_depend d
-            JOIN pg_rewrite r ON r.oid = d.objid
-            JOIN pg_class rc ON rc.oid = r.ev_class
-            JOIN pg_namespace rn ON rn.oid = rc.relnamespace
-            WHERE d.classid = 'pg_rewrite'::regclass
-              AND d.refclassid IN ('pg_proc'::regclass, 'pg_type'::regclass)
-              AND rn.nspname <> $8
-            UNION
-            SELECT DISTINCT d.refobjid, rn.nspname, rc.relname || '.' || t.tgname
-            FROM pg_depend d
-            JOIN pg_trigger t ON t.oid = d.objid
-            JOIN pg_class rc ON rc.oid = t.tgrelid
-            JOIN pg_namespace rn ON rn.oid = rc.relnamespace
-            WHERE d.classid = 'pg_trigger'::regclass
-              AND d.refclassid = 'pg_proc'::regclass AND rn.nspname <> $9
-            UNION
-            SELECT DISTINCT d.refobjid, rn.nspname, rc.relname || '.' || a.attname
-            FROM pg_depend d
-            JOIN pg_attrdef ad ON ad.oid = d.objid
-            JOIN pg_attribute a ON a.attrelid = ad.adrelid AND a.attnum = ad.adnum
-                AND NOT a.attisdropped
-            JOIN pg_class rc ON rc.oid = ad.adrelid
-            JOIN pg_namespace rn ON rn.oid = rc.relnamespace
-            WHERE d.classid = 'pg_attrdef'::regclass AND d.deptype = 'n'
-              AND d.refclassid IN ('pg_class'::regclass, 'pg_proc'::regclass,
-                                   'pg_type'::regclass)
-              AND rn.nspname <> $10
-            UNION
-            SELECT DISTINCT d.refobjid, rn.nspname, co.conname
-            FROM pg_depend d
-            JOIN pg_constraint co ON co.oid = d.objid
-            JOIN pg_class rc ON rc.oid = co.conrelid
-            JOIN pg_namespace rn ON rn.oid = rc.relnamespace
-            WHERE d.classid = 'pg_constraint'::regclass
-              AND d.refclassid IN ('pg_proc'::regclass, 'pg_type'::regclass)
-              AND rn.nspname <> $11
-            UNION
-            SELECT DISTINCT d.refobjid, rn.nspname, ic.relname
-            FROM pg_depend d
-            JOIN pg_class ic ON ic.oid = d.objid AND ic.relkind = 'i'
-            JOIN pg_namespace rn ON rn.oid = ic.relnamespace
-            WHERE d.classid = 'pg_class'::regclass
-              AND d.refclassid IN ('pg_proc'::regclass, 'pg_type'::regclass)
-              AND rn.nspname <> $12
-            UNION
-            -- columns (objsubid > 0) and typed tables (objsubid = 0) in
-            -- other namespaces typed by or collated with our objects
-            SELECT DISTINCT d.refobjid, rn.nspname,
-                   rc.relname || CASE WHEN a.attname IS NULL THEN ''
-                                      ELSE '.' || a.attname END
-            FROM pg_depend d
-            JOIN pg_class rc ON rc.oid = d.objid
-            JOIN pg_namespace rn ON rn.oid = rc.relnamespace AND rn.nspname <> $13
-            LEFT JOIN pg_attribute a ON a.attrelid = d.objid
-                AND a.attnum = d.objsubid AND a.attnum > 0
-                AND NOT a.attisdropped
-            WHERE d.classid = 'pg_class'::regclass AND d.deptype = 'n'
-              AND d.refclassid IN ('pg_type'::regclass, 'pg_collation'::regclass)
-            UNION
-            -- types (domains, ranges, base types) in other namespaces
-            -- built on ours or calling our routines in defaults
-            SELECT DISTINCT d.refobjid, tn.nspname, t.typname
-            FROM pg_depend d
-            JOIN pg_type t ON t.oid = d.objid
-            JOIN pg_namespace tn ON tn.oid = t.typnamespace AND tn.nspname <> $14
-            WHERE d.classid = 'pg_type'::regclass
-              AND d.refclassid IN ('pg_type'::regclass, 'pg_proc'::regclass,
-                                   'pg_collation'::regclass)
-            UNION
-            -- check constraints on other namespaces' domains whose
-            -- expressions use our objects
-            SELECT DISTINCT d.refobjid, dn.nspname,
-                   dt.typname || '.' || c.conname
-            FROM pg_depend d
-            JOIN pg_constraint c ON c.oid = d.objid AND c.contypid <> 0
-            JOIN pg_type dt ON dt.oid = c.contypid
-            JOIN pg_namespace dn ON dn.oid = dt.typnamespace AND dn.nspname <> $15
-            WHERE d.classid = 'pg_constraint'::regclass
-              AND d.refclassid IN ('pg_proc'::regclass, 'pg_type'::regclass,
-                                   'pg_class'::regclass)
-            UNION
-            -- policies on other namespaces' tables whose expressions
-            -- use our objects
-            SELECT DISTINCT d.refobjid, rn.nspname,
-                   rc.relname || '.' || po.polname
-            FROM pg_depend d
-            JOIN pg_policy po ON po.oid = d.objid
-            JOIN pg_class rc ON rc.oid = po.polrelid
-            JOIN pg_namespace rn ON rn.oid = rc.relnamespace AND rn.nspname <> $16
-            WHERE d.classid = 'pg_policy'::regclass
-              AND d.refclassid IN ('pg_proc'::regclass, 'pg_type'::regclass,
-                                   'pg_class'::regclass)
-            UNION
-            -- dependents in other namespaces on our text-search and
-            -- operator objects — views, column defaults, and the
-            -- families' own member rows (an external dictionary on our
-            -- template, an external family member on our operator);
-            -- no tgt join: byOid resolves in-namespace refs only
-            SELECT DISTINCT d.refobjid, rn.nspname, rc.relname
-            FROM pg_depend d
-            JOIN pg_rewrite r ON r.oid = d.objid
-            JOIN pg_class rc ON rc.oid = r.ev_class
-            JOIN pg_namespace rn ON rn.oid = rc.relnamespace AND rn.nspname <> $17
-            WHERE d.classid = 'pg_rewrite'::regclass
-              AND d.refclassid IN ('pg_ts_config'::regclass,'pg_ts_dict'::regclass,
-                                   'pg_ts_parser'::regclass,'pg_ts_template'::regclass,
-                                   'pg_operator'::regclass,'pg_opclass'::regclass,
-                                   'pg_opfamily'::regclass)
-            UNION
-            SELECT DISTINCT d.refobjid, rn.nspname,
-                   rc.relname || '.' || a.attname
-            FROM pg_depend d
-            JOIN pg_attrdef ad ON ad.oid = d.objid
-            JOIN pg_attribute a ON a.attrelid = ad.adrelid AND a.attnum = ad.adnum
-                AND NOT a.attisdropped
-            JOIN pg_class rc ON rc.oid = ad.adrelid
-            JOIN pg_namespace rn ON rn.oid = rc.relnamespace AND rn.nspname <> $18
-            WHERE d.classid = 'pg_attrdef'::regclass AND d.deptype = 'n'
-              AND d.refclassid IN ('pg_ts_config'::regclass,'pg_ts_dict'::regclass,
-                                   'pg_ts_parser'::regclass,'pg_ts_template'::regclass,
-                                   'pg_operator'::regclass,'pg_opclass'::regclass,
-                                   'pg_opfamily'::regclass)
-            UNION
-            SELECT DISTINCT d.refobjid, tdn.nspname, td.dictname
-            FROM pg_depend d
-            JOIN pg_ts_dict td ON td.oid = d.objid
-            JOIN pg_namespace tdn ON tdn.oid = td.dictnamespace AND tdn.nspname <> $19
-            WHERE d.classid = 'pg_ts_dict'::regclass
-              AND d.refclassid IN ('pg_ts_config'::regclass,'pg_ts_dict'::regclass,
-                                   'pg_ts_parser'::regclass,'pg_ts_template'::regclass)
-            UNION
-            -- config mappings record as pg_ts_config -> pg_ts_dict
-            SELECT DISTINCT d.refobjid, cn.nspname, c.cfgname
-            FROM pg_depend d
-            JOIN pg_ts_config c ON c.oid = d.objid
-            JOIN pg_namespace cn ON cn.oid = c.cfgnamespace AND cn.nspname <> $20
-            WHERE d.classid = 'pg_ts_config'::regclass
-              AND d.refclassid IN ('pg_ts_dict'::regclass,'pg_ts_parser'::regclass)
-            UNION
-            SELECT DISTINCT d.refobjid, ocn.nspname, oc.opcname
-            FROM pg_depend d
-            JOIN pg_opclass oc ON oc.oid = d.objid
-            JOIN pg_namespace ocn ON ocn.oid = oc.opcnamespace AND ocn.nspname <> $21
-            WHERE d.classid = 'pg_opclass'::regclass
-              AND d.refclassid IN ('pg_opfamily'::regclass,'pg_operator'::regclass,
-                                   'pg_type'::regclass)
-            UNION
-            SELECT DISTINCT d.refobjid, fn.nspname, f.opfname
-            FROM pg_depend d
-            JOIN pg_amop m ON m.oid = d.objid
-            JOIN pg_opfamily f ON f.oid = m.amopfamily
-            JOIN pg_namespace fn ON fn.oid = f.opfnamespace AND fn.nspname <> $22
-            WHERE d.classid = 'pg_amop'::regclass
-              AND d.refclassid IN ('pg_opfamily'::regclass,'pg_operator'::regclass)
-            UNION
-            SELECT DISTINCT d.refobjid, fn.nspname, f.opfname
-            FROM pg_depend d
-            JOIN pg_amproc m ON m.oid = d.objid
-            JOIN pg_opfamily f ON f.oid = m.amprocfamily
-            JOIN pg_namespace fn ON fn.oid = f.opfnamespace AND fn.nspname <> $23
-            WHERE d.classid = 'pg_amproc'::regclass
-              AND d.refclassid IN ('pg_opfamily'::regclass,'pg_proc'::regclass)
-            UNION
-            SELECT DISTINCT d.refobjid, ons.nspname, o.oprname
-            FROM pg_depend d
-            JOIN pg_operator o ON o.oid = d.objid
-            JOIN pg_namespace ons ON ons.oid = o.oprnamespace AND ons.nspname <> $24
-            WHERE d.classid = 'pg_operator'::regclass
-              AND d.refclassid IN ('pg_operator'::regclass,'pg_proc'::regclass,
-                                   'pg_type'::regclass)
-            UNION
-            SELECT DISTINCT d.refobjid, ofn.nspname, of.opfname
-            FROM pg_depend d
-            JOIN pg_opfamily of ON of.oid = d.objid
-            JOIN pg_namespace ofn ON ofn.oid = of.opfnamespace AND ofn.nspname <> $25
-            WHERE d.classid = 'pg_opfamily'::regclass
-              AND d.refclassid = 'pg_opfamily'::regclass
-            UNION
-            -- casts not anchored to this namespace (by function or by
-            -- either type — the loadOther anchor rule) that still use
-            -- our types or routines
-            SELECT DISTINCT d.refobjid,
-                   coalesce(pn.nspname, sn.nspname, dtn.nspname, '-'),
-                   'cast(' || ca.castsource::regtype::text || ' AS '
-                          || ca.casttarget::regtype::text || ')'
-            FROM pg_depend d
-            JOIN pg_cast ca ON ca.oid = d.objid
-            LEFT JOIN pg_proc p ON p.oid = ca.castfunc
-            LEFT JOIN pg_namespace pn ON pn.oid = p.pronamespace
-            JOIN pg_type st ON st.oid = ca.castsource
-            JOIN pg_namespace sn ON sn.oid = st.typnamespace
-            JOIN pg_type tt ON tt.oid = ca.casttarget
-            JOIN pg_namespace dtn ON dtn.oid = tt.typnamespace
-            WHERE d.classid = 'pg_cast'::regclass
-              AND pn.nspname IS DISTINCT FROM $26
-              AND sn.nspname IS DISTINCT FROM $27
-              AND dtn.nspname IS DISTINCT FROM $28
-            `;
+        const sql = PgQueries.get("external_dependents");;
         for (const row of await conn.query<Row>(sql, nsParams(this.ns, 28))) {
             const target = this.byOid(num(row.tgt));
             if (target === undefined) {
