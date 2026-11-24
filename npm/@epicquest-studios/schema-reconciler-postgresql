@@ -117,16 +117,16 @@
       "sideEffects": false,
       "dist": {
         "tarball": "https://epicquest-studios.github.io/schema-reconciler/npm/tarballs/schema-reconciler-postgresql-0.10.0.tgz",
-        "integrity": "sha512-hHreMP/HV2EZ5UVMimdIbwqRoJ17kIMTmKLBa2/GB1G1KpR8VrHfuVD0ahDDL8qwF7wjL3S8Dv9r6QCRYhea2Q==",
-        "shasum": "fe267c38f75f7b18f611ad5bc5ffb3255e56f8ad",
-        "unpackedSize": 351629
+        "integrity": "sha512-JT0vZZWp8REnC3PMk0hZ5vT1kp8PU+wmnHXuAKSiccSiybs6BjUnEY2P4yXNhFDEk0ljPz3EJQ4YNjNChny1JQ==",
+        "shasum": "20cea300e2624725b528fd68231833923f867dd8",
+        "unpackedSize": 354845
       }
     }
   },
   "time": {
     "created": "2026-10-31T18:30:49.997Z",
-    "modified": "2026-11-24T18:11:56.317Z",
+    "modified": "2026-11-24T21:32:55.365Z",
     "0.9.0": "2026-10-31T18:30:49.997Z",
-    "0.10.0": "2026-11-24T18:11:56.317Z"
+    "0.10.0": "2026-11-24T21:32:55.365Z"
   }
 }

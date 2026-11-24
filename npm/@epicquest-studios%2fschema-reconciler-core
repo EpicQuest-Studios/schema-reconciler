@@ -99,16 +99,16 @@
       "sideEffects": false,
       "dist": {
         "tarball": "https://epicquest-studios.github.io/schema-reconciler/npm/tarballs/schema-reconciler-core-0.10.0.tgz",
-        "integrity": "sha512-3hiHn+CL6HgAeIc3Qn7JSHxg2KAgwOokWGjckF5BC32vo2tkKATy77mV8OuO6FOBqPa5J/xKZBMeyPI29DwPIw==",
-        "shasum": "17a15af921b6ba38dab055684dc2d323292fb447",
-        "unpackedSize": 234753
+        "integrity": "sha512-fGytT4bZMZ7o7xS5VZQrirTEMbzEULYB4+Vj6QGgosTaR59zd8DLdmrZg95E/JFi0Pht8Ty2r6rDQMZvesaMQg==",
+        "shasum": "1189374f2d3d11c67c989c598434c08c246b2465",
+        "unpackedSize": 237664
       }
     }
   },
   "time": {
     "created": "2026-10-31T18:30:48.602Z",
-    "modified": "2026-11-24T18:11:54.187Z",
+    "modified": "2026-11-24T21:32:53.727Z",
     "0.9.0": "2026-10-31T18:30:48.602Z",
-    "0.10.0": "2026-11-24T18:11:54.187Z"
+    "0.10.0": "2026-11-24T21:32:53.727Z"
   }
 }
