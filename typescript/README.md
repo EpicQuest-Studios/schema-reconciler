@@ -28,7 +28,7 @@ same mechanism as the Maven repository. Point your project at it:
 ```
 
 ```bash
-npm install @epicquest-studios/schema-reconciler-postgresql   # brings -core transitively
+npm install @epicquest-studios/schema-reconciler-postgresql@0.10.0   # brings -core transitively
 ```
 
 Implementing a dialect for another database? Depend on
