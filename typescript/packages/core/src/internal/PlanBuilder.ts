@@ -15,7 +15,7 @@ import { PlannedChange } from "../model/PlannedChange.ts";
 import { ReconcilePlan } from "../model/ReconcilePlan.ts";
 import type { RenameHint } from "../model/RenameHint.ts";
 import type { SchemaSnapshot } from "../model/SchemaSnapshot.ts";
-import type { Dialect } from "../spi/Dialect.ts";
+import { Dialect } from "../spi/Dialect.ts";
 import type { RenderOptions } from "../spi/RenderOptions.ts";
 import { Dependencies } from "./Dependencies.ts";
 import { MinHeap } from "./MinHeap.ts";
@@ -34,6 +34,62 @@ function tieCompare(a: PlannedChange, b: PlannedChange): number {
 
 function actionRank(action: ChangeAction): number {
     return action === ChangeAction.ALTER ? 0 : action === ChangeAction.CREATE ? 1 : 2;
+}
+
+
+const PRUNE_CONTAINERS: ReadonlySet<ObjectKind> = new Set([
+    ObjectKind.TABLE, ObjectKind.PARTITION, ObjectKind.FOREIGN_TABLE,
+    ObjectKind.VIEW, ObjectKind.MATERIALIZED_VIEW]);
+
+const PRUNE_CONTAINED: ReadonlySet<ObjectKind> = new Set([
+    ObjectKind.COLUMN, ObjectKind.PRIMARY_KEY, ObjectKind.UNIQUE,
+    ObjectKind.FOREIGN_KEY, ObjectKind.CHECK, ObjectKind.EXCLUSION,
+    ObjectKind.INDEX, ObjectKind.TRIGGER, ObjectKind.POLICY,
+    ObjectKind.RULE, ObjectKind.COMMENT, ObjectKind.SECURITY_LABEL,
+    ObjectKind.PRIVILEGES, ObjectKind.OWNERSHIP]);
+
+const PRUNE_MIRRORED: ReadonlySet<ObjectKind> = new Set([
+    ObjectKind.COMMENT, ObjectKind.SECURITY_LABEL, ObjectKind.OWNERSHIP,
+    ObjectKind.PRIVILEGES, ObjectKind.PUBLICATION]);
+
+function containedInUnexpectedParent(id: ObjectId, prereqs: ObjectSet,
+        unexpected: ObjectSet): boolean {
+    if (!PRUNE_CONTAINED.has(id.kind) || id.parent === undefined) {
+        return false;
+    }
+    for (const dep of prereqs) {
+        if (unexpected.has(dep) && PRUNE_CONTAINERS.has(dep.kind)
+                && dep.name === id.parent) {
+            return true;
+        }
+    }
+    return false;
+}
+
+function serialOwnedByUnexpectedTable(id: ObjectId, prereqs: ObjectSet,
+        unexpected: ObjectSet): boolean {
+    if (id.kind !== ObjectKind.SEQUENCE) {
+        return false;
+    }
+    for (const dep of prereqs) {
+        if (unexpected.has(dep) && dep.kind === ObjectKind.TABLE) {
+            return true;
+        }
+    }
+    return false;
+}
+
+function mirroredOnUnexpected(id: ObjectId, prereqs: ObjectSet,
+        unexpected: ObjectSet): boolean {
+    if (!PRUNE_MIRRORED.has(id.kind)) {
+        return false;
+    }
+    for (const dep of prereqs) {
+        if (unexpected.has(dep)) {
+            return true;
+        }
+    }
+    return false;
 }
 
 /**
@@ -140,7 +196,7 @@ export class PlanBuilder {
             changes.push(...rendered.late);
         }
 
-        this.addDependentRebuilds(changes, coveredByParent);
+        this.addDependentRebuilds(changes, coveredByParent, pruned);
         this.validatePairs(changes);
         this.checkNameCollisions(changes);
         const ordered = this.orderChanges(changes, renameChanges);
@@ -255,7 +311,12 @@ export class PlanBuilder {
         return { suppressed, drift, parentNames };
     }
 
-    /** UNEXPECTED objects whose drop is covered by another UNEXPECTED object's drop. */
+    /**
+     * UNEXPECTED objects implicitly removed by another UNEXPECTED object's
+     * DROP — no CASCADE is ever rendered, so ordinary dependents need their
+     * own standalone DROP (5.5). Only containment, serial ownership and
+     * mirrored annotations are implicit removals.
+     */
     private suppressedUnexpected(differences: Difference[]): ObjectSet {
         const unexpected = new ObjectSet();
         for (const d of differences) {
@@ -269,16 +330,10 @@ export class PlanBuilder {
         }
         const prereqs = Dependencies.prerequisitesOf(this.dialect, this.actual);
         for (const id of unexpected) {
-            const deps = Dependencies.reachable(id, prereqs);
-            deps.delete(id);
-            let covered = false;
-            for (const dep of deps) {
-                if (unexpected.has(dep)) {
-                    covered = true;
-                    break;
-                }
-            }
-            if (covered) {
+            const deps = prereqs.get(id) ?? new ObjectSet();
+            if (containedInUnexpectedParent(id, deps, unexpected)
+                    || serialOwnedByUnexpectedTable(id, deps, unexpected)
+                    || mirroredOnUnexpected(id, deps, unexpected)) {
                 suppressed.add(id);
             }
         }
@@ -369,7 +424,8 @@ export class PlanBuilder {
      * and actual snapshots, or UNEXPECTED ones, fail planning.
      */
     private addDependentRebuilds(changes: PlannedChange[],
-                                 coveredByParent: ObjectMap<ObjectMap<Definition>>): void {
+                                 coveredByParent: ObjectMap<ObjectMap<Definition>>,
+                                 pruned: ObjectSet): void {
         const actualDeps = Dependencies.prerequisitesOf(this.dialect, this.actual);
         const dependents = Dependencies.reverse(actualDeps);
 
@@ -403,9 +459,16 @@ export class PlanBuilder {
                 }
                 const want = this.desired.objects.get(dependent);
                 if (want === undefined) {
-                    if (this.prune) {
-                        // under prune the dependent is itself UNEXPECTED —
-                        // its drop dies with the parent's, no rebuild needed
+                    // an out-of-namespace dependent can never be pruned —
+                    // dropping the prerequisite would break it silently
+                    if (have.attributes.get(Dialect.EXTERNAL_DEPENDENT_ATTRIBUTE) === "true") {
+                        throw new PlanningException("namespace '" + this.targetNamespace + "': "
+                                + dependent + " depends on " + dropped
+                                + " but is not part of the desired state");
+                    }
+                    if (this.prune && (targets.has(dependent) || pruned.has(dependent))) {
+                        // under prune this in-namespace dependent is itself
+                        // being dropped (or implicitly removed); no rebuild
                         continue;
                     }
                     throw new PlanningException("namespace '" + this.targetNamespace + "': "

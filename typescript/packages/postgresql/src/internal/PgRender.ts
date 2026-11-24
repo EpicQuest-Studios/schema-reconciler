@@ -12,10 +12,10 @@ const TOKEN = "${namespace}";
 
 /** Full-table lock of a DROP/recreate or a destructive ALTER. */
 const LOCK_EXCLUSIVE = new ChangeHazard(LockLevel.ACCESS_EXCLUSIVE, false, false);
-/** `SHARE ROW EXCLUSIVE` — constraint/index adds that still allow writes. */
-const LOCK_ROW_EXCLUSIVE = new ChangeHazard(LockLevel.SHARE_ROW_EXCLUSIVE, false, false);
-/** A CHECK/FOREIGN KEY add scans existing rows to validate them. */
+/** A FOREIGN KEY add scans existing rows under SHARE ROW EXCLUSIVE. */
 const VALIDATES = new ChangeHazard(LockLevel.SHARE_ROW_EXCLUSIVE, false, true);
+/** PK/UNIQUE/CHECK/EXCLUSION adds validate existing rows under ACCESS EXCLUSIVE. */
+const VALIDATES_EXCLUSIVE = new ChangeHazard(LockLevel.ACCESS_EXCLUSIVE, false, true);
 /** `CREATE INDEX` (plain) — SHARE on the table: reads pass, writes block. */
 const INDEX_BUILD = new ChangeHazard(LockLevel.SHARE, false, false);
 /** `CREATE/DROP INDEX CONCURRENTLY` — SHARE UPDATE EXCLUSIVE, off-transaction. */
@@ -68,8 +68,7 @@ function missing(id: ObjectId, want: SchemaObject,
         case ObjectKind.EXCLUSION:
             return [additive(id, want, ns, "missing " + id, false,
                     id.kind === ObjectKind.FOREIGN_KEY
-                            || id.kind === ObjectKind.CHECK
-                            ? VALIDATES : LOCK_ROW_EXCLUSIVE)];
+                            ? VALIDATES : VALIDATES_EXCLUSIVE)];
         case ObjectKind.VIEW:
         case ObjectKind.TRIGGER:
         case ObjectKind.TYPE:
@@ -477,8 +476,7 @@ function drifted(id: ObjectId, want: SchemaObject,
         case ObjectKind.FOREIGN_KEY:
         case ObjectKind.CHECK:
         case ObjectKind.EXCLUSION:
-            return recreate(id, want, ns, "drifted " + id, false,
-                    LOCK_ROW_EXCLUSIVE);
+            return constraintRecreate(id, want, ns, "drifted " + id);
         case ObjectKind.VIEW:
         case ObjectKind.TRIGGER:
         case ObjectKind.POLICY:
@@ -667,7 +665,7 @@ function aclTokens(canonical: string): string[] {
     if (s.startsWith("privileges=")) {
         s = s.substring("privileges=".length);
     }
-    return s === "" ? [] : s.split(",");
+    return s === "" ? [] : PgSql.splitOutsideLiterals(s, ",");
 }
 
 /** The grantee of a `grantee:PRIVILEGE[*]` token — the last colon splits it. */
@@ -692,7 +690,7 @@ function tokenSansOption(token: string): string {
 
 /** `PUBLIC` stays a keyword; a role name is quoted. */
 function granteeSql(g: string): string {
-    return g === "PUBLIC" ? g : PgIdentifiers.quote(g);
+    return g === "PUBLIC" || g.startsWith("\"") ? g : PgIdentifiers.quote(g);
 }
 
 /**
@@ -869,7 +867,7 @@ const STORAGE_WORDS = new Map<string, string>([
 
 /** `attcompression` letter to the `SET COMPRESSION` method. */
 const COMPRESSION_WORDS = new Map<string, string>([
-        ["p", "pglz"], ["l", "lz4"], ["", "default"]]);
+        ["p", "pglz"], ["l", "lz4"], ["z", "zstd"], ["", "default"]]);
 
 const INT_TYPES = new Map<string, number>([
         ["smallint", 1], ["integer", 2], ["bigint", 3]]);
@@ -952,6 +950,22 @@ function createStatements(want: SchemaObject, ns: string): string[] {
         statements.push(bind(post, ns));
     }
     return statements;
+}
+
+
+/** Constraint recreate: DROP CONSTRAINT is ACCESS EXCLUSIVE; the CREATE
+ *  half carries the constraint kind's own lock/validation hazard. */
+function constraintRecreate(id: ObjectId, want: SchemaObject,
+        ns: string, reason: string): PlannedChange[] {
+    const createHazard = id.kind === ObjectKind.FOREIGN_KEY
+            ? VALIDATES : VALIDATES_EXCLUSIVE;
+    return [
+        new PlannedChange(0, id, ChangeAction.DROP, ChangeSafety.REBUILD,
+                [bindObj(want, PgCatalog.DROP_SQL, ns)], undefined, reason,
+                false, LOCK_EXCLUSIVE),
+        new PlannedChange(0, id, ChangeAction.CREATE, ChangeSafety.REBUILD,
+                createStatements(want, ns), want.definition, reason,
+                false, createHazard)];
 }
 
 /** A DROP change plus a CREATE change — the two halves of a recreate (4.4). */
@@ -1084,6 +1098,11 @@ function unexpected(id: ObjectId, have: SchemaObject,
             return [new PlannedChange(0, id, ChangeAction.DROP, safety,
                     [bind(drop, ns)], undefined, reason,
                     false, safety === ChangeSafety.DESTRUCTIVE
+                            || id.kind === ObjectKind.PRIMARY_KEY
+                            || id.kind === ObjectKind.UNIQUE
+                            || id.kind === ObjectKind.FOREIGN_KEY
+                            || id.kind === ObjectKind.CHECK
+                            || id.kind === ObjectKind.EXCLUSION
                             ? LOCK_EXCLUSIVE : ChangeHazard.NONE)];
         }
     }
@@ -1123,17 +1142,18 @@ function concurrentIndex(id: ObjectId, snapshot: SchemaSnapshot,
  */
 function indexCreate(id: ObjectId, want: SchemaObject,
         snapshot: SchemaSnapshot, ns: string, reason: string,
-        options?: RenderOptions): PlannedChange {
+        options?: RenderOptions,
+        safety: ChangeSafety = ChangeSafety.ADDITIVE): PlannedChange {
     if (!concurrentIndex(id, snapshot, options)) {
         return new PlannedChange(0, id, ChangeAction.CREATE,
-                ChangeSafety.ADDITIVE, createStatements(want, ns),
+                safety, createStatements(want, ns),
                 want.definition, reason, false, INDEX_BUILD);
     }
     const statements = createStatements(want, ns)
             .map(s => s.replace(/^(CREATE\s+(?:UNIQUE\s+)?INDEX)\s/,
                     "$1 CONCURRENTLY "));
     return new PlannedChange(0, id, ChangeAction.CREATE,
-            ChangeSafety.ADDITIVE, statements, want.definition, reason,
+            safety, statements, want.definition, reason,
             true, INDEX_CONCURRENT);
 }
 
@@ -1164,7 +1184,8 @@ function indexRecreate(id: ObjectId, want: SchemaObject,
     }
     return [
         indexDrop(id, want, snapshot, ns, reason, options),
-        indexCreate(id, want, snapshot, ns, reason, options)];
+        indexCreate(id, want, snapshot, ns, reason, options,
+                ChangeSafety.REBUILD)];
 }
 
 // ---- RENAME (5.5.1) ------------------------------------------------------

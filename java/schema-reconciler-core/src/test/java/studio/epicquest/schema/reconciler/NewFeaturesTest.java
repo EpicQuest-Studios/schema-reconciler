@@ -11,6 +11,7 @@ import java.util.Optional;
 import org.junit.jupiter.api.Test;
 import studio.epicquest.schema.reconciler.fake.FakeDb;
 import studio.epicquest.schema.reconciler.fake.FakeDialect;
+import studio.epicquest.schema.reconciler.internal.Json;
 import studio.epicquest.schema.reconciler.model.ChangeAction;
 import studio.epicquest.schema.reconciler.model.ChangeHazard;
 import studio.epicquest.schema.reconciler.model.ChangeSafety;
@@ -117,6 +118,49 @@ class NewFeaturesTest {
                 .findFirst().orElseThrow();
         assertEquals(ObjectKind.COLUMN, drop.target().kind());
         assertEquals(ChangeSafety.DESTRUCTIVE, drop.safety());
+    }
+
+
+    @Test
+    void pruneDropsOrdinaryDependentsInReverseDependencyOrder() {
+        db.executeDirect(NS, "CREATE TABLE keep DEF k;"
+                + " CREATE TABLE victim DEF v; CREATE VIEW dependent REQUIRES TABLE:victim DEF d");
+        final var report = reconciler("CREATE TABLE keep DEF k",
+                ReconcilePolicy.defaults().withPrune(true)
+                        .withDestructive(Decision.APPLY)).build().reconcile();
+        final var drops = report.plan().changes().stream()
+                .filter(c -> c.action() == ChangeAction.DROP).toList();
+        final var viewAt = drops.indexOf(drops.stream().filter(c ->
+                c.target().kind() == ObjectKind.VIEW
+                        && c.target().name().equals("dependent")).findFirst().orElseThrow());
+        final var tableAt = drops.indexOf(drops.stream().filter(c ->
+                c.target().kind() == ObjectKind.TABLE
+                        && c.target().name().equals("victim")).findFirst().orElseThrow());
+        assertTrue(viewAt >= 0 && tableAt >= 0,
+                "dependent and victim must both have standalone drops");
+        assertTrue(viewAt < tableAt, "dependent drop must precede prerequisite drop");
+    }
+
+    @Test
+    void pruneStillFailsOnExternalDependent() {
+        db.executeDirect(NS, "CREATE TABLE keep DEF k; CREATE TABLE victim DEF v");
+        db.putObject(NS, FakeDb.externalDependent(
+                new ObjectId(ObjectKind.OTHER, "foreign.obj"),
+                new ObjectId(ObjectKind.TABLE, "victim")));
+        assertThrows(PlanningException.class,
+                () -> reconciler("CREATE TABLE keep DEF k",
+                        ReconcilePolicy.defaults().withPrune(true)
+                                .withDestructive(Decision.APPLY)).build().reconcile());
+    }
+
+    @Test
+    void pruneStillFailsOnUnprunableOtherDependent() {
+        db.executeDirect(NS, "CREATE TABLE keep DEF k; CREATE TABLE victim DEF v;"
+                + " CREATE OTHER sticky REQUIRES TABLE:victim DEF o");
+        assertThrows(PlanningException.class,
+                () -> reconciler("CREATE TABLE keep DEF k",
+                        ReconcilePolicy.defaults().withPrune(true)
+                                .withDestructive(Decision.APPLY)).build().reconcile());
     }
 
     // ---- machine-readable plans (JSON) -------------------------------------
@@ -297,4 +341,36 @@ class NewFeaturesTest {
                                 new ObjectId(ObjectKind.TABLE, "new"))
                         .build().reconcile());
     }
+
+    @Test
+    void planJsonStrictFields() {
+        final var valid = "{\"schemaVersion\":1,\"targetNamespace\":\"x\","
+                + "\"dialectId\":\"fake\",\"actualFingerprint\":\"fp\","
+                + "\"desiredFingerprint\":\"fp2\",\"differences\":[],"
+                + "\"changes\":[{\"order\":1,\"target\":{\"kind\":\"TABLE\","
+                + "\"name\":\"t\",\"parent\":null},\"action\":\"CREATE\","
+                + "\"safety\":\"ADDITIVE\",\"statements\":[],\"expected\":\"x\","
+                + "\"reason\":\"r\",\"nonTransactional\":false,"
+                + "\"hazard\":{\"lockLevel\":\"NONE\",\"rewritesTable\":false,"
+                + "\"validatesRows\":false,\"notes\":[]}}]}";
+        assertThrows(IllegalArgumentException.class, () -> ReconcilePlan.fromJson(
+                valid.replace("\"expected\":\"x\"", "\"expected\":42")));
+        assertThrows(IllegalArgumentException.class, () -> ReconcilePlan.fromJson(
+                valid.replace(",\"hazard\":{\"lockLevel\":\"NONE\",\"rewritesTable\":false,"
+                        + "\"validatesRows\":false,\"notes\":[]}", "")));
+        assertThrows(IllegalArgumentException.class, () -> ReconcilePlan.fromJson(
+                valid.replace("\"order\":1", "\"order\":2")));
+        assertThrows(IllegalArgumentException.class, () -> ReconcilePlan.fromJson(
+                valid.replace("\"differences\":[]", "\"differences\":[{\"id\":{\"kind\":\"TABLE\","
+                        + "\"name\":\"t\",\"parent\":null},\"type\":\"MISSING\",\"expected\":42,"
+                        + "\"actual\":null}]")));
+    }
+
+    @Test
+    void jsonParserRejectsRfcInvalidNumbers() {
+        for (final var bad : List.of("01", "-01", "1.", "1e", "1e+")) {
+            assertThrows(IllegalArgumentException.class, () -> Json.read(bad), "input: " + bad);
+        }
+    }
+
 }

@@ -456,7 +456,9 @@ public final class PgCatalog {
                         final var generated = rs.getString("attgenerated");
                         final var identity = nullToEmpty(rs.getString("attidentity"));
                         final var defexpr = rs.getString("defexpr");
-                        final var collname = rs.getString("collname");
+                        final var collation = rs.getString("collation") == null
+                                ? null
+                                : PgSql.normalize(rs.getString("collation"), ns);
                         final var customCollation = rs.getLong("attcollation") != 0
                                 && rs.getLong("attcollation") != rs.getLong("typcollation");
                         final var storage = rs.getString("attstorage");
@@ -478,12 +480,19 @@ public final class PgCatalog {
                             });
                         }
                         if (!compression.isEmpty()) {
-                            sql.append(" COMPRESSION ")
-                                    .append(compression.equals("l") ? "lz4" : "pglz");
+                            final var method = switch (compression) {
+                                case "p" -> "pglz";
+                                case "l" -> "lz4";
+                                case "z" -> "zstd";
+                                default -> null;
+                            };
+                            if (method != null) {
+                                sql.append(" COMPRESSION ").append(method);
+                            }
                         }
-                        if (customCollation && collname != null) {
-                            canonical.append(";collation=").append(collname);
-                            sql.append(" COLLATE ").append(PgIdentifiers.quote(collname));
+                        if (customCollation && collation != null) {
+                            canonical.append(";collation=").append(collation);
+                            sql.append(" COLLATE ").append(collation);
                         }
                         final var attrs = new LinkedHashMap<String, String>();
                         attrs.put(ATTNUM, rs.getString("attnum"));
@@ -618,7 +627,7 @@ public final class PgCatalog {
                             attrs.put(POST_SQL, "ALTER TABLE " + tableRef(parent)
                                     + " REPLICA IDENTITY USING INDEX " + PgIdentifiers.quote(name));
                         }
-                        define(id, def, attrs);
+                        define(id, def + (rs.getBoolean("valid") ? "" : ";valid=false"), attrs);
                     }
                 }
             }
@@ -2944,7 +2953,7 @@ public final class PgCatalog {
                     ? c.substring("privileges=".length()) : c;
             final var grants = new ArrayList<String>();
             if (!c.isEmpty()) {
-                for (final var tok : c.split(",")) {
+                for (final var tok : PgSql.splitOutsideLiterals(c, ',')) {
                     final var g = tok.substring(0, tok.lastIndexOf(':'));
                     if (g.equals("<owner>")) {
                         continue;
@@ -2955,7 +2964,7 @@ public final class PgCatalog {
                         p = p.substring(0, p.length() - 1);
                     }
                     grants.add(pfx + "GRANT " + p + colClause + " ON " + target + " TO "
-                            + (g.equals("PUBLIC") ? g : PgIdentifiers.quote(g))
+                            + (g.equals("PUBLIC") || g.startsWith("\"") ? g : PgIdentifiers.quote(g))
                             + (option ? " WITH GRANT OPTION" : ""));
                 }
             }

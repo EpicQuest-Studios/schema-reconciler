@@ -119,6 +119,45 @@ test("pruneColumnOnExpectedTableRendersDropColumn", async () => {
     assert.equal(drop.safety, ChangeSafety.DESTRUCTIVE);
 });
 
+
+test("pruneDropsOrdinaryDependentsInReverseDependencyOrder", async () => {
+    const { db, dialect } = fixture();
+    db.executeDirect(NS, "CREATE TABLE keep DEF k;"
+            + " CREATE TABLE victim DEF v; CREATE VIEW dependent REQUIRES TABLE:victim DEF d");
+    const report = await reconciler(db, dialect, "CREATE TABLE keep DEF k",
+            ReconcilePolicy.defaults().withPrune(true)
+                    .withDestructive(Decision.APPLY)).build().reconcile();
+    const viewAt = report.plan.changes.findIndex(c => c.action === ChangeAction.DROP
+            && c.target.kind === ObjectKind.VIEW && c.target.name === "dependent");
+    const tableAt = report.plan.changes.findIndex(c => c.action === ChangeAction.DROP
+            && c.target.kind === ObjectKind.TABLE && c.target.name === "victim");
+    assert.ok(viewAt >= 0 && tableAt >= 0,
+            "dependent and victim must both have standalone drops");
+    assert.ok(viewAt < tableAt, "dependent drop must precede prerequisite drop");
+});
+
+test("pruneStillFailsOnExternalDependent", async () => {
+    const { db, dialect } = fixture();
+    db.executeDirect(NS, "CREATE TABLE keep DEF k; CREATE TABLE victim DEF v");
+    db.putObject(NS, FakeDb.externalDependent(
+            new ObjectId(ObjectKind.OTHER, "foreign.obj"),
+            new ObjectId(ObjectKind.TABLE, "victim")));
+    await assert.rejects(() => reconciler(db, dialect, "CREATE TABLE keep DEF k",
+            ReconcilePolicy.defaults().withPrune(true)
+                    .withDestructive(Decision.APPLY)).build().reconcile(),
+            PlanningException);
+});
+
+test("pruneStillFailsOnUnprunableOtherDependent", async () => {
+    const { db, dialect } = fixture();
+    db.executeDirect(NS, "CREATE TABLE keep DEF k; CREATE TABLE victim DEF v;"
+            + " CREATE OTHER sticky REQUIRES TABLE:victim DEF o");
+    await assert.rejects(() => reconciler(db, dialect, "CREATE TABLE keep DEF k",
+            ReconcilePolicy.defaults().withPrune(true)
+                    .withDestructive(Decision.APPLY)).build().reconcile(),
+            PlanningException);
+});
+
 // ---- machine-readable plans (JSON) -------------------------------------
 
 test("planJsonRoundTripsAndApplyJsonApplies", async () => {
@@ -287,4 +326,27 @@ test("renameWithBothSidesPresentIsAPlanningError", async () => {
                     new ObjectId(ObjectKind.TABLE, "new"))
             .build().reconcile());
     assert.ok(e instanceof PlanningException, String(e));
+});
+
+
+test("planJsonStrictFields", () => {
+    const valid = JSON.stringify({ schemaVersion: 1, targetNamespace: "x",
+            dialectId: "fake", actualFingerprint: "fp", desiredFingerprint: "fp2",
+            differences: [], changes: [{ order: 1,
+                    target: { kind: "TABLE", name: "t", parent: null },
+                    action: "CREATE", safety: "ADDITIVE", statements: [],
+                    expected: "x", reason: "r", nonTransactional: false,
+                    hazard: { lockLevel: "NONE", rewritesTable: false,
+                            validatesRows: false, notes: [] } }] });
+    for (const mutate of [
+            (o: any) => { o.changes[0].expected = 42; },
+            (o: any) => { delete o.changes[0].hazard; },
+            (o: any) => { o.changes[0].order = 2; },
+            (o: any) => { o.differences = [{ id: { kind: "TABLE", name: "t", parent: null },
+                    type: "MISSING", expected: 42, actual: null }]; }]) {
+        const doc = JSON.parse(valid);
+        mutate(doc);
+        assert.throws(() => ReconcilePlan.fromJson(JSON.stringify(doc)),
+                IllegalArgumentError);
+    }
 });

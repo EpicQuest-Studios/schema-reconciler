@@ -7,7 +7,10 @@ import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Statement;
 import java.time.Duration;
+import java.util.Collections;
 import java.util.EnumSet;
+import java.util.IdentityHashMap;
+import java.util.Map;
 import java.util.List;
 import java.util.Locale;
 import java.util.Set;
@@ -39,6 +42,10 @@ public final class PostgreSqlDialect implements Dialect {
 
     private static final String SAVEPOINT = "rcl_scratch";
     private static final String LOCK_KEY_PREFIX = "studio.epicquest.schema.reconciler:";
+    /** The session-scoped namespace lock key per pinned connection, so scratch
+     *  cleanup can release script locks without releasing the run's lock. */
+    private static final Map<Connection, Long> NAMESPACE_LOCKS =
+            Collections.synchronizedMap(new IdentityHashMap<>());
 
     /** Creates the dialect — stateless, safe to share. */
     public PostgreSqlDialect() {
@@ -69,13 +76,22 @@ public final class PostgreSqlDialect implements Dialect {
             throws SQLException {
         try (Statement s = connection.createStatement();
              PreparedStatement lock = connection.prepareStatement(
-                     "SELECT pg_advisory_xact_lock(hashtextextended("
+                     "SELECT pg_advisory_lock(hashtextextended("
                              + "'" + LOCK_KEY_PREFIX + "'"
                              + " || current_database() || ':' || ?, 0))")) {
             s.execute("SET LOCAL lock_timeout = '" + millisBounded(timeout) + "ms'");
             try {
                 lock.setString(1, namespace);
                 lock.execute();
+                try (PreparedStatement key = connection.prepareStatement(
+                        "SELECT hashtextextended('" + LOCK_KEY_PREFIX + "'"
+                                + " || current_database() || ':' || ?, 0)")) {
+                    key.setString(1, namespace);
+                    try (ResultSet rs = key.executeQuery()) {
+                        rs.next();
+                        NAMESPACE_LOCKS.put(connection, rs.getLong(1));
+                    }
+                }
             } catch (SQLException e) {
                 if ("55P03".equals(e.getSQLState())) {
                     throw new LockTimeoutException("namespace '" + namespace
@@ -89,8 +105,13 @@ public final class PostgreSqlDialect implements Dialect {
 
     @Override
     public void releaseLock(Connection connection, String namespace) throws SQLException {
-        try (Statement s = connection.createStatement()) {
-            s.execute("SELECT pg_advisory_unlock_all()");
+        try (PreparedStatement ps = connection.prepareStatement(
+                "SELECT pg_advisory_unlock(hashtextextended('" + LOCK_KEY_PREFIX + "'"
+                        + " || current_database() || ':' || ?, 0))")) {
+            ps.setString(1, namespace);
+            ps.execute();
+        } finally {
+            NAMESPACE_LOCKS.remove(connection);
         }
     }
 
@@ -135,17 +156,62 @@ public final class PostgreSqlDialect implements Dialect {
                 // the rollback undoes settings but not session advisory locks, which a
                 // function the script invoked may have taken (the static check cannot
                 // see through a call): release them before the connection is reused
-                s.execute("SELECT pg_advisory_unlock_all()");
+                releaseScriptLocks(connection);
             } catch (SQLException e) {
                 // the savepoint is gone: the script committed (or aborted) the
                 // transaction — remove the committed schema explicitly (A.3)
                 rollbackQuietly(connection);
-                s.execute("SELECT pg_advisory_unlock_all()");
+                releaseScriptLocks(connection);
                 s.execute("DROP SCHEMA IF EXISTS " + PgIdentifiers.quote(scratchNamespace)
                         + " CASCADE");
                 connection.commit();
                 throw new DesiredStateException("the desired script left the transaction: "
                         + "the run's savepoint is gone (" + e.getMessage() + ")", e);
+            }
+        }
+    }
+
+
+    /** Releases advisory locks a desired script took, preserving this run's
+     *  namespace lock when scratch sharing the target connection. */
+    private static void releaseScriptLocks(Connection connection) throws SQLException {
+        final var protectedKey = NAMESPACE_LOCKS.get(connection);
+        if (protectedKey == null) {
+            try (Statement s = connection.createStatement()) {
+                s.execute("SELECT pg_advisory_unlock_all()");
+            }
+            return;
+        }
+        record Held(long key, int subid, int key1, int key2) { }
+        final var held = new java.util.ArrayList<Held>();
+        try (Statement s = connection.createStatement();
+                ResultSet rs = s.executeQuery(
+                        "SELECT ((classid::integer::bigint << 32) | (objid::integer::bigint & 4294967295)) AS key,"
+                                + " objsubid, classid::integer AS key1, objid::integer AS key2"
+                                + " FROM pg_locks WHERE locktype = 'advisory'"
+                                + " AND pid = pg_backend_pid()")) {
+            while (rs.next()) {
+                held.add(new Held(rs.getLong("key"), rs.getInt("objsubid"),
+                        rs.getInt("key1"), rs.getInt("key2")));
+            }
+        }
+        for (final var lock : held) {
+            if (lock.subid() == 1) {
+                if (lock.key() == protectedKey) {
+                    continue;
+                }
+                try (PreparedStatement ps = connection.prepareStatement(
+                        "SELECT pg_advisory_unlock(?)")) {
+                    ps.setLong(1, lock.key());
+                    ps.execute();
+                }
+            } else if (lock.subid() == 2) {
+                try (PreparedStatement ps = connection.prepareStatement(
+                        "SELECT pg_advisory_unlock(?, ?)")) {
+                    ps.setInt(1, lock.key1());
+                    ps.setInt(2, lock.key2());
+                    ps.execute();
+                }
             }
         }
     }

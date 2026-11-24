@@ -131,9 +131,14 @@ export class ReconcilePlan {
         });
         const changes = requireArray(o["changes"], "changes").map((c, i) => {
             const cc = requireObject(c, "changes[" + i + "]");
-            const hz = requireObject(cc["hazard"] ?? {}, "changes[" + i + "].hazard");
+            const hz = requireObject(cc["hazard"], "changes[" + i + "].hazard");
+            const order = requireNumber(cc["order"], "changes[" + i + "].order");
+            if (order !== i + 1) {
+                throw new IllegalArgumentError("invalid plan JSON: changes[" + i
+                        + "].order must be " + (i + 1));
+            }
             return new PlannedChange(
-                    requireNumber(cc["order"], "changes[" + i + "].order"),
+                    order,
                     requireId(cc["target"], "changes[" + i + "].target"),
                     requireEnum(cc["action"], ChangeAction, "changes[" + i + "].action"),
                     requireEnum(cc["safety"], ChangeSafety, "changes[" + i + "].safety"),
@@ -163,7 +168,14 @@ function idJson(id: ObjectId): object {
 }
 
 function optDef(v: unknown): Definition | undefined {
-    return v === undefined || v === null ? undefined : new Definition(String(v));
+    if (v === undefined || v === null) {
+        return undefined;
+    }
+    if (typeof v !== "string") {
+        throw new IllegalArgumentError(
+                "invalid plan JSON: expected/actual is not a string or null");
+    }
+    return new Definition(v);
 }
 
 function requireObject(v: unknown, field: string): Record<string, unknown> {

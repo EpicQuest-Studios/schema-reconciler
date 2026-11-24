@@ -46,3 +46,7 @@ Published to `gh-pages` branch (`maven/` and `npm/`):
 - Canonical definitions normalize namespace refs to `${namespace}` (`PgSql.normalize`).
 - `PgScriptCheck` is a **frozen, best-effort lexical guard** (not a security sandbox); untrusted scripts should use `scratchDataSource` + a least-privilege role.
 - See `docs/adr/` for detailed catalog, rendering, and script-check boundaries.
+
+## Verification Notes
+
+- PostgreSQL catalog SQL is shared through `sql/postgresql/`; after changing it, synchronize `go/postgresql/internal/queries/sql/` (normally via `go generate`/`go/scripts/sync-sql.sh`) before running Go tests.

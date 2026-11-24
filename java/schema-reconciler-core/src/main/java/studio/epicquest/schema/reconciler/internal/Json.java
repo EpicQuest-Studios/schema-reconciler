@@ -272,20 +272,44 @@ public final class Json {
             if (!atEnd() && text.charAt(pos) == '-') {
                 pos++;
             }
-            var isDouble = false;
-            while (!atEnd()) {
-                final var c = text.charAt(pos);
-                if (c >= '0' && c <= '9') {
+            // RFC 8259: int = zero / (digit1-9 *DIGIT); leading zeroes,
+            // a fraction with no digits and an exponent with no digits are
+            // all malformed rather than "almost numbers"
+            if (atEnd() || !Character.isDigit(text.charAt(pos))) {
+                throw error("unexpected token");
+            }
+            if (text.charAt(pos) == '0') {
+                pos++;
+            } else {
+                while (!atEnd() && Character.isDigit(text.charAt(pos))) {
                     pos++;
-                } else if (c == '.' || c == 'e' || c == 'E' || c == '+' || c == '-') {
-                    isDouble = true;
-                    pos++;
-                } else {
-                    break;
                 }
             }
-            if (pos == start) {
-                throw error("unexpected token");
+            var isDouble = false;
+            if (!atEnd() && text.charAt(pos) == '.') {
+                isDouble = true;
+                pos++;
+                final var first = pos;
+                while (!atEnd() && Character.isDigit(text.charAt(pos))) {
+                    pos++;
+                }
+                if (pos == first) {
+                    throw error("bad number: fraction has no digits");
+                }
+            }
+            if (!atEnd() && (text.charAt(pos) == 'e' || text.charAt(pos) == 'E')) {
+                isDouble = true;
+                pos++;
+                if (!atEnd() && (text.charAt(pos) == '+' || text.charAt(pos) == '-')) {
+                    pos++;
+                }
+                final var first = pos;
+                while (!atEnd() && Character.isDigit(text.charAt(pos))) {
+                    pos++;
+                }
+                if (pos == first) {
+                    throw error("bad number: exponent has no digits");
+                }
             }
             final var raw = text.substring(start, pos);
             try {

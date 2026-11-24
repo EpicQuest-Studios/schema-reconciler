@@ -255,6 +255,120 @@ describe("FeatureE2ETest", {
         }
     });
 
+
+    it("an invalid index is detected as drifted and rebuilt concurrently",
+            async () => {
+        const ns = await namespace();
+        try {
+            const qNs = dialect.quoteIdentifier(ns);
+            await execute(ds, "CREATE TABLE " + qNs + ".t (x int);"
+                    + " INSERT INTO " + qNs + ".t VALUES (1), (1)");
+            await assert.rejects(() => execute(ds,
+                    "CREATE UNIQUE INDEX CONCURRENTLY idx ON " + qNs + ".t (x)"));
+            const invalid = await ds.connect();
+            try {
+                const rows = await invalid.query<{ valid: boolean }>(
+                        "SELECT i.indisvalid AS valid FROM pg_index i"
+                                + " JOIN pg_class c ON c.oid = i.indexrelid"
+                                + " JOIN pg_namespace n ON n.oid = c.relnamespace"
+                                + " WHERE n.nspname = $1 AND c.relname = 'idx'",
+                        [ns]);
+                assert.equal(rows[0]?.valid, false,
+                        "the failed concurrent build must leave an invalid index");
+            } finally {
+                await invalid.close();
+            }
+            // make the unique build possible again; the invalid index itself
+            // does not enforce anything
+            await execute(ds, "DELETE FROM " + qNs + ".t WHERE ctid IN"
+                    + " (SELECT ctid FROM " + qNs + ".t LIMIT 1)");
+
+            const script = "CREATE TABLE ${namespace}.t (x int);"
+                    + " CREATE UNIQUE INDEX idx ON ${namespace}.t (x)";
+            const plan = await reconciler(ns, script)
+                    .concurrentIndexes(true).build().plan();
+            const difference = plan.differences.find(d =>
+                    d.id.kind === ObjectKind.INDEX && d.id.name === "idx");
+            assert.ok(difference !== undefined, "index difference missing");
+            assert.equal(difference.type, DifferenceType.DRIFTED);
+
+            const report = await reconciler(ns, script)
+                    .concurrentIndexes(true).build().reconcile();
+            assert.equal(report.outcome, ReconcileOutcome.RECONCILED);
+            assert.ok(report.applied.some(c => c.target.kind === ObjectKind.INDEX
+                    && c.action === ChangeAction.DROP && c.nonTransactional));
+            assert.ok(report.applied.some(c => c.target.kind === ObjectKind.INDEX
+                    && c.action === ChangeAction.CREATE && c.nonTransactional));
+            const valid = await ds.connect();
+            try {
+                const rows = await valid.query<{ valid: boolean }>(
+                        "SELECT i.indisvalid AS valid FROM pg_index i"
+                                + " JOIN pg_class c ON c.oid = i.indexrelid"
+                                + " JOIN pg_namespace n ON n.oid = c.relnamespace"
+                                + " WHERE n.nspname = $1 AND c.relname = 'idx'",
+                        [ns]);
+                assert.equal(rows[0]?.valid, true);
+            } finally {
+                await valid.close();
+            }
+            assert.equal((await reconciler(ns, script)
+                    .concurrentIndexes(true).build().reconcile()).outcome,
+                    ReconcileOutcome.UP_TO_DATE);
+        } finally {
+            await drop(ns);
+        }
+    });
+
+    it("the session advisory lock survives the concurrent-index commit",
+            async () => {
+        const ns = await namespace();
+        const lockAvailable = async (): Promise<boolean> => {
+            const c = await ds.connect();
+            try {
+                const keySql = "hashtextextended("
+                        + "'studio.epicquest.schema.reconciler:'"
+                        + " || current_database() || ':' || $1, 0)";
+                const tried = await c.query<{ ok: boolean }>(
+                        "SELECT pg_try_advisory_lock(" + keySql + ") AS ok",
+                        [ns]);
+                const available = tried[0]!.ok;
+                if (available) {
+                    await c.query("SELECT pg_advisory_unlock(" + keySql + ")",
+                            [ns]);
+                }
+                return available;
+            } finally {
+                await c.close();
+            }
+        };
+        try {
+            let availableDuringConcurrentPhase: boolean | undefined;
+            const script = "CREATE TABLE ${namespace}.t (id int);"
+                    + " CREATE INDEX i ON ${namespace}.t (id)";
+            const report = await reconciler(ns, script)
+                    .concurrentIndexes(true)
+                    .listener({
+                        applying: async change => {
+                            if (change.target.kind === ObjectKind.INDEX
+                                    && change.action === ChangeAction.CREATE
+                                    && change.nonTransactional) {
+                                availableDuringConcurrentPhase =
+                                        await lockAvailable();
+                            }
+                        },
+                    })
+                    .build().reconcile();
+            assert.equal(report.outcome, ReconcileOutcome.RECONCILED);
+            assert.equal(availableDuringConcurrentPhase, false,
+                    "the namespace lock must still be held after the"
+                    + " intermediate commit");
+            assert.equal(await lockAvailable(), true,
+                    "the namespace lock must be released when the run ends");
+        } finally {
+            await drop(ns);
+        }
+    });
+
     // ---- 5.5.1 rename hints ---------------------------------------------------
 
     it("builder rename turns a drop+create into ALTER ... RENAME",
@@ -396,13 +510,13 @@ describe("FeatureE2ETest", {
             assert.deepEqual([...dumps.keys()], [nsB, nsA]);
             assert.ok(dumps.get(nsB)!.includes(
                     "CREATE TABLE ${namespace}.\"customers\""),
-                    dumps.get(nsB));
+                    dumps.get(nsB)!);
             assert.ok(dumps.get(nsA)!.includes(
                     "CREATE TABLE ${namespace}.\"orders\""),
-                    dumps.get(nsA));
+                    dumps.get(nsA)!);
             // the foreign-schema reference stays literal — only the
             // reconcile unit's own namespace is neutralised
-            assert.ok(dumps.get(nsA)!.includes(nsB + "."), dumps.get(nsA));
+            assert.ok(dumps.get(nsA)!.includes(nsB + "."), dumps.get(nsA)!);
         } finally {
             await drop(nsA);
             await drop(nsB);
@@ -518,6 +632,47 @@ describe("FeatureE2ETest", {
             await drop(ns);
             await execute(ds, "DROP OWNED BY " + dialect.quoteIdentifier(role)
                     + "; DROP ROLE " + dialect.quoteIdentifier(role));
+        }
+    });
+
+    it("a table grant to a quoted comma-containing role round-trips",
+            async (t) => {
+        const role = "rcl,comma_feat_" + RUN_ID;
+        const c = await ds.connect();
+        try {
+            const rows = await c.query<{ ok: boolean }>(
+                    "SELECT rolsuper OR rolcreaterole AS ok FROM pg_roles"
+                    + " WHERE rolname = current_user");
+            if (rows.length === 0 || !rows[0]!.ok) {
+                t.skip("connecting role cannot create the grantee role");
+                return;
+            }
+            await c.execute("DROP ROLE IF EXISTS "
+                    + dialect.quoteIdentifier(role));
+            await c.execute("CREATE ROLE "
+                    + dialect.quoteIdentifier(role));
+        } finally {
+            await c.close();
+        }
+        const ns = await namespace();
+        try {
+            const script = "CREATE TABLE ${namespace}.acl_t (id int);"
+                    + " GRANT SELECT ON ${namespace}.acl_t TO "
+                    + dialect.quoteIdentifier(role);
+            assert.equal((await reconciler(ns, script).build().reconcile())
+                    .outcome, ReconcileOutcome.RECONCILED);
+            assert.equal((await reconciler(ns, script).build().reconcile())
+                    .outcome, ReconcileOutcome.UP_TO_DATE);
+
+            const dump = await SchemaReconciler.builder().dataSource(ds)
+                    .namespace(ns).dialect(dialect).build().dump();
+            assert.ok(dump.includes("GRANT SELECT"), dump);
+            assert.ok(dump.includes(dialect.quoteIdentifier(role)), dump);
+            assert.equal((await reconciler(ns, dump).build().reconcile())
+                    .outcome, ReconcileOutcome.UP_TO_DATE);
+        } finally {
+            await drop(ns);
+            await execute(ds, "DROP ROLE " + dialect.quoteIdentifier(role));
         }
     });
 });

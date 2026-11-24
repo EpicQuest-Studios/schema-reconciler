@@ -12,6 +12,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import javax.sql.DataSource;
 import org.junit.jupiter.api.AfterAll;
@@ -32,6 +33,7 @@ import studio.epicquest.schema.reconciler.model.DifferenceType;
 import studio.epicquest.schema.reconciler.model.LockLevel;
 import studio.epicquest.schema.reconciler.model.ObjectId;
 import studio.epicquest.schema.reconciler.model.ObjectKind;
+import studio.epicquest.schema.reconciler.model.PlannedChange;
 import studio.epicquest.schema.reconciler.model.ReconcilePlan;
 import studio.epicquest.schema.reconciler.model.SchemaObject;
 import studio.epicquest.schema.reconciler.model.SchemaSnapshot;
@@ -104,6 +106,47 @@ class FeatureE2ETest {
                         + " AND a.attname = '" + column + "' AND NOT a.attisdropped)")) {
             rs.next();
             return rs.getBoolean(1);
+        }
+    }
+
+
+    private boolean indexValid(String ns, String name) throws SQLException {
+        try (Connection c = ds.getConnection();
+                var ps = c.prepareStatement("SELECT i.indisvalid FROM pg_index i"
+                        + " JOIN pg_class x ON x.oid = i.indexrelid"
+                        + " JOIN pg_namespace n ON n.oid = x.relnamespace"
+                        + " WHERE n.nspname = ? AND x.relname = ?")) {
+            ps.setString(1, ns);
+            ps.setString(2, name);
+            try (var rs = ps.executeQuery()) {
+                return rs.next() && rs.getBoolean(1);
+            }
+        }
+    }
+
+    /** True when this run's session advisory lock is free; a successful try is
+     *  released before returning so the probe itself leaves no lock behind. */
+    private boolean namespaceLockAvailable(String ns) throws SQLException {
+        final var keySql = "hashtextextended('studio.epicquest.schema.reconciler:'"
+                + " || current_database() || ':' || ?, 0)";
+        try (Connection c = ds.getConnection()) {
+            final boolean available;
+            try (var ps = c.prepareStatement(
+                    "SELECT pg_try_advisory_lock(" + keySql + ")")) {
+                ps.setString(1, ns);
+                try (var rs = ps.executeQuery()) {
+                    rs.next();
+                    available = rs.getBoolean(1);
+                }
+            }
+            if (available) {
+                try (var ps = c.prepareStatement(
+                        "SELECT pg_advisory_unlock(" + keySql + ")")) {
+                    ps.setString(1, ns);
+                    ps.execute();
+                }
+            }
+            return available;
         }
     }
 
@@ -276,6 +319,91 @@ class FeatureE2ETest {
                     .findFirst().orElseThrow();
             assertFalse(index.nonTransactional());
             assertFalse(index.statements().get(0).contains("CONCURRENTLY"));
+        } finally {
+            drop(ns);
+        }
+    }
+
+
+    @Test
+    void anInvalidIndexIsDetectedAsDriftedAndRebuiltConcurrently() throws Exception {
+        final var ns = namespace();
+        try {
+            final var qNs = dialect.quoteIdentifier(ns);
+            PgTestDatabase.execute(ds, "CREATE TABLE " + qNs + ".t (x int);"
+                    + " INSERT INTO " + qNs + ".t VALUES (1), (1)");
+            assertThrows(SQLException.class, () -> PgTestDatabase.execute(ds,
+                    "CREATE UNIQUE INDEX CONCURRENTLY idx ON " + qNs + ".t (x)"));
+            assertFalse(indexValid(ns, "idx"),
+                    "the failed concurrent build must leave an invalid index");
+            // make the unique build possible again; the invalid index itself
+            // does not enforce anything
+            PgTestDatabase.execute(ds, "DELETE FROM " + qNs + ".t WHERE ctid IN"
+                    + " (SELECT ctid FROM " + qNs + ".t LIMIT 1)");
+
+            final var script = "CREATE TABLE ${namespace}.t (x int);"
+                    + " CREATE UNIQUE INDEX idx ON ${namespace}.t (x)";
+            final var plan = reconciler(ns, script).concurrentIndexes(true)
+                    .build().plan();
+            final var difference = plan.differences().stream()
+                    .filter(d -> d.id().kind() == ObjectKind.INDEX
+                            && d.id().name().equals("idx"))
+                    .findFirst().orElseThrow();
+            assertEquals(DifferenceType.DRIFTED, difference.type());
+
+            final var report = reconciler(ns, script).concurrentIndexes(true)
+                    .build().reconcile();
+            assertEquals(ReconcileOutcome.RECONCILED, report.outcome());
+            assertTrue(report.applied().stream().anyMatch(c ->
+                    c.target().kind() == ObjectKind.INDEX
+                            && c.action() == ChangeAction.DROP
+                            && c.nonTransactional()));
+            assertTrue(report.applied().stream().anyMatch(c ->
+                    c.target().kind() == ObjectKind.INDEX
+                            && c.action() == ChangeAction.CREATE
+                            && c.nonTransactional()));
+            assertTrue(indexValid(ns, "idx"));
+            assertEquals(ReconcileOutcome.UP_TO_DATE,
+                    reconciler(ns, script).concurrentIndexes(true)
+                            .build().reconcile().outcome());
+        } finally {
+            drop(ns);
+        }
+    }
+
+    @Test
+    void theSessionAdvisoryLockSurvivesTheConcurrentIndexCommit() throws Exception {
+        final var ns = namespace();
+        try {
+            final var availableDuringConcurrentPhase = new AtomicBoolean(true);
+            final var observed = new AtomicBoolean();
+            final var script = "CREATE TABLE ${namespace}.t (id int);"
+                    + " CREATE INDEX i ON ${namespace}.t (id)";
+            final var report = reconciler(ns, script)
+                    .concurrentIndexes(true)
+                    .listener(new studio.epicquest.schema.reconciler.ReconcileListener() {
+                        @Override
+                        public void applying(PlannedChange change) {
+                            if (change.target().kind() == ObjectKind.INDEX
+                                    && change.action() == ChangeAction.CREATE
+                                    && change.nonTransactional()) {
+                                try {
+                                    availableDuringConcurrentPhase.set(
+                                            namespaceLockAvailable(ns));
+                                    observed.set(true);
+                                } catch (SQLException e) {
+                                    throw new RuntimeException(e);
+                                }
+                            }
+                        }
+                    })
+                    .build().reconcile();
+            assertEquals(ReconcileOutcome.RECONCILED, report.outcome());
+            assertTrue(observed.get(), "the deferred index create was not observed");
+            assertFalse(availableDuringConcurrentPhase.get(),
+                    "the namespace lock must still be held after the intermediate commit");
+            assertTrue(namespaceLockAvailable(ns),
+                    "the namespace lock must be released when the run ends");
         } finally {
             drop(ns);
         }
@@ -541,4 +669,44 @@ class FeatureE2ETest {
                             + "; DROP ROLE " + dialect.quoteIdentifier(role));
         }
     }
+
+    @Test
+    void aTableGrantToAQuotedCommaContainingRoleRoundTrips() throws Exception {
+        final var role = "rcl,comma_feat_" + RUN_ID;
+        var created = false;
+        try (Connection c = ds.getConnection(); final var s = c.createStatement()) {
+            final var rs = s.executeQuery(
+                    "SELECT rolsuper OR rolcreaterole FROM pg_roles"
+                            + " WHERE rolname = current_user");
+            assumeTrue(rs.next() && rs.getBoolean(1),
+                    "connecting role cannot create the grantee role");
+            s.execute("DROP ROLE IF EXISTS " + dialect.quoteIdentifier(role));
+            s.execute("CREATE ROLE " + dialect.quoteIdentifier(role));
+            created = true;
+        }
+        final var ns = namespace();
+        try {
+            final var script = "CREATE TABLE ${namespace}.acl_t (id int);"
+                    + " GRANT SELECT ON ${namespace}.acl_t TO "
+                    + dialect.quoteIdentifier(role);
+            assertEquals(ReconcileOutcome.RECONCILED,
+                    reconciler(ns, script).build().reconcile().outcome());
+            assertEquals(ReconcileOutcome.UP_TO_DATE,
+                    reconciler(ns, script).build().reconcile().outcome());
+
+            final var dump = SchemaReconciler.builder().dataSource(ds)
+                    .namespace(ns).dialect(dialect).build().dump();
+            assertTrue(dump.contains("GRANT SELECT"), dump);
+            assertTrue(dump.contains(dialect.quoteIdentifier(role)), dump);
+            assertEquals(ReconcileOutcome.UP_TO_DATE,
+                    reconciler(ns, dump).build().reconcile().outcome());
+        } finally {
+            drop(ns);
+            if (created) {
+                PgTestDatabase.execute(ds,
+                        "DROP ROLE " + dialect.quoteIdentifier(role));
+            }
+        }
+    }
+
 }

@@ -284,7 +284,7 @@ function privilegeDumpStatements(o: { def: Definition | undefined;
             ? c.substring("privileges=".length) : c;
     const grants: string[] = [];
     if (c !== "") {
-        for (const tok of c.split(",")) {
+        for (const tok of PgSql.splitOutsideLiterals(c, ",")) {
             const g = tok.substring(0, tok.lastIndexOf(":"));
             if (g === "<owner>") {
                 continue;
@@ -295,7 +295,7 @@ function privilegeDumpStatements(o: { def: Definition | undefined;
                 p = p.substring(0, p.length - 1);
             }
             grants.push(pfx + "GRANT " + p + colClause + " ON " + target + " TO "
-                    + (g === "PUBLIC" ? g : PgIdentifiers.quote(g))
+                    + (g === "PUBLIC" || g.startsWith("\"") ? g : PgIdentifiers.quote(g))
                     + (option ? " WITH GRANT OPTION" : ""));
         }
     }
@@ -703,7 +703,9 @@ class Data {
             const generated = nullToEmpty(strOrNull(row.attgenerated));
             const identity = nullToEmpty(strOrNull(row.attidentity));
             const defexpr = strOrNull(row.defexpr);
-            const collname = strOrNull(row.collname);
+            const collation0 = strOrNull(row.collation);
+            const collation = collation0 === null ? null
+                    : PgSql.normalize(collation0, this.ns);
             const customCollation = num(row.attcollation) !== 0
                     && num(row.attcollation) !== num(row.typcollation);
             const storage = strOrNull(row.attstorage);
@@ -720,11 +722,16 @@ class Data {
                         : storage === "p" ? "PLAIN" : "EXTENDED");
             }
             if (compression.length > 0) {
-                sql += " COMPRESSION " + (compression === "l" ? "lz4" : "pglz");
+                const method = compression === "p" ? "pglz"
+                        : compression === "l" ? "lz4"
+                        : compression === "z" ? "zstd" : null;
+                if (method !== null) {
+                    sql += " COMPRESSION " + method;
+                }
             }
-            if (customCollation && collname !== null) {
-                canonical += ";collation=" + collname;
-                sql += " COLLATE " + PgIdentifiers.quote(collname);
+            if (customCollation && collation !== null) {
+                canonical += ";collation=" + collation;
+                sql += " COLLATE " + collation;
             }
             const attrs = new Map<string, string>();
             attrs.set(ATTNUM, str(row.attnum));
@@ -822,7 +829,7 @@ class Data {
                 attrs.set(POST_SQL, "ALTER TABLE " + this.tableRef(parent)
                         + " REPLICA IDENTITY USING INDEX " + PgIdentifiers.quote(name));
             }
-            this.define(id, def!, attrs);
+            this.define(id, def! + (bool(row.valid) ? "" : ";valid=false"), attrs);
         }
     }
 

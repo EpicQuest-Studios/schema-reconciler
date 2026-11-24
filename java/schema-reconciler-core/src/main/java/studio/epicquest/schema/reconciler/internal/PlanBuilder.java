@@ -136,7 +136,7 @@ final class PlanBuilder {
             changes.addAll(rendered.late());
         }
 
-        addDependentRebuilds(changes, coveredByParent);
+        addDependentRebuilds(changes, coveredByParent, pruned);
         validatePairs(changes);
         checkNameCollisions(changes);
         final var ordered = orderChanges(changes, renameChanges);
@@ -251,7 +251,27 @@ final class PlanBuilder {
     private record CarriedChildren(Set<ObjectId> suppressed, List<Difference> drift,
                                    Map<String, String> parentNames) { }
 
-    /** UNEXPECTED objects whose drop is covered by another UNEXPECTED object's drop. */
+    private static final Set<ObjectKind> PRUNE_CONTAINERS = Set.of(
+            ObjectKind.TABLE, ObjectKind.PARTITION, ObjectKind.FOREIGN_TABLE,
+            ObjectKind.VIEW, ObjectKind.MATERIALIZED_VIEW);
+
+    private static final Set<ObjectKind> PRUNE_CONTAINED = Set.of(
+            ObjectKind.COLUMN, ObjectKind.PRIMARY_KEY, ObjectKind.UNIQUE,
+            ObjectKind.FOREIGN_KEY, ObjectKind.CHECK, ObjectKind.EXCLUSION,
+            ObjectKind.INDEX, ObjectKind.TRIGGER, ObjectKind.POLICY,
+            ObjectKind.RULE, ObjectKind.COMMENT, ObjectKind.SECURITY_LABEL,
+            ObjectKind.PRIVILEGES, ObjectKind.OWNERSHIP);
+
+    private static final Set<ObjectKind> PRUNE_MIRRORED = Set.of(
+            ObjectKind.COMMENT, ObjectKind.SECURITY_LABEL, ObjectKind.OWNERSHIP,
+            ObjectKind.PRIVILEGES, ObjectKind.PUBLICATION);
+
+    /**
+     * UNEXPECTED objects implicitly removed by another UNEXPECTED object's
+     * DROP — no CASCADE is ever rendered, so ordinary dependents need their
+     * own standalone DROP (5.5). Only containment, serial ownership and
+     * mirrored annotations are implicit removals.
+     */
     private Set<ObjectId> suppressedUnexpected(List<Difference> differences) {
         final var unexpected = differences.stream()
                 .filter(d -> d.type() == DifferenceType.UNEXPECTED
@@ -264,16 +284,38 @@ final class PlanBuilder {
         final var prereqs = Dependencies.prerequisitesOf(dialect, actual);
         final var suppressed = new HashSet<ObjectId>();
         for (final var id : unexpected) {
-            final var deps = new HashSet<>(Dependencies.reachable(id, prereqs));
-            deps.remove(id);
-            for (final var dep : deps) {
-                if (unexpected.contains(dep)) {
-                    suppressed.add(id);
-                    break;
-                }
+            final var deps = prereqs.getOrDefault(id, Set.of());
+            if (containedInUnexpectedParent(id, deps, unexpected)
+                    || serialOwnedByUnexpectedTable(id, deps, unexpected)
+                    || mirroredOnUnexpected(id, deps, unexpected)) {
+                suppressed.add(id);
             }
         }
         return suppressed;
+    }
+
+    private static boolean containedInUnexpectedParent(ObjectId id,
+            Set<ObjectId> prereqs, Set<ObjectId> unexpected) {
+        if (!PRUNE_CONTAINED.contains(id.kind()) || id.parent().isEmpty()) {
+            return false;
+        }
+        final var parent = id.parent().orElseThrow();
+        return prereqs.stream().anyMatch(dep -> unexpected.contains(dep)
+                && PRUNE_CONTAINERS.contains(dep.kind())
+                && dep.name().equals(parent));
+    }
+
+    private static boolean serialOwnedByUnexpectedTable(ObjectId id,
+            Set<ObjectId> prereqs, Set<ObjectId> unexpected) {
+        return id.kind() == ObjectKind.SEQUENCE
+                && prereqs.stream().anyMatch(dep -> unexpected.contains(dep)
+                        && dep.kind() == ObjectKind.TABLE);
+    }
+
+    private static boolean mirroredOnUnexpected(ObjectId id,
+            Set<ObjectId> prereqs, Set<ObjectId> unexpected) {
+        return PRUNE_MIRRORED.contains(id.kind())
+                && prereqs.stream().anyMatch(unexpected::contains);
     }
 
     private List<PlannedChange> render(Difference difference) {
@@ -401,7 +443,8 @@ final class PlanBuilder {
      * and actual snapshots, or UNEXPECTED ones, fail planning.
      */
     private void addDependentRebuilds(List<PlannedChange> changes,
-                                      Map<ObjectId, Map<ObjectId, Definition>> coveredByParent) {
+                                      Map<ObjectId, Map<ObjectId, Definition>> coveredByParent,
+                                      Set<ObjectId> pruned) {
         final var actualDeps = Dependencies.prerequisitesOf(dialect, actual);
         final var dependents = Dependencies.reverse(actualDeps);
 
@@ -434,9 +477,17 @@ final class PlanBuilder {
                 }
                 final var want = desired.objects().get(dependent);
                 if (want == null) {
-                    if (prune) {
-                        // under prune the dependent is itself UNEXPECTED —
-                        // its drop dies with the parent's, no rebuild needed
+                    // an out-of-namespace dependent can never be pruned —
+                    // dropping the prerequisite would break it silently
+                    if ("true".equals(have.attributes()
+                            .get(Dialect.EXTERNAL_DEPENDENT_ATTRIBUTE))) {
+                        throw new PlanningException("namespace '" + targetNamespace + "': "
+                                + dependent + " depends on " + dropped
+                                + " but is not part of the desired state");
+                    }
+                    if (prune && (targets.contains(dependent) || pruned.contains(dependent))) {
+                        // under prune this in-namespace dependent is itself
+                        // being dropped (or implicitly removed); no rebuild
                         continue;
                     }
                     throw new PlanningException("namespace '" + targetNamespace + "': "

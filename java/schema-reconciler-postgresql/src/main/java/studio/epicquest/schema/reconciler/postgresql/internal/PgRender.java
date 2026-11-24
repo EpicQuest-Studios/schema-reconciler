@@ -41,9 +41,12 @@ public final class PgRender {
     /** {@code SHARE ROW EXCLUSIVE} — constraint/index adds that still allow writes. */
     private static final ChangeHazard LOCK_ROW_EXCLUSIVE =
             new ChangeHazard(LockLevel.SHARE_ROW_EXCLUSIVE, false, false);
-    /** A CHECK/FOREIGN KEY add scans existing rows to validate them. */
+    /** A FOREIGN KEY add scans existing rows under SHARE ROW EXCLUSIVE. */
     private static final ChangeHazard VALIDATES =
             new ChangeHazard(LockLevel.SHARE_ROW_EXCLUSIVE, false, true);
+    /** PK/UNIQUE/CHECK/EXCLUSION adds validate existing rows under ACCESS EXCLUSIVE. */
+    private static final ChangeHazard VALIDATES_EXCLUSIVE =
+            new ChangeHazard(LockLevel.ACCESS_EXCLUSIVE, false, true);
     /** {@code CREATE INDEX} (plain) — SHARE on the table: reads pass, writes block. */
     private static final ChangeHazard INDEX_BUILD =
             new ChangeHazard(LockLevel.SHARE, false, false);
@@ -92,12 +95,11 @@ public final class PgRender {
                     Optional.of(want.definition()), "missing " + id));
             case COLUMN -> missingColumn(id, want, desired, ns);
             case INDEX -> List.of(indexCreate(id, want, desired, ns, "missing " + id,
-                    options));
+                    options, ChangeSafety.ADDITIVE));
             case PRIMARY_KEY, UNIQUE, FOREIGN_KEY, CHECK, EXCLUSION ->
                     List.of(additive(id, want, ns, "missing " + id, false,
                             id.kind() == ObjectKind.FOREIGN_KEY
-                                    || id.kind() == ObjectKind.CHECK
-                                    ? VALIDATES : LOCK_ROW_EXCLUSIVE));
+                                    ? VALIDATES : VALIDATES_EXCLUSIVE));
             case VIEW, TRIGGER, TYPE, DOMAIN, POLICY, EXTENSION, STATISTICS, RULE,
                     COLLATION, CONVERSION, PARTITION, PUBLICATION, CAST,
                     TRANSFORM ->
@@ -489,8 +491,7 @@ public final class PgRender {
             case INDEX -> indexRecreate(id, want, desired, ns, "drifted " + id,
                     options);
             case PRIMARY_KEY, UNIQUE, FOREIGN_KEY, CHECK, EXCLUSION ->
-                    recreate(id, want, ns, "drifted " + id, false,
-                            LOCK_ROW_EXCLUSIVE);
+                    constraintRecreate(id, want, ns, "drifted " + id);
             case VIEW, TRIGGER, POLICY, STATISTICS, RULE, COLLATION, CONVERSION,
                     PUBLICATION, CAST, TRANSFORM ->
                     recreate(id, want, ns, "drifted " + id);
@@ -662,7 +663,7 @@ public final class PgRender {
         if (s.startsWith("privileges=")) {
             s = s.substring("privileges=".length());
         }
-        return s.isEmpty() ? List.of() : List.of(s.split(","));
+        return s.isEmpty() ? List.of() : PgSql.splitOutsideLiterals(s, ',');
     }
 
     /** The grantee of a {@code grantee:PRIVILEGE[*]} token — the last colon splits it. */
@@ -687,7 +688,8 @@ public final class PgRender {
 
     /** {@code PUBLIC} stays a keyword; a role name is quoted. */
     private static String granteeSql(String grantee) {
-        return grantee.equals("PUBLIC") ? grantee : PgIdentifiers.quote(grantee);
+        return grantee.equals("PUBLIC") || grantee.startsWith("\"")
+                ? grantee : PgIdentifiers.quote(grantee);
     }
 
     /**
@@ -874,7 +876,7 @@ public final class PgRender {
 
     /** {@code attcompression} letter to the {@code SET COMPRESSION} method. */
     private static final Map<String, String> COMPRESSION_WORDS = Map.of(
-            "p", "pglz", "l", "lz4", "", "default");
+            "p", "pglz", "l", "lz4", "z", "zstd", "", "default");
 
     private static final Map<String, Integer> INT_TYPES = Map.of(
             "smallint", 1, "integer", 2, "bigint", 3);
@@ -960,6 +962,22 @@ public final class PgRender {
             statements.add(bind(post, ns));
         }
         return statements;
+    }
+
+
+    /** Constraint recreate: DROP CONSTRAINT is ACCESS EXCLUSIVE; the CREATE
+     *  half carries the constraint kind's own lock/validation hazard. */
+    private static List<PlannedChange> constraintRecreate(ObjectId id, SchemaObject want,
+                                                          String ns, String reason) {
+        final var createHazard = id.kind() == ObjectKind.FOREIGN_KEY
+                ? VALIDATES : VALIDATES_EXCLUSIVE;
+        return List.of(
+                new PlannedChange(0, id, ChangeAction.DROP, ChangeSafety.REBUILD,
+                        List.of(bind(want, PgCatalog.DROP_SQL, ns)), Optional.empty(), reason,
+                        false, LOCK_EXCLUSIVE),
+                new PlannedChange(0, id, ChangeAction.CREATE, ChangeSafety.REBUILD,
+                        createStatements(want, ns), Optional.of(want.definition()), reason,
+                        false, createHazard));
     }
 
     /** A DROP change plus a CREATE change — the two halves of a recreate (4.4). */
@@ -1100,6 +1118,11 @@ public final class PgRender {
                 return List.of(new PlannedChange(0, id, ChangeAction.DROP, safety,
                         List.of(bind(drop, ns)), Optional.empty(), reason,
                         false, safety == ChangeSafety.DESTRUCTIVE
+                                || id.kind() == ObjectKind.PRIMARY_KEY
+                                || id.kind() == ObjectKind.UNIQUE
+                                || id.kind() == ObjectKind.FOREIGN_KEY
+                                || id.kind() == ObjectKind.CHECK
+                                || id.kind() == ObjectKind.EXCLUSION
                                 ? LOCK_EXCLUSIVE : ChangeHazard.NONE));
             }
         }
@@ -1139,10 +1162,10 @@ public final class PgRender {
      */
     private static PlannedChange indexCreate(ObjectId id, SchemaObject want,
                                              SchemaSnapshot snapshot, String ns, String reason,
-                                             RenderOptions options) {
+                                             RenderOptions options, ChangeSafety safety) {
         if (!concurrentIndex(id, snapshot, options)) {
             return new PlannedChange(0, id, ChangeAction.CREATE,
-                    ChangeSafety.ADDITIVE, createStatements(want, ns),
+                    safety, createStatements(want, ns),
                     Optional.of(want.definition()), reason, false, INDEX_BUILD);
         }
         final var statements = createStatements(want, ns).stream()
@@ -1150,7 +1173,7 @@ public final class PgRender {
                         "$1 CONCURRENTLY "))
                 .toList();
         return new PlannedChange(0, id, ChangeAction.CREATE,
-                ChangeSafety.ADDITIVE, statements, Optional.of(want.definition()), reason,
+                safety, statements, Optional.of(want.definition()), reason,
                 true, INDEX_CONCURRENT);
     }
 
@@ -1182,7 +1205,8 @@ public final class PgRender {
         }
         return List.of(
                 indexDrop(id, want, snapshot, ns, reason, options),
-                indexCreate(id, want, snapshot, ns, reason, options));
+                indexCreate(id, want, snapshot, ns, reason, options,
+                        ChangeSafety.REBUILD));
     }
 
     // ---- RENAME (5.5.1) ------------------------------------------------------

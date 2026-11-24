@@ -130,13 +130,18 @@ public record ReconcilePlan(
         final var parsedChanges = new java.util.ArrayList<PlannedChange>();
         for (var i = 0; i < changes.size(); i++) {
             final var cc = requireObject(changes.get(i), "changes[" + i + "]");
-            final var hzRaw = cc.get("hazard");
-            final var hz = requireObject(hzRaw == null ? Map.of() : hzRaw,
+            final var hz = requireObject(cc.get("hazard"),
                     "changes[" + i + "].hazard");
             final var lockLevel = hz.get("lockLevel");
             final var notes = hz.get("notes");
+            final var order = requireNumber(cc.get("order"),
+                    "changes[" + i + "].order");
+            if (order.doubleValue() != i + 1) {
+                throw new IllegalArgumentException("invalid plan JSON: changes[" + i
+                        + "].order must be " + (i + 1));
+            }
             parsedChanges.add(new PlannedChange(
-                    requireNumber(cc.get("order"), "changes[" + i + "].order").intValue(),
+                    order.intValue(),
                     requireId(cc.get("target"), "changes[" + i + "].target"),
                     requireEnum(cc.get("action"), ChangeAction.class,
                             "changes[" + i + "].action"),
@@ -164,8 +169,14 @@ public record ReconcilePlan(
     }
 
     private static Optional<Definition> optDef(Object v) {
-        return v == null ? Optional.empty()
-                : Optional.of(new Definition(String.valueOf(v)));
+        if (v == null) {
+            return Optional.empty();
+        }
+        if (!(v instanceof String s)) {
+            throw new IllegalArgumentException(
+                    "invalid plan JSON: expected/actual is not a string or null");
+        }
+        return Optional.of(new Definition(s));
     }
 
     @SuppressWarnings("unchecked")

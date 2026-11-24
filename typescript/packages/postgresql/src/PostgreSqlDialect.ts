@@ -20,8 +20,39 @@ import * as PgSql from "./internal/PgSql.ts";
 
 const SAVEPOINT = "rcl_scratch";
 const LOCK_KEY_PREFIX = "studio.epicquest.schema.reconciler:";
+/** The session-scoped namespace lock key per pinned connection, so scratch
+ *  cleanup can release script locks without releasing the run's lock. */
+const NAMESPACE_LOCKS = new WeakMap<SqlConnection, string>();
 
 const CREATE_EXTENSION = /^\s*CREATE\s+EXTENSION\s+(?:IF\s+NOT\s+EXISTS\s+)?("(?:[^"]|"")*"|[\w-]+)/i;
+
+
+/** Releases advisory locks a desired script took, preserving this run's
+ *  namespace lock when scratch shares the target connection. */
+async function releaseScriptLocks(connection: SqlConnection): Promise<void> {
+    const protectedKey = NAMESPACE_LOCKS.get(connection);
+    if (protectedKey === undefined) {
+        await connection.execute("SELECT pg_advisory_unlock_all()");
+        return;
+    }
+    const held = await connection.query<{
+        key: unknown; objsubid: number; key1: number; key2: number;
+    }>("SELECT ((classid::integer::bigint << 32) | (objid::integer::bigint & 4294967295))::text AS key,"
+            + " objsubid, classid::integer AS key1, objid::integer AS key2"
+            + " FROM pg_locks WHERE locktype = 'advisory'"
+            + " AND pid = pg_backend_pid()");
+    for (const lock of held) {
+        if (Number(lock.objsubid) === 1) {
+            if (String(lock.key) === protectedKey) {
+                continue;
+            }
+            await connection.query("SELECT pg_advisory_unlock($1)", [String(lock.key)]);
+        } else if (Number(lock.objsubid) === 2) {
+            await connection.query("SELECT pg_advisory_unlock($1, $2)",
+                    [lock.key1, lock.key2]);
+        }
+    }
+}
 
 /** Creates the dialect — stateless, safe to share. */
 export class PostgreSqlDialect implements Dialect {
@@ -50,10 +81,17 @@ export class PostgreSqlDialect implements Dialect {
                 + millisBounded(timeout) + "ms'");
         try {
             await connection.query(
-                    "SELECT pg_advisory_xact_lock(hashtextextended("
+                    "SELECT pg_advisory_lock(hashtextextended("
                             + "'" + LOCK_KEY_PREFIX + "'"
                             + " || current_database() || ':' || $1, 0))",
                     [namespace]);
+            const keys = await connection.query<{ key: unknown }>(
+                    "SELECT hashtextextended('" + LOCK_KEY_PREFIX + "'"
+                            + " || current_database() || ':' || $1, 0) AS key",
+                    [namespace]);
+            if (keys[0] !== undefined) {
+                NAMESPACE_LOCKS.set(connection, String(keys[0].key));
+            }
         } catch (e) {
             if (sqlState(e) === "55P03") {
                 throw new LockTimeoutException("namespace '" + namespace
@@ -64,8 +102,16 @@ export class PostgreSqlDialect implements Dialect {
         await connection.execute("SET LOCAL lock_timeout = DEFAULT");
     }
 
-    async releaseLock(connection: SqlConnection, _namespace: string): Promise<void> {
-        await connection.execute("SELECT pg_advisory_unlock_all()");
+    async releaseLock(connection: SqlConnection, namespace: string): Promise<void> {
+        try {
+            await connection.query(
+                    "SELECT pg_advisory_unlock(hashtextextended('"
+                            + LOCK_KEY_PREFIX + "'"
+                            + " || current_database() || ':' || $1, 0))",
+                    [namespace]);
+        } finally {
+            NAMESPACE_LOCKS.delete(connection);
+        }
     }
 
     async bindSessionNamespace(connection: SqlConnection, namespace: string): Promise<void> {
@@ -100,12 +146,12 @@ export class PostgreSqlDialect implements Dialect {
             // the rollback undoes settings but not session advisory locks, which a
             // function the script invoked may have taken (the static check cannot
             // see through a call): release them before the connection is reused
-            await connection.execute("SELECT pg_advisory_unlock_all()");
+            await releaseScriptLocks(connection);
         } catch (e) {
             // the savepoint is gone: the script committed (or aborted) the
             // transaction — remove the committed schema explicitly (A.3)
             await rollbackQuietly(connection);
-            await connection.execute("SELECT pg_advisory_unlock_all()");
+            await releaseScriptLocks(connection);
             await connection.execute("DROP SCHEMA IF EXISTS "
                     + PgIdentifiers.quote(scratchNamespace) + " CASCADE");
             await connection.commit();

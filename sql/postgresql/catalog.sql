@@ -75,7 +75,8 @@ SELECT c.relname AS parent, c.oid AS reloid, a.attnum,
        a.attname, format_type(a.atttypid, a.atttypmod) AS typ,
        a.attgenerated, a.attcollation, t.typcollation, a.attidentity,
        a.attstorage, t.typstorage, a.attcompression,
-       co.collname,
+       CASE WHEN a.attcollation <> 0 AND a.attcollation <> t.typcollation
+            THEN a.attcollation::regcollation::text ELSE NULL END AS collation,
        (a.attnotnull OR EXISTS (
            SELECT 1 FROM pg_constraint cn
            WHERE cn.conrelid = a.attrelid AND cn.contype = 'n'
@@ -89,7 +90,6 @@ JOIN pg_class c ON c.oid = a.attrelid AND c.relkind IN ('r', 'p', 'f')
 JOIN pg_namespace n ON n.oid = c.relnamespace
 JOIN pg_type t ON t.oid = a.atttypid
 LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum
-LEFT JOIN pg_collation co ON co.oid = a.attcollation
 LEFT JOIN LATERAL (
     SELECT ps.* FROM pg_depend dep
     JOIN pg_class sq ON sq.oid = dep.objid AND sq.relkind = 'S'
@@ -120,12 +120,13 @@ ORDER BY c.oid
 
 -- name: indexes
 SELECT i.indexrelid AS oid, ic.relname, tc.relname AS parent,
-       pg_get_indexdef(i.indexrelid) AS def, i.indisreplident AS replident
+       pg_get_indexdef(i.indexrelid) AS def, i.indisreplident AS replident,
+       i.indisvalid AS valid
 FROM pg_index i
 JOIN pg_class ic ON ic.oid = i.indexrelid
 JOIN pg_class tc ON tc.oid = i.indrelid
 JOIN pg_namespace n ON n.oid = ic.relnamespace
-WHERE n.nspname = ? AND ic.relkind = 'i' AND i.indisvalid
+WHERE n.nspname = ? AND ic.relkind = 'i'
   AND NOT EXISTS (SELECT 1 FROM pg_constraint co
                   WHERE co.conindid = i.indexrelid
                     AND co.contype IN ('p','u','x'))
@@ -336,7 +337,7 @@ SELECT cl.oid, cl.collname, cl.collprovider, cl.collisdeterministic,
        cl.collencoding, cl.collcollate, cl.collctype,
        COALESCE(to_json(cl)->>'colllocale',
                 to_json(cl)->>'colliculocale') AS colllocale,
-       cl.collicurules
+       to_jsonb(cl)->>'collicurules' AS collicurules
 FROM pg_collation cl
 JOIN pg_namespace n ON n.oid = cl.collnamespace AND n.nspname = ?
 WHERE cl.collprovider IN ('c', 'i')
