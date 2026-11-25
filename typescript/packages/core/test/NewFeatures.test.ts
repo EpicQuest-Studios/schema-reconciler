@@ -350,3 +350,64 @@ test("planJsonStrictFields", () => {
                 IllegalArgumentError);
     }
 });
+
+// ---- 0.11 targeted retirement, scoped prune and hooks -------------------
+
+test("retireDropsWithoutPruneAndRejectsContradictions", async () => {
+    const { db, dialect } = fixture();
+    const old = new ObjectId(ObjectKind.TABLE, "old");
+    db.executeDirect(NS, "CREATE TABLE keep DEF k; CREATE TABLE old DEF o");
+    const report = await reconciler(db, dialect, "CREATE TABLE keep DEF k",
+            ReconcilePolicy.defaults().withDestructive(Decision.APPLY))
+            .retire(old).build().reconcile();
+    assert.equal(report.outcome, ReconcileOutcome.RECONCILED);
+    assert.ok(!db.objectsIn(NS).has(old));
+    assert.ok(report.applied.some(c => c.action === ChangeAction.DROP
+            && c.target.equals(old) && c.reason.includes("retired")));
+
+    await assert.rejects(() => reconciler(db, dialect, "CREATE TABLE old DEF o")
+            .retire(old).build().plan(), PlanningException);
+    assert.throws(() => reconciler(db, dialect, "CREATE TABLE keep DEF k")
+            .retire(new ObjectId(ObjectKind.OTHER, "x")), IllegalArgumentError);
+});
+
+test("pruneFilterProtectsAContainerTreeButKeepsItVisible", async () => {
+    const { db, dialect } = fixture();
+    db.executeDirect(NS, "CREATE TABLE keep DEF k; CREATE TABLE stray DEF s;"
+            + " CREATE COLUMN stray.c DEF c");
+    const report = await reconciler(db, dialect, "CREATE TABLE keep DEF k",
+            ReconcilePolicy.defaults().withPrune(true).withDestructive(Decision.APPLY))
+            .pruneFilter(id => id.name !== "stray")
+            .build().reconcile();
+    assert.equal(report.outcome, ReconcileOutcome.UP_TO_DATE);
+    assert.ok(db.objectsIn(NS).has(new ObjectId(ObjectKind.TABLE, "stray")));
+    assert.ok(db.objectsIn(NS).has(new ObjectId(ObjectKind.COLUMN, "c", "stray")));
+    assert.ok(report.unexpected.some(d => d.id.name === "stray"));
+    assert.ok(report.unexpected.some(d => d.id.kind === ObjectKind.COLUMN
+            && d.id.parent === "stray"));
+    assert.ok(!report.plan.changes.some(c => c.action === ChangeAction.DROP));
+});
+
+test("hooksRunInDeterministicOrderButNeverDuringPlanning", async () => {
+    const { db, dialect } = fixture();
+    const events: string[] = [];
+    const r = reconciler(db, dialect, "CREATE TABLE t DEF v")
+            .hook({ id: "b-pre", phase: "PRE_APPLY", order: 2, run: () => { events.push("b"); } })
+            .hook({ id: "c-post", phase: "POST_APPLY", order: 0, run: () => { events.push("c"); } })
+            .hook({ id: "a-pre", phase: "PRE_APPLY", order: 1, run: () => { events.push("a"); } })
+            .build();
+    const report = await r.reconcile();
+    assert.equal(report.outcome, ReconcileOutcome.RECONCILED);
+    assert.deepEqual(events, ["a", "b", "c"]);
+    const count = events.length;
+    await r.plan();
+    assert.equal(events.length, count, "plan() must not run hooks");
+
+    assert.throws(() => reconciler(db, dialect, "CREATE TABLE x DEF v")
+            .hook({ id: "x", phase: "PRE_APPLY", runOnce: true, run: () => {} })
+            .build(), /runOnce/);
+    assert.throws(() => reconciler(db, dialect, "CREATE TABLE x DEF v")
+            .hook({ id: "x", phase: "PRE_APPLY", run: () => {} })
+            .hook({ id: "x", phase: "POST_APPLY", run: () => {} })
+            .build(), /duplicate/);
+});

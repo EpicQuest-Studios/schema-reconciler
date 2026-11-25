@@ -100,4 +100,78 @@ public final class PgIdentifiers {
         }
         return prefix + suffix;
     }
+
+    /**
+     * Removes the leading {@code ONLY} table qualifier pg_get_indexdef emits
+     * for a valid partitioned index, so the managed create recurses to child
+     * partitions. The scan is identifier-aware: quoted index names may contain
+     * spaces, {@code ON}, or doubled quotes.
+     */
+    static String stripIndexOnOnly(String definition) {
+        var pos = skipSpace(definition, 0);
+        pos = consumeWord(definition, pos, "CREATE");
+        if (pos < 0) {
+            return definition;
+        }
+        pos = skipSpace(definition, pos);
+        final var afterUnique = consumeWord(definition, pos, "UNIQUE");
+        if (afterUnique >= 0) {
+            pos = skipSpace(definition, afterUnique);
+        }
+        pos = consumeWord(definition, pos, "INDEX");
+        if (pos < 0) {
+            return definition;
+        }
+        pos = skipSpace(definition, pos);
+        if (pos >= definition.length()) {
+            return definition;
+        }
+        if (definition.charAt(pos) == '"') {
+            pos++;
+            while (pos < definition.length()) {
+                if (definition.charAt(pos) == '"') {
+                    if (pos + 1 < definition.length() && definition.charAt(pos + 1) == '"') {
+                        pos += 2;
+                    } else {
+                        pos++;
+                        break;
+                    }
+                } else {
+                    pos++;
+                }
+            }
+        } else {
+            while (pos < definition.length() && !Character.isWhitespace(definition.charAt(pos))) {
+                pos++;
+            }
+        }
+        pos = skipSpace(definition, pos);
+        pos = consumeWord(definition, pos, "ON");
+        if (pos < 0) {
+            return definition;
+        }
+        pos = skipSpace(definition, pos);
+        final var onlyEnd = consumeWord(definition, pos, "ONLY");
+        if (onlyEnd < 0 || onlyEnd >= definition.length()
+                || !Character.isWhitespace(definition.charAt(onlyEnd))) {
+            return definition;
+        }
+        return definition.substring(0, pos) + definition.substring(skipSpace(definition, onlyEnd));
+    }
+
+    private static int skipSpace(String text, int pos) {
+        while (pos < text.length() && Character.isWhitespace(text.charAt(pos))) {
+            pos++;
+        }
+        return pos;
+    }
+
+    private static int consumeWord(String text, int pos, String word) {
+        if (pos + word.length() > text.length()
+                || !text.regionMatches(true, pos, word, 0, word.length())) {
+            return -1;
+        }
+        final var end = pos + word.length();
+        return end == text.length() || Character.isWhitespace(text.charAt(end)) ? end : -1;
+    }
 }

@@ -11,7 +11,7 @@ const MIRRORED: ReadonlySet<ObjectKind> = new Set([
 
 /** OTHER relation prefixes whose rows can own catalog children. */
 const RELATION_OTHERS: ReadonlySet<string> = new Set([
-    "inherited", "partindex", "toast", "relation"]);
+    "inherited", "toast", "relation"]);
 
 /** OTHER prefixes that name a target — the unsupported shadow forms of
  *  the mirrored kinds ({@code comment:}/{@code seclabel:}/

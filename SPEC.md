@@ -4,7 +4,7 @@
 
 | | |
 |---|---|
-| **Version** | 0.10, Draft |
+| **Version** | 0.11, Draft |
 | **Date** | 2026-10-25 |
 | **Maven group** | `studio.epicquest.schema` |
 | **Java baseline** | Java SE 25 |
@@ -39,6 +39,8 @@ This document is the working specification of the schema-reconciler project: the
   - [3.4 Dialect resolution](#34-dialect-resolution)
   - [3.5 Results](#35-results)
   - [3.6 `ReconcileListener`](#36-reconcilelistener)
+  - [3.7 Multi-namespace reconciliation](#37-multi-namespace-reconciliation)
+  - [3.8 Lifecycle hooks](#38-lifecycle-hooks)
 - [4. Model](#4-model)
   - [4.1 Object identity](#41-object-identity)
   - [4.2 Schema objects and snapshots](#42-schema-objects-and-snapshots)
@@ -143,8 +145,8 @@ In scope: tables, columns, primary-key, unique, foreign-key and check constraint
 
 Non-goals for version 1:
 
-- versioned migrations or a migration history table,
-- data migration or backfill,
+- versioned migrations or a migration history table (explicit, opt-in lifecycle hooks and `HookStore` records are defined in section 3.8),
+- data migration or backfill (apart from explicit, opt-in lifecycle hooks as defined in section 3.8),
 - translating a script from one dialect to another,
 - rename detection (a rename appears as one missing and one unexpected object),
 - down-migrations or rollback scripts,
@@ -232,6 +234,13 @@ public final class SchemaReconciler {
         public Builder statementTimeout(Duration timeout) { ... }         // optional, unbounded by default
         public Builder concurrentIndexes(boolean enabled) { ... }         // optional, default false (6.4)
         public Builder rename(ObjectId from, ObjectId to) { ... }         // optional, repeatable explicit rename hint
+        public Builder retire(ObjectId id) { ... }                        // optional, repeatable targeted retirement
+        public Builder externalPartitions(String parentTable) { ... }     // optional, repeatable coexistence rule
+        public Builder externalPartitions(String parentTable, String namePrefix) { ... }
+        public Builder externalPartitions(BiPredicate<String, String> matcher) { ... }
+        public Builder pruneFilter(Predicate<ObjectId> allowPrune) { ... } // optional, default allows every prune
+        public Builder hook(SchemaHook hook) { ... }                      // optional, repeatable lifecycle hook
+        public Builder hookStore(HookStore hookStore) { ... }             // optional run-once hook records
         public Builder listener(ReconcileListener listener) { ... }       // optional
         public Builder filter(Predicate<ObjectId> include) { ... }        // optional, default includes all objects
         public SchemaReconciler build() { ... }
@@ -240,6 +249,10 @@ public final class SchemaReconciler {
 ```
 
 `filter` excludes objects from both snapshots — actual and desired alike — before comparison: an object the predicate rejects produces no difference, no change and no unexpected-object report, and its children (`ObjectId.parent`), mirrored annotations — managed or `OTHER`-prefixed — (comments, security labels, ownership, privileges, publication bindings, `constraint:<target>.<member>` shadows) and follower objects it covers (a serial `SEQUENCE`'s `OWNED BY` dependency) are invisible with it. Dependency edges an excluded object records are invisible too, and the staleness fingerprint (5.7) covers only visible objects. Filtering is how a caller coexists with objects another tool manages; it is not a safety valve — an excluded object that should have been reconciled is simply never seen.
+
+`externalPartitions` is the narrower coexistence API for runtime-created PostgreSQL partitions. Rules are repeatable and OR-matched: a rule either names a partitioned parent, names a parent plus a prefix, or is a `(parentTable, partitionName)` predicate. A matching actual `PARTITION` is hidden only when it is not declared in desired and its partitioned-table ancestor is declared in desired; hiding cascades to its columns, local indexes, constraints, triggers, annotations and sub-partitions through the same cascade as `filter`. A declared `DEFAULT` or bootstrap partition reconciles normally even when its name matches. If the partitioned parent itself is absent from desired, its partitions remain visible so `prune` never renders a parent `DROP TABLE` whose non-CASCADE semantics the hidden children would contradict. `dump()` omits rule-matching partitions and their children.
+
+`retire` marks one managed object for targeted removal even when `policy.prune()` is false. `pruneFilter` does not affect visibility: unexpected objects remain in plans and reports, but when pruning is enabled only objects accepted by the predicate receive standalone drops. Rejecting an unexpected container protects its contained columns, constraints, indexes, triggers, policies, mirrored annotations, serial-owned sequences and nested partitions transitively, unless such a child is explicitly retired.
 
 `build()` must fail with `ConfigurationException` if a required property is missing, if `lockTimeout` or `statementTimeout` is zero or negative, or — when no dialect is set — if no `Dialect` provider is discoverable via `ServiceLoader` at all. An empty namespace counts as missing. `desiredState` is required for `plan()`, `reconcile()` and `apply()` but may be omitted when the reconciler is built for `dump()` alone; those methods then fail with `ConfigurationException` naming the missing property. `build()` must not open a connection: the `supports(DatabaseMetaData)` check of 3.4 needs one, so final dialect selection is deferred to the first use of the reconciler.
 
@@ -302,7 +315,7 @@ The compact constructor must reject `unsupported == APPLY` and any `unsupportedC
 - `REPORT`: the change is not executed. It appears in `ReconcileReport.reported()` and is logged at `WARNING`. For `unsupported`, each `UNSUPPORTED` difference appears in `ReconcileReport.unsupported()` and is logged at `WARNING`.
 - `FAIL`: if the plan contains at least one change of this class — or, for `unsupported`, at least one `UNSUPPORTED` difference — `reconcile()` and `apply(plan)` must throw `PolicyViolationException` **before executing any change**.
 
-Unexpected objects (section 5.5) never produce changes when `prune` is `false` (the default), except for the table-shape conflict defined there. When `prune` is `true`, `UNEXPECTED` managed objects produce standalone `DROP` changes classified by data risk (`REBUILD` for indexes, views, routines, constraints, etc.; `DESTRUCTIVE` for tables, columns, materialized views, partitions, sequences) and governed by `rebuild` / `destructive` like any other change.
+Unexpected objects (section 5.5) never produce changes when `prune` is `false` (the default), except for targeted retirements and the table-shape conflict defined there. When `prune` is `true`, `UNEXPECTED` managed objects accepted by `pruneFilter` produce standalone `DROP` changes classified by data risk (`REBUILD` for indexes, views, routines, constraints, etc.; `DESTRUCTIVE` for tables, columns, materialized views, partitions, sequences) and governed by `rebuild` / `destructive` like any other change.
 
 A change whose `statements` list is empty is a *manual change*: the dialect can describe it but not perform it safely. A manual change mapped to `APPLY` must be treated as `FAIL`.
 
@@ -409,6 +422,48 @@ public record MultiReconcileReport(
 ```
 
 `build()` must fail with `ConfigurationException` when `dataSource` is missing, when no namespace is registered, or when a namespace name is empty or a duplicate (compared case-sensitively); it also builds every registered `SchemaReconciler` up front — applying the shared defaults first, then the optional `customize` — so a per-namespace configuration error fails at `build()` without opening a connection (3.1). `reconcile()` runs the namespaces sequentially in configured order, each under its own namespace lock, so a later namespace's desired script may reference an earlier namespace's objects — a cross-schema `REFERENCES`, an external dependency (5.8.3) — and aborts the whole run on the first exception. `MultiReconcileReport.outcome` aggregates the per-namespace outcomes: `RECONCILED` when any namespace reconciled, else `REPORTED_ONLY` when any reported, else `UP_TO_DATE`; `elapsed` is the call's total monotonic run time.
+
+`externalPartitions`, `pruneFilter` and `hookStore` are also available on `MultiNamespaceReconciler.Builder` and are forwarded to every per-namespace builder before its customization callback runs.
+
+### 3.8 Lifecycle hooks
+
+```java
+public enum HookPhase { PRE_APPLY, POST_APPLY, POST_COMMIT }
+
+public record HookContext(String namespace, String dialectId, HookPhase phase,
+        ReconcilePlan plan, List<PlannedChange> applied, Connection connection) { }
+
+public interface SchemaHook {
+    String id();
+    HookPhase phase();
+    default int order() { return 0; }
+    default boolean runOnce() { return false; }
+    default String checksum() { return ""; }
+    void run(HookContext context) throws Exception;
+
+    static SchemaHook of(String id, HookPhase phase, HookAction action) { ... }
+    static SchemaHook of(String id, HookPhase phase, int order, HookAction action) { ... }
+    static SchemaHook runOnce(String id, HookPhase phase, String checksum, HookAction action) { ... }
+    static SchemaHook runOnce(String id, HookPhase phase, int order, String checksum, HookAction action) { ... }
+}
+
+@FunctionalInterface
+public interface HookAction {
+    void run(HookContext context) throws Exception;
+}
+
+public interface HookStore {
+    Optional<String> recordedChecksum(Connection conn, String namespace, String hookId) throws SQLException;
+    void record(Connection conn, String namespace, String hookId, HookPhase phase, String checksum) throws SQLException;
+    default Optional<ObjectId> managedTable(String targetNamespace) { return Optional.empty(); }
+}
+```
+
+Hooks are repeatable and execute in deterministic `(phase, order, id)` order. `build()` rejects a blank or duplicate hook id, a missing phase or action, and `runOnce` without a `hookStore`. Hooks never execute for `plan()`, `planTimed()`, `dump()`, a policy violation, or a wholly reported plan. They do execute during `reconcile()`, `apply(plan)` and `applyJson(...)` when policy evaluation enters apply — including an empty, up-to-date plan.
+
+`PRE_APPLY` hooks run after namespace binding and before transactional DDL; `POST_APPLY` hooks run after transactional DDL and before verification, in the same transaction. On transactional dialects, a hook failure therefore rolls back prior DDL, hook mutations and run-once records. Verification then runs and the transaction commits. Deferred non-transactional changes run in auto-commit mode; `POST_COMMIT` hooks run after them, still under the namespace lock, with the full applied list. Hook and hook-store failures are `ApplyException`s carrying the changes applied so far.
+
+For a `runOnce` hook the engine reads the recorded checksum first. An equal checksum skips execution; a different checksum fails with `ApplyException`; otherwise the hook runs and the checksum is recorded. `PgHookStore` is the PostgreSQL implementation, constructed as `PgHookStore.inSchema(schema)` or `PgHookStore.of(schema, table)` (`schema_reconciler_hooks` by default). It lazily creates a table with columns `(namespace, hook_id, phase, checksum, applied_at)` and primary key `(namespace, hook_id)`, using parameterized lookups and `ON CONFLICT DO NOTHING` recording. When that table is inside the target namespace, `managedTable` makes the engine filter it from both snapshots so it is neither unexpected nor pruned; a dedicated schema such as `_reconciler_internal` is also supported.
 
 ## 4. Model
 
@@ -536,12 +591,12 @@ A plan must be serialisable as plain text for review via `toSql()`. The output m
 2. **Lock.** Acquire the namespace lock (6.2) within `lockTimeout`, or fail with `LockTimeoutException`. If `statementTimeout` is configured, the dialect applies it now (for example `SET LOCAL statement_timeout`), so it bounds applied statements and catalog reads but never the lock wait itself.
 3. **Read actual.** Read the snapshot of the target namespace.
 4. **Load desired.** Create a scratch namespace (6.3), bind the session namespace to it (`bindSessionNamespace`, 6.1), execute the desired script in it, read its snapshot, then remove the scratch namespace. Removal must happen even if loading fails. When `scratchDataSource` supplies a separate connection and `statementTimeout` is configured, the dialect applies the bound on that connection as well before the script runs.
-5. **Diff.** Compute differences (5.4, 5.5).
+5. **Diff.** Compute differences (5.4, 5.5) against the effective actual snapshot: when `externalPartitions` rules are configured, rule-matching externally managed partitions and their contained objects are suppressed before diffing and before the actual fingerprint is taken.
 6. **Plan.** Ask the dialect to render changes for each difference, add dependent rebuilds (5.8), assign execution order and safety classes, and build the `ReconcilePlan`.
 7. **Evaluate policy.** Evaluate the plan as defined in 3.3: fail check, recreate pairing, then prerequisite closure. On a `FAIL`, throw `PolicyViolationException` carrying the plan. Nothing is executed.
-8. **Apply.** Bind the session namespace to the target namespace (6.1), then execute the transactional changes (`!nonTransactional`) that remain mapped to `APPLY`, in plan order. Collect the changes mapped to or demoted to `REPORT`, and the `UNSUPPORTED` differences reported under `REPORT`.
-9. **Verify.** Re-read the actual snapshot. The target of every applied transactional change whose `expected` is present must now have a definition equal to it (4.4); for an applied standalone `DROP` (from `prune`), the target must now be absent. Otherwise throw `VerificationException`, listing each object that did not converge. `DROP` changes that are part of a recreate are verified through the `CREATE` half.
-10. **Finish & optional non-transactional phase.** Commit (transactional dialects). If any applied-policy changes have `nonTransactional == true` (for example `CREATE INDEX CONCURRENTLY` when `concurrentIndexes` is enabled), switch the connection to `autoCommit = true`, execute them in plan order, and re-verify their targets (catching invalid indexes); restore `autoCommit` before releasing the lock. Release the lock and return the report.
+8. **Apply.** Bind the session namespace to the target namespace (6.1). Run `PRE_APPLY` hooks in deterministic order, execute the transactional changes (`!nonTransactional`) that remain mapped to `APPLY` in plan order, then run `POST_APPLY` hooks in deterministic order with the transactional applied list. Collect the changes mapped to or demoted to `REPORT`, and the `UNSUPPORTED` differences reported under `REPORT`.
+9. **Verify.** Re-read the actual snapshot in the same transaction. The target of every applied transactional change whose `expected` is present must now have a definition equal to it (4.4); for an applied standalone `DROP` (from `prune` or `retire`), the target must now be absent. Otherwise throw `VerificationException`, listing each object that did not converge. `DROP` changes that are part of a recreate are verified through the `CREATE` half.
+10. **Finish, non-transactional phase, and post-commit hooks.** Commit (transactional dialects). If any applied-policy changes have `nonTransactional == true` (for example `CREATE INDEX CONCURRENTLY` when `concurrentIndexes` is enabled), switch the connection to `autoCommit = true`, execute them in plan order, and re-verify their targets (catching invalid indexes). Then run `POST_COMMIT` hooks in deterministic order in auto-commit mode with the full applied list. Restore the connection's original auto-commit setting before releasing the lock. Release the lock and return the report.
 
 On any exception in steps 3 to 9, transactional dialects must roll back the whole run. For non-transactional dialects see 6.4.
 
@@ -571,9 +626,13 @@ A dialect must detect every object in the scratch namespace, including kinds it 
 
 ### 5.5 Unexpected objects
 
-`UNEXPECTED`: present in actual, absent in desired. Unexpected objects must be listed in the report and logged at `WARNING`. When `ReconcilePolicy.prune()` is `false` (the default), they do not produce changes, except for the table-shape conflict below; removing them is an operator decision outside this library. When `ReconcilePolicy.prune()` is `true`, `UNEXPECTED` managed objects produce standalone `DROP` changes classified by data risk (`REBUILD` for indexes, views, routines, constraints, triggers, etc.; `DESTRUCTIVE` for tables, columns, materialized views, partitions, sequences), ordered in reverse dependency order of `actual`.
+`UNEXPECTED`: present in actual, absent in desired. Unexpected objects must be listed in the report and logged at `WARNING`. When `ReconcilePolicy.prune()` is `false` (the default), they do not produce changes, except for targeted retirements and the table-shape conflict below; removing them otherwise is an operator decision outside this library. When `ReconcilePolicy.prune()` is `true`, `UNEXPECTED` managed objects accepted by `pruneFilter` produce standalone `DROP` changes classified by data risk (`REBUILD` for indexes, views, routines, constraints, triggers, etc.; `DESTRUCTIVE` for tables, columns, materialized views, partitions, sequences), ordered in reverse dependency order of `actual`. `pruneFilter` controls dropping, never visibility: protected objects still appear as `UNEXPECTED`.
 
-Exception: an unexpected `COLUMN` whose parent table is expected is a table-shape conflict when `prune` is `false`. The core must add a `DESTRUCTIVE` change for the owning table with the reason `unexpected column <name>`, so that the default policy fails loudly instead of running against a foreign table shape. When `prune` is `true`, it instead renders `ALTER TABLE ... DROP COLUMN` (`DESTRUCTIVE`).
+A retirement target is supplied by `Builder.retire(ObjectId)` or by a whole-line script directive `-- @reconciler retire <KIND> [<parent>.]<name>`, using the same SQL identifier-path syntax as rename directives. `OTHER` targets, malformed paths, a target present in desired, and a target used as either endpoint of a rename are rejected (`DesiredStateException` for a malformed directive, otherwise `IllegalArgumentException` or `PlanningException`). A target present in actual and absent from desired is dropped even when `prune` is false, with its normal safety class and a reason containing `retired`; an already absent target is an idempotent no-op. Containment suppression and the no-CASCADE dependent rules are the same as for pruning.
+
+Externally managed partitions matching `externalPartitions` are removed from the effective actual snapshot before diffing and before its fingerprint is taken. `apply(plan)` loads desired before this suppression when rules are configured, so a runtime partition created between `plan()` and `apply(plan)` does not by itself stale the plan.
+
+Exception: an unexpected `COLUMN` whose parent table is expected is a table-shape conflict when it is neither approved for pruning nor retired. The core must add a `DESTRUCTIVE` change for the owning table with the reason `unexpected column <name>`, so that the default policy fails loudly instead of running against a foreign table shape. When the column itself is approved under `prune` or explicitly retired, it instead renders `ALTER TABLE ... DROP COLUMN` (`DESTRUCTIVE`).
 
 **Explicit rename hints.** A caller may supply rename hints via `Builder.rename(from, to)` or SQL comment directives (`-- @reconciler rename <KIND> [<parent>.]<old_name> -> <new_name>`). When `from` is present in `actual` (and absent from `desired`) and `to` is present in `desired` (and absent from `actual`), the core suppresses `UNEXPECTED(from)` and `MISSING(to)` and asks the dialect to render a `REBUILD` `ALTER ... RENAME` change (followed by a `DRIFTED` change if the definition also changed). If the rename has already occurred, the hint is an idempotent no-op.
 
@@ -600,7 +659,7 @@ A snapshot fingerprint is the lowercase hex SHA-256 of the following byte sequen
 
 With this format, a fingerprint depends only on the snapshot's content. Plans can therefore be checked across processes and library versions, as long as the dialect's normalisation rules have not changed (10.4).
 
-`apply(plan)` must first reject the plan with `IllegalArgumentException` if `plan.targetNamespace()` or `plan.dialectId()` does not match this reconciler's configuration — the statements are already bound to a namespace, so a foreign plan would execute against the wrong namespace. It must then re-read the actual snapshot after acquiring the lock and throw `StalePlanException` if its fingerprint differs from `plan.actualFingerprint()`.
+`apply(plan)` must first reject the plan with `IllegalArgumentException` if `plan.targetNamespace()` or `plan.dialectId()` does not match this reconciler's configuration — the statements are already bound to a namespace, so a foreign plan would execute against the wrong namespace. It must then re-read the actual snapshot after acquiring the lock and throw `StalePlanException` if its fingerprint differs from `plan.actualFingerprint()`. With `externalPartitions` configured, both fingerprints are fingerprints of the effective actual snapshot after external-partition suppression.
 
 ### 5.8 Dependencies and ordering
 
@@ -953,7 +1012,7 @@ Where `CREATE ON DATABASE` cannot be granted, a separate `scratchDataSource` (6.
 | `TRANSFORM` | `pg_transform` rows whose `trftype` is a managed type — the only anchor a script can express (3.2); the language is a cluster-object reference (4.1) | `trffromsql`/`trftosql` as `regprocedure` text (`none` when 0); the `ObjectId` name is `format_type(trftype)/lanname` |
 | `COLUMN` | `pg_attribute`, `pg_attrdef`, `pg_collation` | `format_type(atttypid, atttypmod)`, nullability, `pg_get_expr(adbin, adrelid)` as the default or, when `attgenerated` is set, as the generation expression; collation when it is not the type's default; identity kind and identity sequence options; `attstorage` storage strategy and `attcompression` compression method |
 | `PRIMARY_KEY`, `UNIQUE`, `FOREIGN_KEY`, `CHECK`, `EXCLUSION` | `pg_constraint` (`contype` `p`, `u`, `f`, `c`, `x`), excluding inherited copies (`conislocal` `false` — partition-child and classic-inheritance constraints, which only the parent's object owns) | `pg_get_constraintdef(oid)` |
-| `INDEX` | `pg_index` (`relkind` `i`), excluding constraint-backing indexes (`pg_constraint.conindid` on `p`, `u`, `x` constraints) and partition-child indexes | `pg_get_indexdef(indexrelid)` |
+| `INDEX` | `pg_index` (`relkind` `i` or `I`), excluding constraint-backing indexes (`pg_constraint.conindid` on `p`, `u`, `x` constraints) and partition-child indexes | `pg_get_indexdef(indexrelid)`, with `;valid=false` appended when `indisvalid` is false |
 | `VIEW` | `pg_class` (`relkind` `v`) | `pg_get_viewdef(oid, true)` plus column names and types, plus `reloptions` (`check_option`, `security_barrier`, `security_invoker`) in sorted order |
 | `SEQUENCE` | `pg_sequence`, `pg_class.relpersistence` | type, start, increment, min, max, cache, cycle, persistence (`LOGGED`/`UNLOGGED`); never the current value |
 | `ROUTINE` | `pg_proc` (`prokind` `f`, `p`, `w`) | `pg_get_functiondef(oid)`; the identity signature (4.1) is `proname` plus `format_type` over each element of `proargtypes` |
@@ -981,8 +1040,8 @@ Where `CREATE ON DATABASE` cannot be granted, a separate `scratchDataSource` (6.
 | `OTHER` | see below | detected so that unsupported constructs are reported (5.4) |
 
 `OTHER` detection covers every namespace-scoped catalog object the managed
-kinds do not claim: non-managed relations (`relkind` `t`,
-`I` and `r` tables with an inheritance parent — `relkind` `c` is the
+kinds do not claim: non-managed relations (`relkind` `t`
+and `r` tables with an inheritance parent — `relkind` `c` is the
 backing relation of a managed composite `TYPE`), base types
 (`pg_type` `typtype` `b` with no array element), collations the
 dialect cannot recreate (database-default provider or
@@ -1004,7 +1063,7 @@ language is a cluster-level object (4.1), so it is always `OTHER`.
 
 `OTHER` object ids carry a documented category prefix — the substring
 before the first `:` of the `ObjectId` name, used by
-`unsupportedCategories` (3.3): `partindex`,
+`unsupportedCategories` (3.3):
 `toast`, `inherited` and `relation` (any other
 non-managed `relkind`), `type` (base types),
 `collation`, `conversion`, `constraint` (unmodelled contype),
@@ -1092,6 +1151,8 @@ Name scopes (`nameScopes`, 5.8.7). Tables, views, materialized views, sequences 
 | `PRIMARY_KEY`, `UNIQUE`, `EXCLUSION` | `relation:<name>`, `constraint:<parent>.<name>` |
 | `FOREIGN_KEY`, `CHECK` | `constraint:<parent>.<name>` |
 | `COLUMN`, `TRIGGER`, `POLICY`, `EXTENSION`, `COMMENT`, `STATISTICS`, `RULE`, `COLLATION`, `CONVERSION`, `SECURITY_LABEL`, `PUBLICATION`, `OWNERSHIP`, `PRIVILEGES`, `DEFAULT_PRIVILEGES`, `CAST`, `TRANSFORM` | none (the `ObjectId` is already the engine's uniqueness key) |
+
+Partitioned parent indexes (`pg_class.relkind = 'I'`) are managed `INDEX` objects in 0.11 rather than `OTHER partindex:*` shadows. Constraint-backing indexes still fold into their constraints and child-partition clones remain hidden. A valid partitioned index carries the dialect-private `partitionedIndex` attribute; its create fragment removes the catalog's `ON ONLY` token so apply and `dump()` recreate child indexes recursively. An invalid index intentionally created `ON ONLY` keeps that spelling in its create fragment as faithful desired state. Concurrent create/drop rendering is forbidden for these indexes and for indexes on sub-partitioned partitions.
 
 ### A.6 Rendering
 
@@ -1214,7 +1275,7 @@ Coverage of the PostgreSQL SQL command set by the reference dialect, measured ag
 
 ### Detected but unsupported (`OTHER` → `UNSUPPORTED` per 5.4)
 
-`CREATE TYPE` for base types (a multirange cannot be created standalone — it arrives with its range), indexes on partitioned tables (`relkind` `I` — auto-cloned per child, never standalone), classic-inheritance children, `CREATE DEFAULT CONVERSION`, unrecreatable collations (the default provider or an encoding bound to a different database encoding), constraints in contypes the dialect does not model (`pg_constraint` — `contype` `t` is managed via its `TRIGGER`, `n` folds into its `COLUMN`), `CREATE CAST`/`CREATE TRANSFORM` anchored only to unmanaged objects, `COMMENT ON` an unmanaged target, `SECURITY LABEL` on an unmanaged target, granted privileges on an unmanaged target, ownership reassignment on an unmanaged target and `CREATE PUBLICATION` (the publication itself is a cluster-level object, 4.1 — only its `ALTER PUBLICATION` binding forms are namespace-anchored).
+`CREATE TYPE` for base types (a multirange cannot be created standalone — it arrives with its range), classic-inheritance children, `CREATE DEFAULT CONVERSION`, unrecreatable collations (the default provider or an encoding bound to a different database encoding), constraints in contypes the dialect does not model (`pg_constraint` — `contype` `t` is managed via its `TRIGGER`, `n` folds into its `COLUMN`), `CREATE CAST`/`CREATE TRANSFORM` anchored only to unmanaged objects, `COMMENT ON` an unmanaged target, `SECURITY LABEL` on an unmanaged target, granted privileges on an unmanaged target, ownership reassignment on an unmanaged target and `CREATE PUBLICATION` (the publication itself is a cluster-level object, 4.1 — only its `ALTER PUBLICATION` binding forms are namespace-anchored).
 
 ### Out of scope (cluster-level or statement-only, per 1.5/3.2)
 
@@ -1253,6 +1314,8 @@ Every Java SPI/API method that performs I/O — `SqlConnection` operations, `Dia
 - Plan metadata retention uses a `WeakMap` keyed by the plan object — the same identity-keyed, GC-purged semantics the Java `WeakHashMap` + `IdentityKey` wrapper provides.
 - `ReconcileListener.NONE` is replaced by the builder's default `{}` listener.
 - `int8` catalog values may arrive as strings (the `pg` driver's precision-safe default); identity and sequence option reads use exact-string semantics so rendered SQL keeps the full value.
+
+TypeScript exposes the 0.11 additions with idiomatic typing: `externalPartitions(parentTable, match?)` accepts a prefix string, `RegExp`, partition predicate, or a `(parentTable, partitionName)` predicate; `pruneFilter` and `retire` take the same object ids as Java; hooks are async-capable objects `{ id, phase, order?, runOnce?, checksum?, run(ctx) }`, `HookContext.connection` is the `HookSqlExecutor` (`execute`/`query`) surface, and `PgHookStore.inSchema(schema)` / `.of(schema, table?)` implements `HookStore`. Go exposes the same surface as `ExternalPartitions`, `ExternalPartitionsPrefix`, `ExternalPartitionsFunc`, `Retire`, `PruneFilter`, `Hook`, `HookStore`, `SchemaHook`, `HookContext`, and `postgresql.NewHookStore`.
 
 ### D.4 Conformance
 

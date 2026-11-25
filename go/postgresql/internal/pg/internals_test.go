@@ -709,3 +709,20 @@ func equalStrings(a, b []string) bool {
 	}
 	return true
 }
+
+func TestStripIndexOnOnlyIdentifierAwareAndUTF8Safe(t *testing.T) {
+	quoted := StripIndexOnOnly(`CREATE INDEX "my ""on only"" idx" ON ONLY public.t USING btree (x)`)
+	wantQuoted := `CREATE INDEX "my ""on only"" idx" ON public.t USING btree (x)`
+	if quoted != wantQuoted {
+		t.Fatalf("quoted = %q, want %q", quoted, wantQuoted)
+	}
+	utf8Index := StripIndexOnOnly(`CREATE UNIQUE INDEX ąх ON ONLY public.t USING btree (x)`)
+	wantUTF8 := `CREATE UNIQUE INDEX ąх ON public.t USING btree (x)`
+	if utf8Index != wantUTF8 {
+		t.Fatalf("utf8 = %q, want %q", utf8Index, wantUTF8)
+	}
+	recursive := `CREATE INDEX plain ON public.t USING btree (x)`
+	if got := StripIndexOnOnly(recursive); got != recursive {
+		t.Fatalf("recursive = %q, want unchanged %q", got, recursive)
+	}
+}

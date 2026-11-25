@@ -3,6 +3,9 @@ import { ConfigurationException } from "../ConfigurationException.ts";
 import { Decision } from "../Decision.ts";
 import type { DesiredState } from "../DesiredState.ts";
 import { DesiredStateException } from "../DesiredStateException.ts";
+import { hookPhaseOrdinal } from "../HookPhase.ts";
+import type { HookStore } from "../HookStore.ts";
+import type { SchemaHook } from "../SchemaHook.ts";
 import { Duration } from "../Duration.ts";
 import { IllegalArgumentError } from "../IllegalArgumentError.ts";
 import { LockTimeoutException } from "../LockTimeoutException.ts";
@@ -32,6 +35,7 @@ import { DialectResolver } from "./DialectResolver.ts";
 import { Differ } from "./Differ.ts";
 import { DumpRenderer } from "./DumpRenderer.ts";
 import { ObjectFilter } from "./ObjectFilter.ts";
+import { suppressExternalPartitions, type ExternalPartitionMatcher } from "./ExternalPartitions.ts";
 import { PlanBuilder, type Built } from "./PlanBuilder.ts";
 import { PolicyEvaluator, type Evaluation } from "./PolicyEvaluator.ts";
 import { ScriptProcessor } from "./ScriptProcessor.ts";
@@ -77,7 +81,13 @@ export class Engine {
     private readonly objectFilter: (id: ObjectId) => boolean;
     private readonly concurrentIndexes: boolean;
     private readonly renameHints: readonly RenameHint[];
+    private readonly retireTargets: readonly ObjectId[];
+    private readonly externalPartitionMatchers: readonly ExternalPartitionMatcher[];
+    private readonly pruneFilter: (id: ObjectId) => boolean;
+    private readonly hooks: readonly SchemaHook[];
+    private readonly hookStore: HookStore | undefined;
     private scriptHints: readonly RenameHint[] = [];
+    private scriptRetireTargets: readonly ObjectId[] = [];
 
     constructor(dataSource: SqlDataSource,
                 scratchDataSource: SqlDataSource | undefined,
@@ -90,7 +100,12 @@ export class Engine {
                 listener: ReconcileListener,
                 objectFilter: (id: ObjectId) => boolean,
                 concurrentIndexes = false,
-                renameHints: readonly RenameHint[] = []) {
+                renameHints: readonly RenameHint[] = [],
+                retireTargets: readonly ObjectId[] = [],
+                externalPartitionMatchers: readonly ExternalPartitionMatcher[] = [],
+                pruneFilter: (id: ObjectId) => boolean = () => true,
+                hooks: readonly SchemaHook[] = [],
+                hookStore: HookStore | undefined = undefined) {
         this.dataSource = dataSource;
         this.scratchDataSource = scratchDataSource;
         this.namespace = namespace;
@@ -99,9 +114,18 @@ export class Engine {
         this.lockTimeout = lockTimeout;
         this.statementTimeout = statementTimeout;
         this.listener = listener;
-        this.objectFilter = objectFilter;
+        const managedTable = hookStore?.managedTable?.(namespace);
+        this.objectFilter = managedTable === undefined ? objectFilter
+                : id => !id.equals(managedTable) && objectFilter(id);
         this.concurrentIndexes = concurrentIndexes;
         this.renameHints = renameHints;
+        this.retireTargets = retireTargets;
+        this.externalPartitionMatchers = externalPartitionMatchers;
+        this.pruneFilter = pruneFilter;
+        this.hookStore = hookStore;
+        this.hooks = hooks.slice().sort((a, b) =>
+                (hookPhaseOrdinal(a.phase) - hookPhaseOrdinal(b.phase))
+                || ((a.order ?? 0) - (b.order ?? 0)) || a.id.localeCompare(b.id));
         this.resolver = new DialectResolver(dialect);
     }
 
@@ -140,7 +164,7 @@ export class Engine {
             t = clock.now();
             let built: Built;
             try {
-                built = this.buildPlan(session, actual, desired);
+                built = this.buildPlan(session, this.effectiveActual(actual, desired), desired);
             } finally {
                 clock.plan = clock.since(t);
             }
@@ -191,16 +215,17 @@ export class Engine {
                 clock.loadDesired = clock.since(t);
             }
             t = clock.now();
+            const effectiveActual = this.effectiveActual(actual, desired);
             let built: Built;
             try {
-                built = this.buildPlan(session, actual, desired);
+                built = this.buildPlan(session, effectiveActual, desired);
             } finally {
                 clock.plan = clock.since(t);
             }
             await this.notifyPlanned(built.plan, []);
             const evaluation =
                     new PolicyEvaluator(session.dialect, this.policy)
-                            .evaluate(built.plan, actual, desired);
+                            .evaluate(built.plan, effectiveActual, desired);
             const outcome = await this.applyAndVerify(session, built.plan, evaluation,
                     built.coveredByParent, clock, desired);
             await session.commit();
@@ -250,7 +275,9 @@ export class Engine {
             } finally {
                 clock.readActual = clock.since(t);
             }
-            this.verifyPlan(plan, session.dialect, actual);
+            if (this.externalPartitionMatchers.length === 0) {
+                this.verifyPlan(plan, session.dialect, actual);
+            }
             t = clock.now();
             let desired: SchemaSnapshot;
             try {
@@ -258,10 +285,14 @@ export class Engine {
             } finally {
                 clock.loadDesired = clock.since(t);
             }
+            const effectiveActual = this.effectiveActual(actual, desired);
+            if (this.externalPartitionMatchers.length !== 0) {
+                this.verifyPlan(plan, session.dialect, effectiveActual);
+            }
             await this.notifyPlanned(plan, []);
             const evaluation =
                     new PolicyEvaluator(session.dialect, this.policy)
-                            .evaluate(plan, actual, desired);
+                            .evaluate(plan, effectiveActual, desired);
             const meta = this.planMeta.get(plan);
             const covered = meta !== undefined
                     ? meta.coveredByParent
@@ -297,7 +328,8 @@ export class Engine {
         try {
             await session.lock();
             return DumpRenderer.render(session.dialect, this.namespace,
-                    await session.readActual());
+                    suppressExternalPartitions(await session.readActual(), undefined,
+                            this.externalPartitionMatchers, false));
         } finally {
             await session.close();
         }
@@ -316,13 +348,16 @@ export class Engine {
                                  clock: PhaseClock, desired: SchemaSnapshot): Promise<RunOutcome> {
         const applied: PlannedChange[] = [];
         const reported: PlannedChange[] = [];
-        // non-transactional APPLY changes (CREATE INDEX CONCURRENTLY and
-        // friends) run in a second phase, after the transactional work
-        // verifies and commits
         const deferred: PlannedChange[] = [];
         await session.bindNamespace();
+        const anyApply = plan.changes.some(change =>
+                evaluation.decisions.get(change) === Decision.APPLY);
+        const hooksEligible = plan.changes.length === 0 || anyApply;
         const applyStart = clock.now();
         try {
+            if (hooksEligible) {
+                await this.runHooks(session, "PRE_APPLY", plan, applied);
+            }
             for (let change of plan.changes) {
                 if (evaluation.decisions.get(change) === Decision.APPLY) {
                     if (change.nonTransactional) {
@@ -345,6 +380,9 @@ export class Engine {
                     await this.notifyReported(change, applied);
                 }
             }
+            if (hooksEligible) {
+                await this.runHooks(session, "POST_APPLY", plan, applied);
+            }
         } finally {
             clock.apply = clock.since(applyStart);
         }
@@ -354,9 +392,8 @@ export class Engine {
         } finally {
             clock.verify = clock.since(verifyStart);
         }
-        if (deferred.length > 0) {
-            // commit the transactional work first: a non-transactional
-            // statement cannot run inside a transaction
+        const postCommit = hooksEligible && this.hooks.some(hook => hook.phase === "POST_COMMIT");
+        if (deferred.length > 0 || postCommit) {
             await session.commit();
             await session.autoCommit(true);
             const phase1Count = applied.length;
@@ -364,18 +401,21 @@ export class Engine {
                 for (const change of deferred) {
                     await this.executeChange(session, change, applied);
                 }
+                if (deferred.length > 0) {
+                    const deferredVerifyStart = clock.now();
+                    try {
+                        await this.verify(session, applied.slice(phase1Count),
+                                coveredByParent, desired);
+                    } finally {
+                        clock.verify = Duration.ofMillis(
+                                clock.verify.toMillis() + clock.since(deferredVerifyStart).toMillis());
+                    }
+                }
+                if (postCommit) {
+                    await this.runHooks(session, "POST_COMMIT", plan, applied);
+                }
             } finally {
-                // restore the transactional session mode before the
-                // outer commit/close handling
                 await session.autoCommit(false);
-            }
-            const deferredVerifyStart = clock.now();
-            try {
-                await this.verify(session, applied.slice(phase1Count),
-                        coveredByParent, desired);
-            } finally {
-                clock.verify = Duration.ofMillis(
-                        clock.verify.toMillis() + clock.since(deferredVerifyStart).toMillis());
             }
         }
         const outcome = applied.length === 0
@@ -383,6 +423,45 @@ export class Engine {
                         : ReconcileOutcome.REPORTED_ONLY)
                 : ReconcileOutcome.RECONCILED;
         return { outcome, applied, reported };
+    }
+
+    /** Runs the deterministic hook slice of one phase, including run-once bookkeeping. */
+    private async runHooks(session: Session, phase: "PRE_APPLY" | "POST_APPLY" | "POST_COMMIT",
+                           plan: ReconcilePlan, applied: PlannedChange[]): Promise<void> {
+        for (const hook of this.hooks) {
+            if (hook.phase !== phase) {
+                continue;
+            }
+            try {
+                const checksum = hook.checksum ?? "";
+                let execute = true;
+                if (hook.runOnce === true) {
+                    const recorded = await this.hookStore!.recordedChecksum(
+                            session.conn, this.namespace, hook.id);
+                    if (recorded === checksum) {
+                        execute = false;
+                    } else if (recorded !== undefined) {
+                        throw new ApplyException("namespace '" + this.namespace + "': hook '"
+                                + hook.id + "' is recorded with a different checksum",
+                                [...applied], undefined);
+                    }
+                }
+                if (execute) {
+                    await hook.run({ namespace: this.namespace, dialectId: session.dialect.id(),
+                            phase, plan, applied: [...applied], connection: session.conn });
+                    if (hook.runOnce === true) {
+                        await this.hookStore!.record(session.conn, this.namespace,
+                                hook.id, phase, checksum);
+                    }
+                }
+            } catch (e) {
+                if (e instanceof ApplyException) {
+                    throw e;
+                }
+                throw new ApplyException("namespace '" + this.namespace + "': hook '" + hook.id
+                        + "' failed in " + phase + ": " + messageOf(e), [...applied], undefined, e);
+            }
+        }
     }
 
     private async executeChange(session: Session, change: PlannedChange,
@@ -503,11 +582,18 @@ export class Engine {
         return this.apply(ReconcilePlan.fromJson(serializedPlan));
     }
 
+    private effectiveActual(actual: SchemaSnapshot, desired: SchemaSnapshot): SchemaSnapshot {
+        return suppressExternalPartitions(actual, desired,
+                this.externalPartitionMatchers, true);
+    }
+
     private buildPlan(session: Session, actual: SchemaSnapshot, desired: SchemaSnapshot): Built {
         const differences = Differ.diff(actual, desired, session.dialect);
         return new PlanBuilder(session.dialect, this.namespace, actual, desired,
                 this.policy.prune, [...this.renameHints, ...this.scriptHints],
-                { concurrentIndexes: this.concurrentIndexes }).build(differences);
+                { concurrentIndexes: this.concurrentIndexes },
+                [...this.retireTargets, ...this.scriptRetireTargets],
+                this.pruneFilter).build(differences);
     }
 
     private async loadDesired(session: Session): Promise<SchemaSnapshot> {
@@ -554,6 +640,7 @@ export class Engine {
                         new ScriptProcessor(this.desiredState!.script, this.namespace,
                                 scratchNamespace, session.dialect);
                 this.scriptHints = processor.renameHints;
+                this.scriptRetireTargets = processor.retireTargets;
                 if (!processor.hasPlaceholder
                         && !session.dialect.capabilities().sessionDefaultNamespace) {
                     throw new DesiredStateException("namespace '" + this.namespace

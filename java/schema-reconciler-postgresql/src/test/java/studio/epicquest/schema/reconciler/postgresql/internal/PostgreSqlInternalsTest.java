@@ -764,4 +764,16 @@ class PostgreSqlInternalsTest {
                 "core").get(0);
         assertEquals(ChangeSafety.DESTRUCTIVE, change.safety());
     }
+    @Test
+    void stripIndexOnOnlyIsIdentifierAwareAndUtf8Safe() {
+        assertEquals("CREATE INDEX \"my \"\"on only\"\" idx\" ON public.t USING btree (x)",
+                PgIdentifiers.stripIndexOnOnly("CREATE INDEX \"my \"\"on only\"\" idx\""
+                        + " ON ONLY public.t USING btree (x)"));
+        assertEquals("CREATE UNIQUE INDEX ąх ON public.t USING btree (x)",
+                PgIdentifiers.stripIndexOnOnly(
+                        "CREATE UNIQUE INDEX ąх ON ONLY public.t USING btree (x)"));
+        final var recursive = "CREATE INDEX plain ON public.t USING btree (x)";
+        assertEquals(recursive, PgIdentifiers.stripIndexOnOnly(recursive));
+    }
+
 }

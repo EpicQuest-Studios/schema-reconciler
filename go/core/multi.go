@@ -121,16 +121,20 @@ func WithCustomize(customize func(*Builder)) NamespaceOption {
 // MultiNamespaceReconciler.Builder (spec 3.7): shared defaults forwarded to
 // each namespace's Builder.
 type MultiNamespaceBuilder struct {
-	dataSource        spi.DB
-	scratchDataSource spi.DB
-	dialect           spi.Dialect
-	policy            ReconcilePolicy
-	lockTimeout       time.Duration
-	statementTimeout  *time.Duration
-	listener          ReconcileListener
-	filter            ObjectFilter
-	concurrentIndexes bool
-	namespaces        []namespaceRegistration
+	dataSource         spi.DB
+	scratchDataSource  spi.DB
+	dialect            spi.Dialect
+	policy             ReconcilePolicy
+	lockTimeout        time.Duration
+	statementTimeout   *time.Duration
+	listener           ReconcileListener
+	filter             ObjectFilter
+	concurrentIndexes  bool
+	externalPartitions []externalPartitionMatcher
+	pruneFilter        ObjectFilter
+	hookStore          HookStore
+	err                error
+	namespaces         []namespaceRegistration
 }
 
 // DataSource sets the shared pool (required).
@@ -195,6 +199,56 @@ func (b *MultiNamespaceBuilder) ConcurrentIndexes(enabled bool) *MultiNamespaceB
 	return b
 }
 
+// ExternalPartitions coexists with every runtime partition directly parented on parentTable.
+func (b *MultiNamespaceBuilder) ExternalPartitions(parentTable string) *MultiNamespaceBuilder {
+	if parentTable == "" {
+		b.err = NewConfigurationError("parentTable must not be empty")
+		return b
+	}
+	b.externalPartitions = append(b.externalPartitions,
+		func(parent, partition string) bool { return parent == parentTable })
+	return b
+}
+
+// ExternalPartitionsPrefix coexists with runtime partitions whose names start with namePrefix.
+func (b *MultiNamespaceBuilder) ExternalPartitionsPrefix(parentTable, namePrefix string) *MultiNamespaceBuilder {
+	if parentTable == "" {
+		b.err = NewConfigurationError("parentTable must not be empty")
+		return b
+	}
+	b.externalPartitions = append(b.externalPartitions,
+		func(parent, partition string) bool {
+			return parent == parentTable && len(partition) >= len(namePrefix) && partition[:len(namePrefix)] == namePrefix
+		})
+	return b
+}
+
+// ExternalPartitionsFunc coexists with runtime partitions accepted by match.
+func (b *MultiNamespaceBuilder) ExternalPartitionsFunc(match func(parentTable, partitionName string) bool) *MultiNamespaceBuilder {
+	if match == nil {
+		b.err = NewConfigurationError("external partition matcher must not be nil")
+		return b
+	}
+	b.externalPartitions = append(b.externalPartitions, match)
+	return b
+}
+
+// PruneFilter limits which unexpected objects prune may drop in every namespace.
+func (b *MultiNamespaceBuilder) PruneFilter(allowPrune ObjectFilter) *MultiNamespaceBuilder {
+	if allowPrune == nil {
+		b.err = NewConfigurationError("pruneFilter must not be nil")
+		return b
+	}
+	b.pruneFilter = allowPrune
+	return b
+}
+
+// HookStore registers the shared hook store forwarded to every namespace.
+func (b *MultiNamespaceBuilder) HookStore(store HookStore) *MultiNamespaceBuilder {
+	b.hookStore = store
+	return b
+}
+
 // Namespace registers a target namespace, preserving execution order. Use
 // WithDesiredState to give it a script — required for plan/reconcile/apply —
 // and WithCustomize for per-namespace overrides.
@@ -213,6 +267,9 @@ func (b *MultiNamespaceBuilder) Namespace(name string, opts ...NamespaceOption) 
 // namespace's SchemaReconciler up front — so a per-namespace configuration
 // error fails at Build without opening a connection (spec 3.7).
 func (b *MultiNamespaceBuilder) Build() (*MultiNamespaceReconciler, error) {
+	if b.err != nil {
+		return nil, b.err
+	}
 	if b.dataSource == nil {
 		return nil, NewConfigurationError("dataSource is required")
 	}
@@ -236,6 +293,15 @@ func (b *MultiNamespaceBuilder) Build() (*MultiNamespaceReconciler, error) {
 			Listener(b.listener).
 			Filter(b.filter).
 			ConcurrentIndexes(b.concurrentIndexes)
+		if b.pruneFilter != nil {
+			child.PruneFilter(b.pruneFilter)
+		}
+		for _, matcher := range b.externalPartitions {
+			child.ExternalPartitionsFunc(matcher)
+		}
+		if b.hookStore != nil {
+			child.HookStore(b.hookStore)
+		}
 		if b.scratchDataSource != nil {
 			child.ScratchDataSource(b.scratchDataSource)
 		}

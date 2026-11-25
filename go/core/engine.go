@@ -7,6 +7,8 @@ import (
 	"errors"
 	"fmt"
 	"runtime"
+	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -67,19 +69,38 @@ func (m *planMetaMap) get(plan *model.ReconcilePlan) (planMeta, bool) {
 // engine is the shared step machine of spec 5.1 behind Plan, Reconcile and
 // Apply.
 type engine struct {
-	resolver          *dialectResolver
-	planMeta          *planMetaMap
-	dataSource        spi.DB
-	scratchDataSource spi.DB
-	namespace         string
-	desiredState      *DesiredState
-	policy            ReconcilePolicy
-	lockTimeout       time.Duration
-	statementTimeout  *time.Duration
-	listener          ReconcileListener
-	objectFilter      ObjectFilter
-	concurrentIndexes bool
-	renameHints       []model.RenameHint
+	resolver           *dialectResolver
+	planMeta           *planMetaMap
+	dataSource         spi.DB
+	scratchDataSource  spi.DB
+	namespace          string
+	desiredState       *DesiredState
+	policy             ReconcilePolicy
+	lockTimeout        time.Duration
+	statementTimeout   *time.Duration
+	listener           ReconcileListener
+	objectFilter       ObjectFilter
+	concurrentIndexes  bool
+	renameHints        []model.RenameHint
+	retireTargets      []model.ObjectId
+	externalPartitions []externalPartitionMatcher
+	pruneFilter        ObjectFilter
+	hooks              []SchemaHook
+	hookStore          HookStore
+}
+
+func sortedHooks(hooks []SchemaHook) []SchemaHook {
+	out := append([]SchemaHook(nil), hooks...)
+	slices.SortFunc(out, func(a, b SchemaHook) int {
+		if a.Phase != b.Phase {
+			return int(a.Phase) - int(b.Phase)
+		}
+		if a.Order != b.Order {
+			return a.Order - b.Order
+		}
+		return strings.Compare(a.ID, b.ID)
+	})
+	return out
 }
 
 func newEngine(cfg reconcilerConfig) *engine {
@@ -91,20 +112,33 @@ func newEngine(cfg reconcilerConfig) *engine {
 	if filter == nil {
 		filter = func(model.ObjectId) bool { return true }
 	}
+	if cfg.hookStore != nil {
+		if managed := cfg.hookStore.ManagedTable(cfg.namespace); managed != nil {
+			base := filter
+			filter = func(id model.ObjectId) bool {
+				return id != *managed && base(id)
+			}
+		}
+	}
 	return &engine{
-		resolver:          newDialectResolver(cfg.dialect, nil),
-		planMeta:          newPlanMetaMap(),
-		dataSource:        cfg.dataSource,
-		scratchDataSource: cfg.scratchDataSource,
-		namespace:         cfg.namespace,
-		desiredState:      cfg.desiredState,
-		policy:            cfg.policy,
-		lockTimeout:       cfg.lockTimeout,
-		statementTimeout:  cfg.statementTimeout,
-		listener:          listener,
-		objectFilter:      filter,
-		concurrentIndexes: cfg.concurrentIndexes,
-		renameHints:       cfg.renameHints,
+		resolver:           newDialectResolver(cfg.dialect, nil),
+		planMeta:           newPlanMetaMap(),
+		dataSource:         cfg.dataSource,
+		scratchDataSource:  cfg.scratchDataSource,
+		namespace:          cfg.namespace,
+		desiredState:       cfg.desiredState,
+		policy:             cfg.policy,
+		lockTimeout:        cfg.lockTimeout,
+		statementTimeout:   cfg.statementTimeout,
+		listener:           listener,
+		objectFilter:       filter,
+		concurrentIndexes:  cfg.concurrentIndexes,
+		renameHints:        cfg.renameHints,
+		retireTargets:      cfg.retireTargets,
+		externalPartitions: cfg.externalPartitions,
+		pruneFilter:        cfg.pruneFilter,
+		hooks:              sortedHooks(cfg.hooks),
+		hookStore:          cfg.hookStore,
 	}
 }
 
@@ -179,7 +213,7 @@ func (e *engine) PlanTimed(ctx context.Context) (TimedPlan, error) {
 			return nil, err
 		}
 		built, err := timed(clock, &clock.plan, func() (*builtPlan, error) {
-			return e.buildPlan(session, actual, desired.snapshot, desired.hints)
+			return e.buildPlan(session, e.effectiveActual(actual, desired.snapshot), desired.snapshot, desired.hints, desired.retires)
 		})
 		if err != nil {
 			return nil, err
@@ -232,8 +266,9 @@ func (e *engine) Reconcile(ctx context.Context) (ReconcileReport, error) {
 		if err != nil {
 			return ReconcileReport{}, err
 		}
+		effectiveActual := e.effectiveActual(actual, desired.snapshot)
 		built, err := timed(clock, &clock.plan, func() (*builtPlan, error) {
-			return e.buildPlan(session, actual, desired.snapshot, desired.hints)
+			return e.buildPlan(session, effectiveActual, desired.snapshot, desired.hints, desired.retires)
 		})
 		if err != nil {
 			return ReconcileReport{}, err
@@ -241,7 +276,7 @@ func (e *engine) Reconcile(ctx context.Context) (ReconcileReport, error) {
 		if err := e.notifyPlanned(built.plan, nil); err != nil {
 			return ReconcileReport{}, err
 		}
-		eval, err := evaluatePolicy(session.dialect, e.policy, built.plan, actual, desired.snapshot)
+		eval, err := evaluatePolicy(session.dialect, e.policy, built.plan, effectiveActual, desired.snapshot)
 		if err != nil {
 			return ReconcileReport{}, err
 		}
@@ -311,8 +346,10 @@ func (e *engine) Apply(ctx context.Context, plan *model.ReconcilePlan) (Reconcil
 		if err != nil {
 			return ReconcileReport{}, err
 		}
-		if err := e.verifyPlan(plan, session.dialect, actual); err != nil {
-			return ReconcileReport{}, err
+		if len(e.externalPartitions) == 0 {
+			if err := e.verifyPlan(plan, session.dialect, actual); err != nil {
+				return ReconcileReport{}, err
+			}
 		}
 		desired, err := timed(clock, &clock.loadDesired, func() (desiredAndHints, error) {
 			return e.desiredFor(ctx, plan, session)
@@ -320,10 +357,16 @@ func (e *engine) Apply(ctx context.Context, plan *model.ReconcilePlan) (Reconcil
 		if err != nil {
 			return ReconcileReport{}, err
 		}
+		effectiveActual := e.effectiveActual(actual, desired.snapshot)
+		if len(e.externalPartitions) != 0 {
+			if err := e.verifyPlan(plan, session.dialect, effectiveActual); err != nil {
+				return ReconcileReport{}, err
+			}
+		}
 		if err := e.notifyPlanned(plan, nil); err != nil {
 			return ReconcileReport{}, err
 		}
-		eval, err := evaluatePolicy(session.dialect, e.policy, plan, actual, desired.snapshot)
+		eval, err := evaluatePolicy(session.dialect, e.policy, plan, effectiveActual, desired.snapshot)
 		if err != nil {
 			return ReconcileReport{}, err
 		}
@@ -381,7 +424,8 @@ func (e *engine) Dump(ctx context.Context) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return renderDump(session.dialect, e.namespace, actual)
+	return renderDump(session.dialect, e.namespace,
+		suppressExternalPartitions(actual, nil, e.externalPartitions, false))
 }
 
 // ApplyJSON is spec 3.1 applyJson(): applies a plan serialised by ToJSON.
@@ -419,8 +463,21 @@ func (e *engine) applyAndVerify(ctx context.Context, session *engineSession,
 	if err := session.bindNamespace(ctx); err != nil {
 		return runOutcome{}, err
 	}
+	anyApply := false
+	for i := range plan.Changes {
+		if eval.decisions[i] == DecisionApply {
+			anyApply = true
+			break
+		}
+	}
+	hooksEligible := len(plan.Changes) == 0 || anyApply
 	applyStart := clock.now()
 	applyErr := func() error {
+		if hooksEligible {
+			if err := e.runHooks(ctx, session, HookPreApply, plan, &applied); err != nil {
+				return err
+			}
+		}
 		for i, change := range plan.Changes {
 			if eval.decisions[i] == DecisionApply {
 				if change.NonTransactional {
@@ -442,6 +499,11 @@ func (e *engine) applyAndVerify(ctx context.Context, session *engineSession,
 				}
 			}
 		}
+		if hooksEligible {
+			if err := e.runHooks(ctx, session, HookPostApply, plan, &applied); err != nil {
+				return err
+			}
+		}
 		return nil
 	}()
 	clock.apply = clock.since(applyStart)
@@ -454,12 +516,12 @@ func (e *engine) applyAndVerify(ctx context.Context, session *engineSession,
 	if verifyErr != nil {
 		return runOutcome{}, verifyErr
 	}
-	if len(deferred) > 0 {
-		// commit the transactional work first: a non-transactional
-		// statement cannot run inside a transaction
+	postCommit := hooksEligible && slices.ContainsFunc(e.hooks, func(h SchemaHook) bool { return h.Phase == HookPostCommit })
+	if len(deferred) > 0 || postCommit {
 		if err := session.commit(ctx); err != nil {
 			return runOutcome{}, err
 		}
+		// non-transactional statements and post-commit hooks run in auto-commit mode
 		if err := session.autoCommit(ctx, true); err != nil {
 			return runOutcome{}, err
 		}
@@ -478,16 +540,23 @@ func (e *engine) applyAndVerify(ctx context.Context, session *engineSession,
 					return err
 				}
 			}
+			if len(deferred) > 0 {
+				deferredVerifyStart := clock.now()
+				verifyErr := e.verify(ctx, session, applied[phase1Count:], coveredByParent, desired)
+				clock.verify += clock.since(deferredVerifyStart)
+				if verifyErr != nil {
+					return verifyErr
+				}
+			}
+			if postCommit {
+				if err := e.runHooks(ctx, session, HookPostCommit, plan, &applied); err != nil {
+					return err
+				}
+			}
 			return nil
 		}()
 		if deferredErr != nil {
 			return runOutcome{}, deferredErr
-		}
-		deferredVerifyStart := clock.now()
-		verifyErr := e.verify(ctx, session, applied[phase1Count:], coveredByParent, desired)
-		clock.verify += clock.since(deferredVerifyStart)
-		if verifyErr != nil {
-			return runOutcome{}, verifyErr
 		}
 	}
 	outcome := OutcomeReconciled
@@ -499,6 +568,47 @@ func (e *engine) applyAndVerify(ctx context.Context, session *engineSession,
 		}
 	}
 	return runOutcome{outcome: outcome, applied: applied, reported: reported}, nil
+}
+
+func (e *engine) runHooks(ctx context.Context, session *engineSession,
+	phase HookPhase, plan *model.ReconcilePlan, applied *[]model.PlannedChange) error {
+	for _, hook := range e.hooks {
+		if hook.Phase != phase {
+			continue
+		}
+		execute := true
+		if hook.RunOnce {
+			recorded, found, err := e.hookStore.RecordedChecksum(ctx, session.conn,
+				e.namespace, hook.ID)
+			if err != nil {
+				return NewApplyError("namespace '"+e.namespace+"': hook '"+hook.ID+
+					"' checksum lookup failed in "+phase.String(), append([]model.PlannedChange(nil), (*applied)...), nil).WithCause(err)
+			}
+			if found && recorded == hook.Checksum {
+				execute = false
+			} else if found {
+				return NewApplyError("namespace '"+e.namespace+"': hook '"+hook.ID+
+					"' is recorded with a different checksum", append([]model.PlannedChange(nil), (*applied)...), nil)
+			}
+		}
+		if execute {
+			ctxCopy := append([]model.PlannedChange(nil), (*applied)...)
+			if err := hook.Run(ctx, HookContext{Namespace: e.namespace,
+				DialectID: session.dialect.ID(), Phase: phase, Plan: plan,
+				Applied: ctxCopy, Conn: session.conn}); err != nil {
+				return NewApplyError("namespace '"+e.namespace+"': hook '"+hook.ID+
+					"' failed in "+phase.String(), append([]model.PlannedChange(nil), (*applied)...), nil).WithCause(err)
+			}
+			if hook.RunOnce {
+				if err := e.hookStore.Record(ctx, session.conn, e.namespace,
+					hook.ID, phase, hook.Checksum); err != nil {
+					return NewApplyError("namespace '"+e.namespace+"': hook '"+hook.ID+
+						"' record failed in "+phase.String(), append([]model.PlannedChange(nil), (*applied)...), nil).WithCause(err)
+				}
+			}
+		}
+	}
+	return nil
 }
 
 func (e *engine) executeChange(ctx context.Context, session *engineSession,
@@ -658,15 +768,21 @@ func (e *engine) logUnexpectedAndUnsupported(unexpected, unsupported []model.Dif
 type desiredAndHints struct {
 	snapshot model.SchemaSnapshot
 	hints    []model.RenameHint
+	retires  []model.ObjectId
+}
+
+func (e *engine) effectiveActual(actual, desired model.SchemaSnapshot) model.SchemaSnapshot {
+	return suppressExternalPartitions(actual, &desired, e.externalPartitions, true)
 }
 
 func (e *engine) buildPlan(session *engineSession,
 	actual, desired model.SchemaSnapshot,
-	scriptHints []model.RenameHint) (*builtPlan, error) {
+	scriptHints []model.RenameHint, scriptRetires []model.ObjectId) (*builtPlan, error) {
 	differences := differDiff(actual, desired, session.dialect)
 	hints := append(append([]model.RenameHint{}, e.renameHints...), scriptHints...)
+	retires := append(append([]model.ObjectId{}, e.retireTargets...), scriptRetires...)
 	return newPlanBuilder(session.dialect, e.namespace, actual, desired,
-		e.policy.prune, hints,
+		e.policy.prune, hints, retires, e.pruneFilter,
 		spi.RenderOptions{ConcurrentIndexes: e.concurrentIndexes}).build(differences)
 }
 
@@ -783,6 +899,7 @@ func (e *engine) loadDesired(ctx context.Context, session *engineSession) (desir
 		return desiredAndHints{
 			snapshot: applyObjectFilter(snapshot, e.objectFilter),
 			hints:    processor.RenameHints,
+			retires:  processor.RetireTargets,
 		}, nil
 	}()
 	if err != nil {

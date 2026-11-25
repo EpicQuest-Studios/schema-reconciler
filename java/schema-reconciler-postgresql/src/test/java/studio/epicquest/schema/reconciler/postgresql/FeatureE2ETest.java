@@ -17,12 +17,16 @@ import java.util.concurrent.atomic.AtomicLong;
 import javax.sql.DataSource;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.Test;
+import studio.epicquest.schema.reconciler.ApplyException;
 import studio.epicquest.schema.reconciler.Decision;
 import studio.epicquest.schema.reconciler.DesiredState;
 import studio.epicquest.schema.reconciler.MultiNamespaceReconciler;
+import studio.epicquest.schema.reconciler.HookPhase;
 import studio.epicquest.schema.reconciler.PlanningException;
+import studio.epicquest.schema.reconciler.PolicyViolationException;
 import studio.epicquest.schema.reconciler.ReconcileOutcome;
 import studio.epicquest.schema.reconciler.ReconcilePolicy;
+import studio.epicquest.schema.reconciler.SchemaHook;
 import studio.epicquest.schema.reconciler.SchemaReconciler;
 import studio.epicquest.schema.reconciler.StalePlanException;
 import studio.epicquest.schema.reconciler.model.ChangeAction;
@@ -71,6 +75,14 @@ class FeatureE2ETest {
         } catch (SQLException ignored) {
             // cleanup best effort
         }
+    }
+
+    private void execute(String sql) throws SQLException {
+        PgTestDatabase.execute(ds, sql);
+    }
+
+    private String q(String ns, String name) {
+        return dialect.quoteIdentifier(ns) + "." + dialect.quoteIdentifier(name);
     }
 
     private SchemaReconciler.Builder reconciler(String ns, String script) {
@@ -285,26 +297,24 @@ class FeatureE2ETest {
     }
 
     @Test
-    void anIndexOnAPartitionedParentStaysTransactional() {
-        // PostgreSQL catalogues an index on a partitioned table as an
-        // unsupported partindex (relkind 'I'), so the partitioned-parent
-        // fallback can only be exercised on a synthetic snapshot
-        final var tableId = new ObjectId(ObjectKind.TABLE, "p");
-        final var indexId = new ObjectId(ObjectKind.INDEX, "i", "p");
-        final var table = new SchemaObject(tableId, new Definition("t"), Set.of(),
-                Map.of("partkey", "(id)"));
-        final var index = new SchemaObject(indexId, new Definition("i"), Set.of(),
-                Map.of("createSql", "CREATE INDEX \"i\" ON"
-                        + " ${namespace}.\"p\" (\"id\")"));
-        final var desired = SchemaSnapshot.of(Map.of(tableId, table, indexId, index));
-        final var changes = dialect.render(new Difference(indexId,
-                DifferenceType.MISSING, Optional.of(index.definition()),
-                Optional.empty()), desired, "ns",
-                new RenderOptions(true, Map.of()));
-        assertEquals(1, changes.size());
-        assertFalse(changes.get(0).nonTransactional());
-        assertFalse(changes.get(0).statements().get(0).contains("CONCURRENTLY"),
-                changes.get(0).statements().get(0));
+    void anIndexOnAPartitionedParentStaysTransactional() throws Exception {
+        final var ns = namespace();
+        try {
+            final var script = "CREATE TABLE p (id int) PARTITION BY RANGE (id);"
+                    + " CREATE TABLE p1 PARTITION OF p FOR VALUES FROM (1) TO (10);"
+                    + " CREATE INDEX i ON p (id)";
+            final var report = reconciler(ns, script).concurrentIndexes(true)
+                    .build().reconcile();
+            final var index = report.applied().stream()
+                    .filter(c -> c.target().kind() == ObjectKind.INDEX)
+                    .findFirst().orElseThrow();
+            assertFalse(index.nonTransactional());
+            assertFalse(index.statements().get(0).contains("CONCURRENTLY"));
+            assertEquals(ReconcileOutcome.UP_TO_DATE, reconciler(ns, script)
+                    .concurrentIndexes(true).build().reconcile().outcome());
+        } finally {
+            drop(ns);
+        }
     }
 
     @Test
@@ -708,5 +718,370 @@ class FeatureE2ETest {
             }
         }
     }
+
+    @Test
+    void managedPartitionedIndexesReconcileStayTransactionalDumpAndRename() throws Exception {
+        final var ns = namespace();
+        try {
+            final var script = "CREATE FUNCTION usage_day(timestamptz) RETURNS date"
+                    + " LANGUAGE sql IMMUTABLE AS $$ SELECT $1::date $$;"
+                    + " CREATE TABLE usage_records (tenant_account_id bigint,"
+                    + " created_at timestamptz NOT NULL,"
+                    + " CONSTRAINT usage_records_pkey PRIMARY KEY (created_at, tenant_account_id),"
+                    + " CONSTRAINT usage_records_tenant_key UNIQUE (tenant_account_id, created_at))"
+                    + " PARTITION BY RANGE (created_at);"
+                    + " CREATE TABLE usage_records_p2026_11 PARTITION OF usage_records"
+                    + " FOR VALUES FROM ('2026-11-01') TO ('2026-12-01');"
+                    + " CREATE INDEX usage_records_tenant_idx ON usage_records (tenant_account_id)"
+                    + " WHERE tenant_account_id IS NOT NULL;"
+                    + " CREATE UNIQUE INDEX usage_records_tenant_created_uq"
+                    + " ON usage_records (tenant_account_id, created_at);"
+                    + " CREATE INDEX usage_records_day_idx ON usage_records (usage_day(created_at));"
+                    + " COMMENT ON INDEX usage_records_tenant_idx IS 'tenant index'";
+            final var first = reconciler(ns, script).concurrentIndexes(true)
+                    .build().reconcile();
+            assertEquals(ReconcileOutcome.RECONCILED, first.outcome());
+            final var indexCreates = first.applied().stream()
+                    .filter(c -> c.target().kind() == ObjectKind.INDEX).toList();
+            assertTrue(indexCreates.size() >= 2, first.applied().toString());
+            assertTrue(indexCreates.stream().allMatch(c -> !c.nonTransactional()
+                    && c.statements().stream().noneMatch(sql -> sql.contains("CONCURRENTLY"))));
+            assertEquals(ReconcileOutcome.UP_TO_DATE,
+                    reconciler(ns, script).build().reconcile().outcome());
+            final var dump = SchemaReconciler.builder().dataSource(ds).namespace(ns)
+                    .dialect(dialect).build().dump();
+            assertTrue(dump.contains("CREATE INDEX usage_records_tenant_idx ON ${namespace}.usage_records"), dump);
+            assertFalse(dump.contains("ON ONLY"), dump);
+
+            final var renamed = script.replace("usage_records_tenant_idx",
+                    "usage_records_tenant_new_idx")
+                    + "\n-- @reconciler rename INDEX usage_records.usage_records_tenant_idx -> usage_records_tenant_new_idx";
+            final var rename = reconciler(ns, renamed).build().reconcile();
+            assertEquals(ReconcileOutcome.RECONCILED, rename.outcome());
+            assertTrue(rename.applied().stream().anyMatch(c ->
+                    c.action() == ChangeAction.ALTER
+                            && c.target().kind() == ObjectKind.INDEX
+                            && c.target().name().equals("usage_records_tenant_new_idx")),
+                    rename.applied().toString());
+            assertTrue(tableExists(ns, "usage_records_tenant_new_idx"));
+            assertEquals(ReconcileOutcome.UP_TO_DATE,
+                    reconciler(ns, renamed).build().reconcile().outcome());
+        } finally {
+            drop(ns);
+        }
+    }
+
+    @Test
+    void anInvalidOnOnlyPartitionedIndexRecoversToValid() throws Exception {
+        final var ns = namespace();
+        try {
+            final var base = "CREATE TABLE usage_records (tenant_account_id bigint,"
+                    + " created_at timestamptz NOT NULL) PARTITION BY RANGE (created_at);"
+                    + " CREATE TABLE usage_records_p2026_11 PARTITION OF usage_records"
+                    + " FOR VALUES FROM ('2026-11-01') TO ('2026-12-01');";
+            final var invalid = base + " CREATE INDEX usage_records_tenant_idx"
+                    + " ON ONLY usage_records (tenant_account_id)";
+            assertEquals(ReconcileOutcome.RECONCILED,
+                    reconciler(ns, invalid).build().reconcile().outcome());
+            assertFalse(indexValid(ns, "usage_records_tenant_idx"));
+            final var valid = base + " CREATE INDEX usage_records_tenant_idx"
+                    + " ON usage_records (tenant_account_id)";
+            assertEquals(ReconcileOutcome.RECONCILED,
+                    reconciler(ns, valid).build().reconcile().outcome());
+            assertTrue(indexValid(ns, "usage_records_tenant_idx"));
+            assertEquals(ReconcileOutcome.UP_TO_DATE,
+                    reconciler(ns, valid).build().reconcile().outcome());
+        } finally {
+            drop(ns);
+        }
+    }
+
+    @Test
+    void externalPartitionsCoexistThroughReconcilePlanApplyDumpAndPrune() throws Exception {
+        final var ns = namespace();
+        try {
+            final var base = "CREATE TABLE usage_records (tenant_account_id bigint,"
+                    + " created_at timestamptz NOT NULL) PARTITION BY RANGE (created_at);"
+                    + " CREATE TABLE usage_records_default PARTITION OF usage_records DEFAULT";
+            final var policy = ReconcilePolicy.defaults()
+                    .withDestructive(Decision.APPLY).withPrune(true);
+            final var builder = reconciler(ns, base, policy)
+                    .externalPartitions("usage_records", "usage_records_p");
+            assertEquals(ReconcileOutcome.RECONCILED, builder.build().reconcile().outcome());
+            final var qNs = dialect.quoteIdentifier(ns);
+            PgTestDatabase.execute(ds, "CREATE TABLE " + qNs
+                    + ".usage_records_p2026_11 PARTITION OF " + qNs
+                    + ".usage_records FOR VALUES FROM ('2026-11-01') TO ('2026-12-01')");
+            final var upToDate = reconciler(ns, base, policy)
+                    .externalPartitions("usage_records", "usage_records_p").build().reconcile();
+            assertEquals(ReconcileOutcome.UP_TO_DATE, upToDate.outcome());
+            assertTrue(upToDate.unexpected().isEmpty(), upToDate.unexpected().toString());
+
+            final var withIndex = base + "; CREATE INDEX usage_records_tenant_idx"
+                    + " ON usage_records (tenant_account_id)";
+            final var plan = reconciler(ns, withIndex, policy)
+                    .externalPartitions("usage_records", "usage_records_p").build().plan();
+            PgTestDatabase.execute(ds, "CREATE TABLE " + qNs
+                    + ".usage_records_p2026_12 PARTITION OF " + qNs
+                    + ".usage_records FOR VALUES FROM ('2026-12-01') TO ('2027-01-01')");
+            assertEquals(ReconcileOutcome.RECONCILED, reconciler(ns, withIndex, policy)
+                    .externalPartitions("usage_records", "usage_records_p")
+                    .build().apply(plan).outcome());
+            final var dump = SchemaReconciler.builder().dataSource(ds).namespace(ns)
+                    .dialect(dialect).externalPartitions("usage_records", "usage_records_p")
+                    .build().dump();
+            assertFalse(dump.contains("usage_records_p2026_"), dump);
+            assertTrue(dump.contains("usage_records_default"), dump);
+        } finally {
+            drop(ns);
+        }
+    }
+
+    @Test
+    void retireDropsTargetedConstraintAndPruneFilterProtectsMigrationTableTree() throws Exception {
+        final var ns = namespace();
+        try {
+            final var qNs = dialect.quoteIdentifier(ns);
+            PgTestDatabase.execute(ds, "CREATE TABLE " + qNs + ".router_models"
+                    + " (id bigint PRIMARY KEY, slug text NOT NULL, tenant_id bigint NOT NULL);"
+                    + " ALTER TABLE " + qNs + ".router_models"
+                    + " ADD CONSTRAINT router_models_slug_key UNIQUE (slug);"
+                    + " CREATE TABLE " + qNs + ".goose_db_version"
+                    + " (id bigserial PRIMARY KEY, version bigint NOT NULL)");
+            final var script = "CREATE TABLE router_models (id bigint PRIMARY KEY,"
+                    + " slug text NOT NULL, tenant_id bigint NOT NULL,"
+                    + " CONSTRAINT router_models_global_slug_uq UNIQUE (slug),"
+                    + " CONSTRAINT router_models_tenant_slug_uq UNIQUE (tenant_id, slug));"
+                    + "\n-- @reconciler retire UNIQUE router_models.router_models_slug_key";
+            final var report = reconciler(ns, script).build().reconcile();
+            assertEquals(ReconcileOutcome.RECONCILED, report.outcome());
+            assertTrue(report.applied().stream().anyMatch(c ->
+                    c.action() == ChangeAction.DROP
+                            && c.target().kind() == ObjectKind.UNIQUE
+                            && c.target().name().equals("router_models_slug_key")
+                            && c.reason().contains("retired")), report.applied().toString());
+            assertTrue(tableExists(ns, "goose_db_version"));
+            assertEquals(ReconcileOutcome.UP_TO_DATE,
+                    reconciler(ns, script).build().reconcile().outcome());
+
+            PgTestDatabase.execute(ds, "ALTER TABLE " + qNs + ".router_models"
+                    + " ADD CONSTRAINT router_models_obsolete_uq UNIQUE (id, slug)");
+            final var prunePolicy = ReconcilePolicy.defaults()
+                    .withDestructive(Decision.APPLY).withPrune(true);
+            final var prune = reconciler(ns, script, prunePolicy)
+                    .pruneFilter(id -> !id.name().equals("goose_db_version"))
+                    .build().reconcile();
+            assertEquals(ReconcileOutcome.RECONCILED, prune.outcome());
+            assertTrue(tableExists(ns, "goose_db_version"));
+            assertTrue(tableExists(ns, "goose_db_version_id_seq"));
+            assertTrue(prune.unexpected().stream().anyMatch(d ->
+                    d.id().name().equals("goose_db_version")),
+                    "protected objects remain visible as unexpected");
+        } finally {
+            drop(ns);
+        }
+    }
+
+    @Test
+    void schemaHooksOrderBackfillAtomicallyRollBackAndRunOnce() throws Exception {
+        final var ns = namespace();
+        try {
+            final var qNs = dialect.quoteIdentifier(ns);
+            PgTestDatabase.execute(ds, "CREATE TABLE " + qNs + ".accounts"
+                    + " (id bigint PRIMARY KEY, slug text);"
+                    + " INSERT INTO " + qNs + ".accounts (id, slug) VALUES (1, NULL)");
+            final var events = new java.util.ArrayList<String>();
+            final var store = PgHookStore.inSchema(ns);
+            final var script = "CREATE TABLE accounts (id bigint PRIMARY KEY, slug text NOT NULL);"
+                    + " CREATE TABLE hook_audit (id int)";
+            final var hooked = reconciler(ns, script,
+                    ReconcilePolicy.defaults().withDestructive(Decision.APPLY))
+                    .hookStore(store)
+                    .hook(SchemaHook.of("z-post", HookPhase.POST_COMMIT, 2,
+                            ctx -> events.add("z:" + ctx.applied().size())))
+                    .hook(SchemaHook.of("a-pre", HookPhase.PRE_APPLY, 1, ctx -> {
+                        events.add("a");
+                        ctx.connection().createStatement().execute(
+                                "UPDATE accounts SET slug = 'x' WHERE slug IS NULL");
+                    }))
+                    .hook(SchemaHook.runOnce("m-once", HookPhase.POST_APPLY, 0, "v1", ctx -> {
+                        events.add("m");
+                        ctx.connection().createStatement().execute(
+                                "INSERT INTO hook_audit (id) VALUES (1)");
+                    }))
+                    .build();
+            assertEquals(ReconcileOutcome.RECONCILED, hooked.reconcile().outcome());
+            assertEquals(List.of("a", "m", "z"), events.stream().map(e -> e.substring(0, 1)).toList());
+            final var eventCount = events.size();
+            assertEquals(ReconcileOutcome.UP_TO_DATE, hooked.reconcile().outcome());
+            assertEquals(eventCount + 2, events.size(),
+                    "run-once hook skips but always-run hooks still run on an up-to-date apply");
+            assertEquals(1, events.stream().filter(e -> e.startsWith("m")).count());
+            assertTrue(tableExists(ns, "schema_reconciler_hooks"));
+
+            final var changed = reconciler(ns, script).hookStore(store)
+                    .hook(SchemaHook.runOnce("m-once", HookPhase.POST_APPLY, "v2",
+                            ctx -> { }))
+                    .build();
+            assertThrows(ApplyException.class, changed::reconcile);
+
+            final var failing = reconciler(ns, "CREATE TABLE rollback_probe (id int)")
+                    .hook(SchemaHook.of("fail", HookPhase.POST_APPLY, ctx -> {
+                        ctx.connection().createStatement().execute(
+                                "INSERT INTO rollback_probe (id) VALUES (1)");
+                        throw new SQLException("boom");
+                    }))
+                    .build();
+            assertThrows(ApplyException.class, failing::reconcile);
+            assertFalse(tableExists(ns, "rollback_probe"),
+                    "POST_APPLY failure rolls back the DDL transaction");
+        } finally {
+            drop(ns);
+        }
+    }
+
+    @Test
+    void externalPartitionsRemainVisibleWhenTheirParentIsPruned() throws Exception {
+        final var ns = namespace();
+        try {
+            execute("CREATE TABLE " + q(ns, "usage_records")
+                    + " (id bigint, created_at timestamptz) PARTITION BY RANGE (created_at);"
+                    + " CREATE TABLE " + q(ns, "usage_records_p2026_11") + " PARTITION OF "
+                    + q(ns, "usage_records") + " FOR VALUES FROM ('2026-11-01') TO ('2026-12-01')");
+            final var report = reconciler(ns, "", ReconcilePolicy.defaults()
+                    .withPrune(true).withDestructive(Decision.APPLY))
+                    .externalPartitions("usage_records", "usage_records_p").build().reconcile();
+            assertEquals(ReconcileOutcome.RECONCILED, report.outcome());
+            final var drops = report.applied().stream()
+                    .filter(c -> c.action() == ChangeAction.DROP).toList();
+            assertTrue(drops.stream().anyMatch(c -> c.target().kind() == ObjectKind.PARTITION
+                    && c.target().name().equals("usage_records_p2026_11")), drops.toString());
+            assertTrue(drops.stream().anyMatch(c -> c.target().kind() == ObjectKind.TABLE
+                    && c.target().name().equals("usage_records")));
+        } finally {
+            drop(ns);
+        }
+    }
+
+    @Test
+    void retireEdgeCasesCoverColumnsDestructivePolicyAndDependents() throws Exception {
+        final var ns = namespace();
+        try {
+            execute("CREATE TABLE " + q(ns, "t") + " (id int, old text)");
+            final var column = reconciler(ns, "CREATE TABLE t (id int)",
+                    ReconcilePolicy.defaults().withDestructive(Decision.APPLY))
+                    .retire(new ObjectId(ObjectKind.COLUMN, "old", "t")).build().reconcile();
+            assertEquals(ReconcileOutcome.RECONCILED, column.outcome());
+            assertTrue(column.applied().stream().anyMatch(c ->
+                    c.target().kind() == ObjectKind.COLUMN && c.safety() == ChangeSafety.DESTRUCTIVE
+                            && c.statements().stream().anyMatch(sql -> sql.contains("DROP COLUMN"))));
+            assertFalse(columnExists(ns, "t", "old"));
+
+            execute("CREATE TABLE " + q(ns, "victim") + " (id int)");
+            assertThrows(PolicyViolationException.class, () -> reconciler(ns, "CREATE TABLE t (id int)")
+                    .retire(new ObjectId(ObjectKind.TABLE, "victim")).build().reconcile());
+            execute("CREATE VIEW " + q(ns, "dependent") + " AS SELECT id FROM " + q(ns, "victim"));
+            assertThrows(PlanningException.class, () -> reconciler(ns, "CREATE TABLE t (id int)",
+                    ReconcilePolicy.defaults().withDestructive(Decision.APPLY))
+                    .retire(new ObjectId(ObjectKind.TABLE, "victim")).build().reconcile());
+        } finally {
+            drop(ns);
+        }
+    }
+
+    @Test
+    void hooksSkipReportedOnlyAndPostCommitFailuresCarryAppliedChanges() throws Exception {
+        final var ns = namespace();
+        try {
+            final var events = new java.util.ArrayList<String>();
+            final var reported = SchemaReconciler.builder().dataSource(ds).namespace(ns)
+                    .desiredState(DesiredState.ofScript("CREATE TABLE later (id int)"))
+                    .dialect(dialect).policy(ReconcilePolicy.reportOnly())
+                    .hook(SchemaHook.of("pre", HookPhase.PRE_APPLY, ctx -> events.add("pre")))
+                    .hook(SchemaHook.of("post", HookPhase.POST_APPLY, ctx -> events.add("post")))
+                    .hook(SchemaHook.of("commit", HookPhase.POST_COMMIT, ctx -> events.add("commit")))
+                    .build();
+            assertEquals(ReconcileOutcome.REPORTED_ONLY, reported.reconcile().outcome());
+            assertEquals(List.of(), events);
+
+            final var failing = SchemaReconciler.builder().dataSource(ds).namespace(ns)
+                    .desiredState(DesiredState.ofScript("CREATE TABLE later (id int)"))
+                    .dialect(dialect)
+                    .hook(SchemaHook.of("boom", HookPhase.POST_COMMIT,
+                            ctx -> { throw new SQLException("boom"); }))
+                    .build();
+            final var error = assertThrows(ApplyException.class, failing::reconcile);
+            assertTrue(error.applied().stream().anyMatch(c -> c.target().name().equals("later")),
+                    "post-commit failure carries prior applied changes");
+        } finally {
+            drop(ns);
+        }
+    }
+
+    @Test
+    void pgHookStoreDedicatedSchemaAndSubPartitionIndexTransactional() throws Exception {
+        final var ns = namespace();
+        final var internal = "_reconciler_internal_" + RUN_ID + "_" + SEQUENCE.incrementAndGet();
+        execute("CREATE SCHEMA " + dialect.quoteIdentifier(internal));
+        try {
+            final var runs = new AtomicLong();
+            final var r = reconciler(ns, "CREATE TABLE hooked (id int)")
+                    .hookStore(PgHookStore.inSchema(internal))
+                    .hook(SchemaHook.runOnce("once", HookPhase.POST_COMMIT, "v1",
+                            ctx -> runs.incrementAndGet()))
+                    .build();
+            assertEquals(ReconcileOutcome.RECONCILED, r.reconcile().outcome());
+            assertEquals(ReconcileOutcome.UP_TO_DATE, r.reconcile().outcome());
+            assertEquals(1, runs.get());
+
+            final var sub = "CREATE TABLE measurement (city_id int, logdate date) PARTITION BY RANGE (logdate);"
+                    + " CREATE TABLE measurement_2026 PARTITION OF measurement"
+                    + " FOR VALUES FROM ('2026-01-01') TO ('2027-01-01') PARTITION BY LIST (city_id);"
+                    + " CREATE TABLE measurement_2026_x PARTITION OF measurement_2026 FOR VALUES IN (1);"
+                    + " CREATE INDEX measurement_city_idx ON measurement_2026 (city_id)";
+            final var applied = reconciler(ns, sub).concurrentIndexes(true).build().reconcile();
+            final var indexes = applied.applied().stream().filter(c ->
+                    c.target().kind() == ObjectKind.INDEX
+                            && c.target().name().equals("measurement_city_idx")).toList();
+            assertFalse(indexes.isEmpty());
+            assertTrue(indexes.stream().noneMatch(PlannedChange::nonTransactional));
+        } finally {
+            drop(ns);
+            drop(internal);
+        }
+    }
+
+    @Test
+    void multiNamespaceForwards011Options() throws Exception {
+        final var ns = namespace();
+        try {
+            execute("CREATE TABLE " + q(ns, "usage_records")
+                    + " (id bigint, created_at timestamptz) PARTITION BY RANGE (created_at);"
+                    + " CREATE TABLE " + q(ns, "usage_records_p2026_11") + " PARTITION OF "
+                    + q(ns, "usage_records") + " FOR VALUES FROM ('2026-11-01') TO ('2026-12-01');"
+                    + " CREATE TABLE " + q(ns, "goose_db_version") + " (id int)");
+            final var runs = new AtomicLong();
+            final var multi = MultiNamespaceReconciler.builder().dataSource(ds).dialect(dialect)
+                    .policy(ReconcilePolicy.defaults().withPrune(true).withDestructive(Decision.APPLY))
+                    .externalPartitions("usage_records", "usage_records_p")
+                    .pruneFilter(id -> !id.name().equals("goose_db_version"))
+                    .hookStore(PgHookStore.inSchema(ns))
+                    .namespace(ns, DesiredState.ofScript(
+                            "CREATE TABLE usage_records (id bigint, created_at timestamptz)"
+                                    + " PARTITION BY RANGE (created_at)"),
+                            b -> b.hook(SchemaHook.runOnce("once", HookPhase.POST_COMMIT, "v1",
+                                    ctx -> runs.incrementAndGet())))
+                    .build();
+            final var report = multi.reconcile();
+            assertEquals(ReconcileOutcome.UP_TO_DATE, report.reports().get(ns).outcome());
+            assertTrue(tableExists(ns, "goose_db_version"));
+            assertEquals(1, runs.get());
+            assertTrue(tableExists(ns, "schema_reconciler_hooks"));
+        } finally {
+            drop(ns);
+        }
+    }
+
+
 
 }

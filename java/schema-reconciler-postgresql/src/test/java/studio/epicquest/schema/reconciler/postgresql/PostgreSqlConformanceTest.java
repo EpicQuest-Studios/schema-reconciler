@@ -634,17 +634,16 @@ class PostgreSqlConformanceTest extends DialectConformanceTest {
     }
 
     @Test
-    @DisplayName("category override tolerates partindex but not a comment")
+    @DisplayName("category override tolerates inherited but not a comment")
     void categoryOverrideSplitsUnsupportedKinds() throws Exception {
         final var script = """
                 CREATE TABLE t (id bigint, n int);
-                CREATE TABLE pp (k int) PARTITION BY RANGE (k);
-                CREATE TABLE pt PARTITION OF pp FOR VALUES FROM (1) TO (10);
-                CREATE INDEX pi ON pp (k);
-                COMMENT ON INDEX pi IS 'x'
+                CREATE TABLE pp ();
+                CREATE TABLE pt () INHERITS (pp);
+                COMMENT ON TABLE pt IS 'x'
                 """;
         final var tolerant = ReconcilePolicy.defaults()
-                .withUnsupportedCategory("partindex", Decision.REPORT);
+                .withUnsupportedCategory("inherited", Decision.REPORT);
         // the comment category is not tolerated → still fails closed
         assertThrows(PolicyViolationException.class,
                 () -> reconciler(script, tolerant).reconcile());
@@ -808,19 +807,18 @@ class PostgreSqlConformanceTest extends DialectConformanceTest {
     }
 
     @Test
-    @DisplayName("tolerated partindex reports; the comment still fails")
+    @DisplayName("tolerated inherited reports; the comment still fails")
     void toleratedDictionaryAndGrantVsOperator() throws Exception {
         // some unsupported categories may be tolerated — an unsupported
         // construct must still fail closed under the same policy
         final var script = """
                 CREATE TABLE t (id bigint, n int);
-                CREATE TABLE pp (k int) PARTITION BY RANGE (k);
-                CREATE TABLE pt PARTITION OF pp FOR VALUES FROM (1) TO (10);
-                CREATE INDEX pi ON pp (k);
-                COMMENT ON INDEX pi IS 'x'
+                CREATE TABLE pp ();
+                CREATE TABLE pt () INHERITS (pp);
+                COMMENT ON TABLE pt IS 'x'
                 """;
         final var tolerant = ReconcilePolicy.defaults()
-                .withUnsupportedCategory("partindex", Decision.REPORT);
+                .withUnsupportedCategory("inherited", Decision.REPORT);
         assertThrows(PolicyViolationException.class,
                 () -> reconciler(script, tolerant).reconcile());
         final var report = reconciler(script, tolerant
@@ -828,8 +826,8 @@ class PostgreSqlConformanceTest extends DialectConformanceTest {
         final var names = report.unsupported().stream()
                 .map(d -> d.id().name()).sorted().toList();
         assertTrue(names.stream().anyMatch(n -> n.startsWith("comment:")), names.toString());
-        assertTrue(names.stream().anyMatch(n -> n.startsWith("partindex:")),
-                "expected a partindex entry: " + names);
+        assertTrue(names.stream().anyMatch(n -> n.startsWith("inherited:")),
+                "expected an inherited entry: " + names);
         // tolerated objects are intentionally ignored, never applied
         assertTrue(report.unsupported().stream().allMatch(
                 d -> d.type() == DifferenceType.UNSUPPORTED));

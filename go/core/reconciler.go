@@ -2,6 +2,7 @@ package reconciler
 
 import (
 	"context"
+	"strings"
 	"time"
 
 	"github.com/EpicQuest-Studios/schema-reconciler/go/core/model"
@@ -17,17 +18,22 @@ type SchemaReconciler struct {
 }
 
 type reconcilerConfig struct {
-	dataSource        spi.DB
-	scratchDataSource spi.DB
-	namespace         string
-	desiredState      *DesiredState
-	dialect           spi.Dialect
-	policy            ReconcilePolicy
-	lockTimeout       time.Duration
-	listener          ReconcileListener
-	filter            ObjectFilter
-	concurrentIndexes bool
-	renameHints       []model.RenameHint
+	dataSource         spi.DB
+	scratchDataSource  spi.DB
+	namespace          string
+	desiredState       *DesiredState
+	dialect            spi.Dialect
+	policy             ReconcilePolicy
+	lockTimeout        time.Duration
+	listener           ReconcileListener
+	filter             ObjectFilter
+	concurrentIndexes  bool
+	renameHints        []model.RenameHint
+	retireTargets      []model.ObjectId
+	externalPartitions []externalPartitionMatcher
+	pruneFilter        ObjectFilter
+	hooks              []SchemaHook
+	hookStore          HookStore
 
 	// statementTimeout is a pointer because the option is itself optional:
 	// nil means "unbounded"; once set it must be positive (spec 3.1).
@@ -139,6 +145,80 @@ func (b *Builder) Rename(from, to model.ObjectId) *Builder {
 	return b
 }
 
+// Retire marks id for targeted retirement even when the prune policy is off.
+func (b *Builder) Retire(id model.ObjectId) *Builder {
+	if err := id.Validate(); err != nil {
+		b.hintErr = err
+		return b
+	}
+	if id.Kind == model.KindOther {
+		b.hintErr = model.InvalidArgumentErrorf("OTHER objects cannot be retired: %s", id)
+		return b
+	}
+	b.cfg.retireTargets = append(b.cfg.retireTargets, id)
+	return b
+}
+
+// ExternalPartitions coexists with every runtime partition directly parented on parentTable.
+func (b *Builder) ExternalPartitions(parentTable string) *Builder {
+	if parentTable == "" {
+		b.hintErr = NewConfigurationError("parentTable must not be empty")
+		return b
+	}
+	b.cfg.externalPartitions = append(b.cfg.externalPartitions,
+		func(parent, partition string) bool { return parent == parentTable })
+	return b
+}
+
+// ExternalPartitionsPrefix coexists with runtime partitions of parentTable whose names start with namePrefix.
+func (b *Builder) ExternalPartitionsPrefix(parentTable, namePrefix string) *Builder {
+	if parentTable == "" {
+		b.hintErr = NewConfigurationError("parentTable must not be empty")
+		return b
+	}
+	b.cfg.externalPartitions = append(b.cfg.externalPartitions,
+		func(parent, partition string) bool {
+			return parent == parentTable && strings.HasPrefix(partition, namePrefix)
+		})
+	return b
+}
+
+// ExternalPartitionsFunc coexists with runtime partitions accepted by match.
+func (b *Builder) ExternalPartitionsFunc(match func(parentTable, partitionName string) bool) *Builder {
+	if match == nil {
+		b.hintErr = NewConfigurationError("external partition matcher must not be nil")
+		return b
+	}
+	b.cfg.externalPartitions = append(b.cfg.externalPartitions, match)
+	return b
+}
+
+// PruneFilter limits which unexpected objects prune may drop; visibility is unaffected.
+func (b *Builder) PruneFilter(allowPrune ObjectFilter) *Builder {
+	if allowPrune == nil {
+		b.hintErr = NewConfigurationError("pruneFilter must not be nil")
+		return b
+	}
+	b.cfg.pruneFilter = allowPrune
+	return b
+}
+
+// Hook registers an ordered lifecycle hook (spec 3.8); repeatable.
+func (b *Builder) Hook(hook SchemaHook) *Builder {
+	b.cfg.hooks = append(b.cfg.hooks, hook)
+	return b
+}
+
+// HookStore registers the durable store checksum-protected run-once hooks use.
+func (b *Builder) HookStore(store HookStore) *Builder {
+	if store == nil {
+		b.hintErr = NewConfigurationError("hookStore must not be nil")
+		return b
+	}
+	b.cfg.hookStore = store
+	return b
+}
+
 // Listener sets the run's callback listener; the default is a no-op.
 func (b *Builder) Listener(listener ReconcileListener) *Builder {
 	if listener != nil {
@@ -180,8 +260,33 @@ func (b *Builder) Build() (*SchemaReconciler, error) {
 		return nil, NewConfigurationErrorf(
 			"no Dialect provider registered for namespace %s", b.cfg.namespace)
 	}
+	if b.cfg.pruneFilter == nil {
+		b.cfg.pruneFilter = func(model.ObjectId) bool { return true }
+	}
+	seenHooks := map[string]bool{}
+	for _, hook := range b.cfg.hooks {
+		if strings.TrimSpace(hook.ID) == "" {
+			return nil, NewConfigurationError("hook id must not be blank")
+		}
+		if hook.Phase < HookPreApply || hook.Phase > HookPostCommit {
+			return nil, NewConfigurationErrorf("hook '%s' has invalid phase %d", hook.ID, hook.Phase)
+		}
+		if hook.Run == nil {
+			return nil, NewConfigurationErrorf("hook '%s' has no run action", hook.ID)
+		}
+		if seenHooks[hook.ID] {
+			return nil, NewConfigurationErrorf("duplicate hook id '%s'", hook.ID)
+		}
+		seenHooks[hook.ID] = true
+		if hook.RunOnce && b.cfg.hookStore == nil {
+			return nil, NewConfigurationErrorf("hook '%s' is runOnce but no hookStore is configured", hook.ID)
+		}
+	}
 	cfg := b.cfg
 	cfg.renameHints = append([]model.RenameHint(nil), b.cfg.renameHints...)
+	cfg.retireTargets = append([]model.ObjectId(nil), b.cfg.retireTargets...)
+	cfg.externalPartitions = append([]externalPartitionMatcher(nil), b.cfg.externalPartitions...)
+	cfg.hooks = append([]SchemaHook(nil), b.cfg.hooks...)
 	return &SchemaReconciler{engine: newEngine(cfg)}, nil
 }
 

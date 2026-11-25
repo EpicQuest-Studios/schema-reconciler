@@ -523,3 +523,14 @@ test("driftedColumnGeneratedOrIdentityStaysManual", () => {
             "core")[0]!;
     assert.equal(change.safety, ChangeSafety.DESTRUCTIVE);
 });
+
+test("stripIndexOnOnlyIsIdentifierAwareAndUtf8Safe", () => {
+    assert.equal(PgIdentifiers.stripIndexOnOnly(
+            'CREATE INDEX "my ""on only"" idx" ON ONLY public.t USING btree (x)'),
+            'CREATE INDEX "my ""on only"" idx" ON public.t USING btree (x)');
+    assert.equal(PgIdentifiers.stripIndexOnOnly(
+            'CREATE UNIQUE INDEX ąх ON ONLY public.t USING btree (x)'),
+            'CREATE UNIQUE INDEX ąх ON public.t USING btree (x)');
+    const recursive = 'CREATE INDEX plain ON public.t USING btree (x)';
+    assert.equal(PgIdentifiers.stripIndexOnOnly(recursive), recursive);
+});

@@ -1,6 +1,6 @@
 {
     "name": "@epicquest-studios/schema-reconciler-postgresql",
-    "version": "0.10.0",
+    "version": "0.11.0",
     "description": "PostgreSQL 14+ reference dialect for the schema reconciler (TypeScript binding of SPEC.md).",
     "license": "Apache-2.0",
     "type": "module",
@@ -20,7 +20,7 @@
         "node": ">=22.18"
     },
     "dependencies": {
-        "@epicquest-studios/schema-reconciler-core": "0.10.0"
+        "@epicquest-studios/schema-reconciler-core": "0.11.0"
     },
     "scripts": {
         "build": "tsc -p tsconfig.build.json && node -e \"const fs=require('fs');fs.cpSync('../../../sql/postgresql','dist/sql/postgresql',{recursive:true})\"",
@@ -28,7 +28,7 @@
         "typecheck": "tsc --noEmit -p tsconfig.json"
     },
     "devDependencies": {
-        "@epicquest-studios/schema-reconciler-tck": "0.10.0",
+        "@epicquest-studios/schema-reconciler-tck": "0.11.0",
         "@types/pg": "^8.23.1",
         "pg": "^8.16.3"
     },

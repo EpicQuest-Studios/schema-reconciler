@@ -32,7 +32,7 @@ final class ObjectFilter {
 
     /** OTHER relation prefixes whose rows can own catalog children. */
     private static final Set<String> RELATION_OTHERS = Set.of(
-            "inherited", "partindex", "toast", "relation");
+            "inherited", "toast", "relation");
 
     /** OTHER prefixes that name a target — the unsupported shadow forms of
      *  the mirrored kinds ({@code comment:}/{@code seclabel:}/

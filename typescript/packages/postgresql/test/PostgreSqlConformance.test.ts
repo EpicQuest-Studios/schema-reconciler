@@ -612,14 +612,13 @@ describe("PostgreSqlConformanceTest PostgreSQL extras", {
                 ReconcileOutcome.UP_TO_DATE);
     });
 
-    it("category override tolerates partindex but not a comment", async () => {
+    it("category override tolerates inherited but not a comment", async () => {
         const script = "CREATE TABLE t (id bigint, n int);"
-                + " CREATE TABLE pp (k int) PARTITION BY RANGE (k);"
-                + " CREATE TABLE pt PARTITION OF pp FOR VALUES FROM (1) TO (10);"
-                + " CREATE INDEX pi ON pp (k);"
-                + " COMMENT ON INDEX pi IS 'x'";
+                + " CREATE TABLE pp ();"
+                + " CREATE TABLE pt () INHERITS (pp);"
+                + " COMMENT ON TABLE pt IS 'x'";
         const tolerant = ReconcilePolicy.defaults()
-                .withUnsupportedCategory("partindex", Decision.REPORT);
+                .withUnsupportedCategory("inherited", Decision.REPORT);
         await assert.rejects(() => reconciler(script, tolerant).reconcile(),
                 PolicyViolationException);
         const both = tolerant.withUnsupportedCategory("comment",
@@ -761,14 +760,13 @@ describe("PostgreSqlConformanceTest PostgreSQL extras", {
         await assertCleanSession();
     });
 
-    it("tolerated partindex reports; the comment still fails", async () => {
+    it("tolerated inherited reports; the comment still fails", async () => {
         const script = "CREATE TABLE t (id bigint, n int);"
-                + " CREATE TABLE pp (k int) PARTITION BY RANGE (k);"
-                + " CREATE TABLE pt PARTITION OF pp FOR VALUES FROM (1) TO (10);"
-                + " CREATE INDEX pi ON pp (k);"
-                + " COMMENT ON INDEX pi IS 'x'";
+                + " CREATE TABLE pp ();"
+                + " CREATE TABLE pt () INHERITS (pp);"
+                + " COMMENT ON TABLE pt IS 'x'";
         const tolerant = ReconcilePolicy.defaults()
-                .withUnsupportedCategory("partindex", Decision.REPORT);
+                .withUnsupportedCategory("inherited", Decision.REPORT);
         await assert.rejects(() => reconciler(script, tolerant).reconcile(),
                 PolicyViolationException);
         const both = tolerant.withUnsupportedCategory("comment",
@@ -777,8 +775,8 @@ describe("PostgreSqlConformanceTest PostgreSQL extras", {
         const names = report.unsupported.map(d => d.id.name).sort();
         assert.ok(names.some(n => n.startsWith("comment:")),
                 JSON.stringify(names));
-        assert.ok(names.some(n => n.startsWith("partindex:")),
-                "expected a partindex entry: " + JSON.stringify(names));
+        assert.ok(names.some(n => n.startsWith("inherited:")),
+                "expected a inherited entry: " + JSON.stringify(names));
         assert.ok(report.unsupported
                 .every(d => d.type === DifferenceType.UNSUPPORTED));
         assert.ok(report.applied.some(c => c.target.equals(table("t"))),

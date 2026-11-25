@@ -1436,8 +1436,8 @@ var ownerResetRe = regexp.MustCompile(` OWNER TO "(?:[^"]|"")*"$`)
 // one (the partitioned index build is transactional anyway).
 func parentPartitioned(id model.ObjectId, snapshot model.SchemaSnapshot) bool {
 	for _, o := range snapshot.Objects {
-		if o.ID.Name == id.Parent && o.ID.Parent == "" &&
-			(o.ID.Kind == model.KindTable || o.ID.Kind == model.KindPartition) {
+		if o.ID.Name == id.Parent &&
+			((o.ID.Kind == model.KindTable && o.ID.Parent == "") || o.ID.Kind == model.KindPartition) {
 			if _, ok := o.Attributes[AttrPartkey]; ok {
 				return true
 			}
@@ -1450,7 +1450,9 @@ func parentPartitioned(id model.ObjectId, snapshot model.SchemaSnapshot) bool {
 // under the options.
 func concurrentIndex(id model.ObjectId, snapshot model.SchemaSnapshot,
 	options spi.RenderOptions) bool {
-	return options.ConcurrentIndexes && !parentPartitioned(id, snapshot)
+	object, ok := snapshot.Objects[id]
+	return options.ConcurrentIndexes && !parentPartitioned(id, snapshot) &&
+		(!ok || object.Attributes[AttrPartitionedIndex] != "true")
 }
 
 var concurrentlyRe = regexp.MustCompile(`^(CREATE\s+(?:UNIQUE\s+)?INDEX)\s`)
@@ -1671,7 +1673,7 @@ func CoveredChildren(created model.Difference,
 // `type:` (a standalone type collides with a table's rowtype). Must
 // match the prefixes the catalog assigns to those objects.
 var relationNamespaceOthers = map[string]bool{
-	"inherited": true, "partindex": true, "toast": true,
+	"inherited": true, "toast": true,
 	"relation": true, "type": true}
 
 // NameScopes is the collision scopes an id's name occupies (spec 5.4.2).

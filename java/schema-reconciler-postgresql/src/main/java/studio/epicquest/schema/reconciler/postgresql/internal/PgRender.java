@@ -1138,8 +1138,7 @@ public final class PgRender {
     private static boolean parentPartitioned(ObjectId id, SchemaSnapshot snapshot) {
         for (final var o : snapshot.objects().values()) {
             if (o.id().name().equals(id.parent().orElse(null))
-                    && o.id().parent().isEmpty()
-                    && (o.id().kind() == ObjectKind.TABLE
+                    && ((o.id().kind() == ObjectKind.TABLE && o.id().parent().isEmpty())
                             || o.id().kind() == ObjectKind.PARTITION)
                     && o.attributes().get(PgCatalog.PARTKEY) != null) {
                 return true;
@@ -1151,7 +1150,10 @@ public final class PgRender {
     /** Whether concurrent index DDL applies to this index under the options. */
     private static boolean concurrentIndex(ObjectId id, SchemaSnapshot snapshot,
                                            RenderOptions options) {
-        return options.concurrentIndexes() && !parentPartitioned(id, snapshot);
+        final var object = snapshot.objects().get(id);
+        return options.concurrentIndexes() && !parentPartitioned(id, snapshot)
+                && (object == null || !"true".equals(
+                        object.attributes().get(PgCatalog.PARTITIONED_INDEX)));
     }
 
     /**
@@ -1344,7 +1346,7 @@ public final class PgRender {
      * prefixes {@code PgCatalog} assigns to those objects.
      */
     private static final Set<String> RELATION_NAMESPACE_OTHERS = Set.of(
-            "inherited", "partindex",
+            "inherited",
             "toast", "relation", "type");
 
     public static Set<String> nameScopes(ObjectId id) {

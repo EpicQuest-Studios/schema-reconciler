@@ -11,11 +11,11 @@ import studio.epicquest.schema.reconciler.model.RenameHint;
 
 /**
  * Parses {@code -- @reconciler rename <KIND> [<parent>.]<old_name> -> <new_name>}
- * comment directives out of a desired-state script (spec 3.2). Identifier
- * paths follow SQL quoting: a {@code "double quoted"} segment is verbatim
- * text ({@code ""} escapes a quote); a bare segment is used as written.
- * The last path segment is the object name, the rest (at most one) its
- * parent.
+ * and {@code -- @reconciler retire <KIND> [<parent>.]<name>} comment directives
+ * out of a desired-state script (spec 3.2). Identifier paths follow SQL quoting:
+ * a {@code "double quoted"} segment is verbatim text ({@code ""} escapes a
+ * quote); a bare segment is used as written. The last path segment is the
+ * object name, the rest (at most one) its parent.
  */
 public final class RenameHints {
 
@@ -24,51 +24,95 @@ public final class RenameHints {
 
     private static final Pattern DIRECTIVE = Pattern.compile(
             "^\\s*--\\s*@reconciler\\s+rename\\s+([A-Za-z_]+)\\s+(\\S+)\\s*->\\s*(\\S+)\\s*$");
+    private static final Pattern RETIRE = Pattern.compile(
+            "^\\s*--\\s*@reconciler\\s+retire\\s+([A-Za-z_]+)\\s+(\\S+)\\s*$");
+
+    /** The directives a script declares. */
+    public record Directives(List<RenameHint> renameHints, List<ObjectId> retireTargets) {
+        public Directives {
+            renameHints = List.copyOf(renameHints);
+            retireTargets = List.copyOf(retireTargets);
+        }
+    }
 
     public static List<RenameHint> parse(String script) {
+        return parseDirectives(script).renameHints();
+    }
+
+    /** Parses both {@code rename} and {@code retire} directives. */
+    public static Directives parseDirectives(String script) {
         final var hints = new ArrayList<RenameHint>();
+        final var retire = new ArrayList<ObjectId>();
         for (final var line : script.split("\n")) {
             final var m = DIRECTIVE.matcher(line);
-            if (!m.matches()) {
+            if (m.matches()) {
+                final var kind = kind("rename", m.group(1));
+                final var from = idPath("rename", kind, m.group(2));
+                hints.add(new RenameHint(from, toId(kind, from, m.group(3))));
                 continue;
             }
-            final ObjectKind kind;
-            try {
-                kind = ObjectKind.valueOf(m.group(1).toUpperCase(Locale.ROOT));
-            } catch (IllegalArgumentException e) {
-                throw new DesiredStateException(
-                        "@reconciler rename: unknown object kind '" + m.group(1) + "'");
+            final var r = RETIRE.matcher(line);
+            if (r.matches()) {
+                final var kind = kind("retire", r.group(1));
+                if (kind == ObjectKind.OTHER) {
+                    throw new DesiredStateException(
+                            "@reconciler retire: OTHER objects cannot be retired");
+                }
+                retire.add(idPath("retire", kind, r.group(2)));
             }
-            hints.add(new RenameHint(idPath(kind, m.group(2)),
-                    toId(kind, m.group(2), m.group(3))));
         }
-        return hints;
+        return new Directives(hints, retire);
+    }
+
+    private static ObjectKind kind(String directive, String text) {
+        try {
+            return ObjectKind.valueOf(text.toUpperCase(Locale.ROOT));
+        } catch (IllegalArgumentException e) {
+            throw new DesiredStateException(
+                    "@reconciler " + directive + ": unknown object kind '" + text + "'");
+        }
     }
 
     /** {@code <KIND> [parent.]name} — the parent comes from the {@code from} path when {@code to} carries none. */
-    private static ObjectId toId(ObjectKind kind, String fromPath, String toPath) {
-        final var to = idPath(kind, toPath);
-        if (to.parent().isPresent()) {
-            return to;
-        }
-        final var from = idPath(kind, fromPath);
-        return new ObjectId(kind, to.name(), from.parent());
-    }
-
-    private static ObjectId idPath(ObjectKind kind, String text) {
-        final var parts = splitPath(text);
+    private static ObjectId toId(ObjectKind kind, ObjectId from, String toPath) {
+        final var parts = splitPath("rename", toPath);
         if (parts.isEmpty() || parts.size() > 2 || parts.stream().anyMatch(String::isEmpty)) {
             throw new DesiredStateException(
-                    "@reconciler rename: bad identifier path '" + text + "'");
+                    "@reconciler rename: bad identifier path '" + toPath + "'");
+        }
+        final var parent = parts.size() == 2 ? parts.get(0)
+                : from.parent().orElse(null);
+        try {
+            return parent == null
+                    ? new ObjectId(kind, parts.get(parts.size() - 1))
+                    : new ObjectId(kind, parts.get(parts.size() - 1), parent);
+        } catch (IllegalArgumentException e) {
+            throw new DesiredStateException(
+                    "@reconciler rename: bad identifier path '" + toPath
+                            + "': " + e.getMessage(), e);
+        }
+    }
+
+    private static ObjectId idPath(String directive, ObjectKind kind, String text) {
+        final var parts = splitPath(directive, text);
+        if (parts.isEmpty() || parts.size() > 2 || parts.stream().anyMatch(String::isEmpty)) {
+            throw new DesiredStateException(
+                    "@reconciler " + directive + ": bad identifier path '" + text + "'");
         }
         final var parent = parts.size() == 2 ? parts.get(0) : null;
-        return parent == null
-                ? new ObjectId(kind, parts.get(parts.size() - 1))
-                : new ObjectId(kind, parts.get(parts.size() - 1), parent);
+        try {
+            return parent == null
+                    ? new ObjectId(kind, parts.get(parts.size() - 1))
+                    : new ObjectId(kind, parts.get(parts.size() - 1), parent);
+        } catch (IllegalArgumentException e) {
+            throw new DesiredStateException(
+                    "@reconciler " + directive + ": bad identifier path '" + text
+                            + "': " + e.getMessage(), e);
+        }
     }
 
     /** Splits a {@code .}-separated identifier path outside double quotes and unquotes each segment. */
-    private static List<String> splitPath(String text) {
+    private static List<String> splitPath(String directive, String text) {
         final var parts = new ArrayList<String>();
         final var cur = new StringBuilder();
         var inQuote = false;
@@ -96,7 +140,7 @@ public final class RenameHints {
         }
         if (inQuote) {
             throw new DesiredStateException(
-                    "@reconciler rename: unterminated quote in '" + text + "'");
+                    "@reconciler " + directive + ": unterminated quote in '" + text + "'");
         }
         parts.add(cur.toString());
         return parts;

@@ -21,7 +21,7 @@ import type { Duration } from "../../src/Duration.ts";
 
 /** OTHER categories whose stripped names occupy the relation namespace (mirrors PgRender). */
 const RELATION_NAMESPACE_OTHERS: ReadonlySet<string> = new Set([
-    "inherited", "partindex", "toast", "relation", "type"]);
+    "inherited", "toast", "relation", "type"]);
 
 /**
  * A {@link Dialect} over {@link FakeDb}, used to exercise the whole engine in

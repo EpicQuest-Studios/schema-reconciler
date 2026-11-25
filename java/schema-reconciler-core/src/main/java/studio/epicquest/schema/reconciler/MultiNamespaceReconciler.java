@@ -8,6 +8,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.function.Consumer;
+import java.util.function.BiPredicate;
 import java.util.function.Predicate;
 import javax.sql.DataSource;
 import studio.epicquest.schema.reconciler.model.ObjectId;
@@ -99,6 +100,9 @@ public final class MultiNamespaceReconciler {
         private ReconcileListener listener = ReconcileListener.NONE;
         private Predicate<ObjectId> objectFilter = id -> true;
         private boolean concurrentIndexes;
+        private final List<BiPredicate<String, String>> externalPartitionMatchers = new ArrayList<>();
+        private Predicate<ObjectId> pruneFilter = id -> true;
+        private HookStore hookStore;
         private final List<Registration> namespaces = new ArrayList<>();
 
         private Builder() {
@@ -147,6 +151,61 @@ public final class MultiNamespaceReconciler {
 
         public Builder concurrentIndexes(boolean enabled) {
             this.concurrentIndexes = enabled;
+            return this;
+        }
+
+        /** Coexists with every runtime partition directly parented on {@code parentTable}. */
+        public Builder externalPartitions(String parentTable) {
+            if (parentTable == null) {
+                throw new NullPointerException("parentTable");
+            }
+            if (parentTable.isEmpty()) {
+                throw new IllegalArgumentException("parentTable must not be empty");
+            }
+            this.externalPartitionMatchers.add((parent, partition) -> parent.equals(parentTable));
+            return this;
+        }
+
+        /** Coexists with runtime partitions of {@code parentTable} whose names start with {@code namePrefix}. */
+        public Builder externalPartitions(String parentTable, String namePrefix) {
+            if (parentTable == null) {
+                throw new NullPointerException("parentTable");
+            }
+            if (parentTable.isEmpty()) {
+                throw new IllegalArgumentException("parentTable must not be empty");
+            }
+            if (namePrefix == null) {
+                throw new NullPointerException("namePrefix");
+            }
+            this.externalPartitionMatchers.add((parent, partition) ->
+                    parent.equals(parentTable) && partition.startsWith(namePrefix));
+            return this;
+        }
+
+        /** Coexists with runtime partitions accepted by {@code matcher}. */
+        public Builder externalPartitions(BiPredicate<String, String> matcher) {
+            if (matcher == null) {
+                throw new NullPointerException("matcher");
+            }
+            this.externalPartitionMatchers.add(matcher);
+            return this;
+        }
+
+        /** Limits which unexpected objects prune may drop in every namespace. */
+        public Builder pruneFilter(Predicate<ObjectId> allowPrune) {
+            if (allowPrune == null) {
+                throw new NullPointerException("allowPrune");
+            }
+            this.pruneFilter = allowPrune;
+            return this;
+        }
+
+        /** Registers the shared hook store forwarded to every namespace. */
+        public Builder hookStore(HookStore hookStore) {
+            if (hookStore == null) {
+                throw new NullPointerException("hookStore");
+            }
+            this.hookStore = hookStore;
             return this;
         }
 
@@ -208,7 +267,14 @@ public final class MultiNamespaceReconciler {
                         .lockTimeout(lockTimeout)
                         .listener(listener)
                         .filter(objectFilter)
-                        .concurrentIndexes(concurrentIndexes);
+                        .concurrentIndexes(concurrentIndexes)
+                        .pruneFilter(pruneFilter);
+                for (final var matcher : externalPartitionMatchers) {
+                    b.externalPartitions(matcher);
+                }
+                if (hookStore != null) {
+                    b.hookStore(hookStore);
+                }
                 if (scratchDataSource != null) {
                     b.scratchDataSource(scratchDataSource);
                 }

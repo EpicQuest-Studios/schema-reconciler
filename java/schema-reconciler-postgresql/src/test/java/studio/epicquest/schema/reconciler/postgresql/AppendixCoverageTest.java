@@ -27,7 +27,6 @@ class AppendixCoverageTest {
     /** {setup SQL (run in the schema, search_path bound), expected OTHER name prefix}.
      *  A third element {@code "super"} marks cases that need a superuser. */
     private static final String[][] CASES = {
-        {"CREATE TABLE pt2 (k int) PARTITION BY RANGE (k); CREATE INDEX pix ON pt2 (k)", "partindex:"},
         {"CREATE TABLE parent (id int); CREATE TABLE child () INHERITS (parent)", "inherited:"},
         {"CREATE DEFAULT CONVERSION conv FOR 'LATIN1' TO 'UTF8' FROM iso8859_1_to_utf8",
                 "conversion:"},

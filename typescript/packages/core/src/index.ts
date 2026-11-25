@@ -44,3 +44,7 @@ export * from "./spi/DialectCapabilities.ts";
 export * from "./spi/RenderOptions.ts";
 export { registerDialect, registeredDialects, unregisterDialect }
         from "./internal/dialects.ts";
+export * from "./HookPhase.ts";
+export * from "./HookContext.ts";
+export * from "./SchemaHook.ts";
+export * from "./HookStore.ts";

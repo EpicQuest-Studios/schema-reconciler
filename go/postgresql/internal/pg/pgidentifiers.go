@@ -67,6 +67,81 @@ func IsConstantDefault(expression string) bool {
 	return false
 }
 
+// StripIndexOnOnly removes the leading ONLY table qualifier pg_get_indexdef
+// emits for a valid partitioned index, so the managed create recurses to
+// child partitions. The scan is identifier-aware for quoted index names.
+func StripIndexOnOnly(definition string) string {
+	pos := skipSpace(definition, 0)
+	pos = consumeIdentWord(definition, pos, "CREATE")
+	if pos < 0 {
+		return definition
+	}
+	pos = skipSpace(definition, pos)
+	if end := consumeIdentWord(definition, pos, "UNIQUE"); end >= 0 {
+		pos = skipSpace(definition, end)
+	}
+	pos = consumeIdentWord(definition, pos, "INDEX")
+	if pos < 0 {
+		return definition
+	}
+	pos = skipSpace(definition, pos)
+	if pos >= len(definition) {
+		return definition
+	}
+	if definition[pos] == '"' {
+		pos++
+		for pos < len(definition) {
+			if definition[pos] == '"' {
+				if pos+1 < len(definition) && definition[pos+1] == '"' {
+					pos += 2
+				} else {
+					pos++
+					break
+				}
+			} else {
+				pos++
+			}
+		}
+	} else {
+		for pos < len(definition) && !asciiSpace(definition[pos]) {
+			pos++
+		}
+	}
+	pos = skipSpace(definition, pos)
+	pos = consumeIdentWord(definition, pos, "ON")
+	if pos < 0 {
+		return definition
+	}
+	pos = skipSpace(definition, pos)
+	onlyEnd := consumeIdentWord(definition, pos, "ONLY")
+	if onlyEnd < 0 || onlyEnd >= len(definition) || !asciiSpace(definition[onlyEnd]) {
+		return definition
+	}
+	return definition[:pos] + definition[skipSpace(definition, onlyEnd):]
+}
+
+func asciiSpace(b byte) bool {
+	return b == ' ' || b == '\t' || b == '\n' || b == '\r' || b == '\f' || b == '\v'
+}
+
+func skipSpace(text string, pos int) int {
+	for pos < len(text) && asciiSpace(text[pos]) {
+		pos++
+	}
+	return pos
+}
+
+func consumeIdentWord(text string, pos int, word string) int {
+	if pos+len(word) > len(text) || !strings.EqualFold(text[pos:pos+len(word)], word) {
+		return -1
+	}
+	end := pos + len(word)
+	if end == len(text) || asciiSpace(text[end]) {
+		return end
+	}
+	return -1
+}
+
 // ScratchName renders a scratch namespace name (6.3.1):
 // `<target>__rcl_<12 hex>`, truncated to 63 bytes. The prefix is
 // lower-cased: unquoted references fold to lowercase, so only a fold-safe

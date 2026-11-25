@@ -44,6 +44,7 @@ func ReadSnapshot(ctx context.Context, conn spi.Conn, namespace string) (model.S
 			return model.SchemaSnapshot{}, err
 		}
 	}
+	d.depInvalidPartitionedIndexesOnPartitions()
 	d.computeDumpSql()
 	return d.snapshot()
 }
@@ -690,8 +691,6 @@ func (d *catalogData) loadRelations(ctx context.Context, conn spi.Conn) error {
 		// a documented category prefix per relkind (3.3):
 		// tolerating one non-managed relation kind must
 		// not exempt the others
-		case "I":
-			id = &model.ObjectId{Kind: model.KindOther, Name: "partindex:" + name}
 		// a standalone composite's 'c' row is the type's
 		// backing — the managed TYPE object claims it in
 		// loadComposites
@@ -979,17 +978,26 @@ func (d *catalogData) loadIndexes(ctx context.Context, conn spi.Conn) error {
 			continue
 		}
 		name := str(r["relname"])
+		relkind := str(r["relkind"])
 		parent := str(r["parent"])
 		def := str(r["def"])
+		valid := boolOf(r["valid"])
 		id := model.ObjectId{Kind: model.KindIndex, Name: name, Parent: parent}
 		d.relByOid[oid] = id
 		qName, err := Quote(name)
 		if err != nil {
 			return err
 		}
+		createSQL := def
+		if relkind == "I" && valid {
+			createSQL = StripIndexOnOnly(def)
+		}
 		attrs := map[string]string{
-			AttrCreateSQL: def,
+			AttrCreateSQL: createSQL,
 			AttrDropSQL:   "DROP INDEX " + d.qNs + "." + qName,
+		}
+		if relkind == "I" {
+			attrs[AttrPartitionedIndex] = "true"
 		}
 		if boolOf(r["replident"]) {
 			qParent, err := d.tableRef(parent)
@@ -999,12 +1007,31 @@ func (d *catalogData) loadIndexes(ctx context.Context, conn spi.Conn) error {
 			attrs[AttrPostSQL] = "ALTER TABLE " + qParent +
 				" REPLICA IDENTITY USING INDEX " + qName
 		}
-		if !boolOf(r["valid"]) {
+		if !valid {
 			def += ";valid=false"
 		}
 		d.define(id, def, attrs)
 	}
 	return nil
+}
+
+// depInvalidPartitionedIndexesOnPartitions ties intentionally invalid
+// partitioned indexes to partitions of their parent. CREATE INDEX ... ON ONLY
+// is order-sensitive: when partitions already exist it stays invalid, while
+// creating it before those partitions can converge as valid once they attach.
+func (d *catalogData) depInvalidPartitionedIndexesOnPartitions() {
+	for id, object := range d.objects {
+		if id.Kind != model.KindIndex || object.attrs[AttrPartitionedIndex] != "true" ||
+			object.def.Canonical() == "" ||
+			!strings.HasSuffix(object.def.Canonical(), ";valid=false") || id.Parent == "" {
+			continue
+		}
+		for partition := range d.objects {
+			if partition.Kind == model.KindPartition && partition.Parent == id.Parent {
+				d.dep(&id, &partition)
+			}
+		}
+	}
 }
 
 func (d *catalogData) loadViews(ctx context.Context, conn spi.Conn) error {

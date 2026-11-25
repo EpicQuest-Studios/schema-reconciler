@@ -20,7 +20,7 @@ import (
 // fakeRelationNamespaceOthers are the OTHER categories whose stripped names
 // occupy the relation namespace (mirrors PgRender).
 var fakeRelationNamespaceOthers = map[string]struct{}{
-	"inherited": {}, "partindex": {}, "toast": {}, "relation": {}, "type": {},
+	"inherited": {}, "toast": {}, "relation": {}, "type": {},
 }
 
 type fakeDialect struct {

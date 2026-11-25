@@ -38,6 +38,8 @@ public final class PgCatalog {
 
     /** Attribute keys used by the renderer. */
     public static final String CREATE_SQL = "createSql";
+    /** True when the index itself is a relkind 'I' partitioned index. */
+    public static final String PARTITIONED_INDEX = "partitionedIndex";
     public static final String DROP_SQL = "dropSql";
     public static final String POST_SQL = "postSql";
     public static final String OWNED_SQL = "ownedSql";
@@ -110,6 +112,7 @@ public final class PgCatalog {
         data.loadOther(conn);
         data.loadComments(conn);
         data.loadDependencies(conn);
+        data.depInvalidPartitionedIndexesOnPartitions();
         data.loadExternalDependents(conn);
         data.computeDumpSql();
         return data.snapshot();
@@ -353,8 +356,7 @@ public final class PgCatalog {
                             // a documented category prefix per relkind (3.3):
                             // tolerating one non-managed relation kind must
                             // not exempt the others
-                            case "I" -> new ObjectId(ObjectKind.OTHER, "partindex:" + name);
-                            // a standalone composite's 'c' row is the type's
+                                // a standalone composite's 'c' row is the type's
                             // backing — the managed TYPE object claims it in
                             // loadComposites
                             case "c" -> null;
@@ -616,18 +618,52 @@ public final class PgCatalog {
                             continue;
                         }
                         final var name = rs.getString("relname");
+                        final var relkind = rs.getString("relkind");
                         final var parent = rs.getString("parent");
                         final var def = rs.getString("def");
+                        final var valid = rs.getBoolean("valid");
                         final var id = new ObjectId(ObjectKind.INDEX, name, parent);
                         relByOid.put(rs.getLong("oid"), id);
                         final var attrs = new LinkedHashMap<String, String>();
-                        attrs.put(CREATE_SQL, def);
+                        attrs.put(CREATE_SQL, "I".equals(relkind) && valid
+                                ? PgIdentifiers.stripIndexOnOnly(def) : def);
+                        if ("I".equals(relkind)) {
+                            attrs.put(PARTITIONED_INDEX, "true");
+                        }
                         attrs.put(DROP_SQL, "DROP INDEX " + qNs + "." + PgIdentifiers.quote(name));
                         if (rs.getBoolean("replident")) {
                             attrs.put(POST_SQL, "ALTER TABLE " + tableRef(parent)
                                     + " REPLICA IDENTITY USING INDEX " + PgIdentifiers.quote(name));
                         }
-                        define(id, def + (rs.getBoolean("valid") ? "" : ";valid=false"), attrs);
+                        define(id, def + (valid ? "" : ";valid=false"), attrs);
+                    }
+                }
+            }
+        }
+
+        /**
+         * `CREATE INDEX ... ON ONLY` is order-sensitive: when partitions
+         * already exist it leaves the partitioned parent invalid, while
+         * creating it before those partitions can converge as valid once
+         * they attach. Tie an intentionally invalid partitioned index to the
+         * desired/actual partitions of its parent so creation order
+         * preserves that distinction.
+         */
+        void depInvalidPartitionedIndexesOnPartitions() {
+            for (final var entry : objects.entrySet()) {
+                final var id = entry.getKey();
+                final var object = entry.getValue();
+                if (id.kind() != ObjectKind.INDEX
+                        || !"true".equals(object.attrs.get(PARTITIONED_INDEX))
+                        || object.def == null
+                        || !object.def.canonical().endsWith(";valid=false")
+                        || id.parent().isEmpty()) {
+                    continue;
+                }
+                for (final var partition : objects.keySet()) {
+                    if (partition.kind() == ObjectKind.PARTITION
+                            && partition.parent().equals(id.parent())) {
+                        dep(id, partition);
                     }
                 }
             }

@@ -67,7 +67,7 @@ SELECT c.oid, c.relname, c.relkind, c.relpersistence,
 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
 LEFT JOIN pg_foreign_table f ON f.ftrelid = c.oid
 LEFT JOIN pg_foreign_server s ON s.oid = f.ftserver
-WHERE n.nspname = ? AND c.relkind IN ('r','v','m','f','p','c','t','I','S')
+WHERE n.nspname = ? AND c.relkind IN ('r','v','m','f','p','c','t','S')
 ORDER BY c.oid
 
 -- name: columns
@@ -119,14 +119,14 @@ WHERE n.nspname = ? AND c.contype IN ('p','u','f','c','x')
 ORDER BY c.oid
 
 -- name: indexes
-SELECT i.indexrelid AS oid, ic.relname, tc.relname AS parent,
+SELECT i.indexrelid AS oid, ic.relname, ic.relkind, tc.relname AS parent,
        pg_get_indexdef(i.indexrelid) AS def, i.indisreplident AS replident,
        i.indisvalid AS valid
 FROM pg_index i
 JOIN pg_class ic ON ic.oid = i.indexrelid
 JOIN pg_class tc ON tc.oid = i.indrelid
 JOIN pg_namespace n ON n.oid = ic.relnamespace
-WHERE n.nspname = ? AND ic.relkind = 'i'
+WHERE n.nspname = ? AND ic.relkind IN ('i', 'I')
   AND NOT EXISTS (SELECT 1 FROM pg_constraint co
                   WHERE co.conindid = i.indexrelid
                     AND co.contype IN ('p','u','x'))

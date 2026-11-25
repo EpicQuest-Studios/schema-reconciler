@@ -1,4 +1,5 @@
 import { ConfigurationException } from "./ConfigurationException.ts";
+import { IllegalArgumentError } from "./IllegalArgumentError.ts";
 import type { DesiredState } from "./DesiredState.ts";
 import { Duration } from "./Duration.ts";
 import { MultiReconcileReport } from "./MultiReconcileReport.ts";
@@ -8,6 +9,8 @@ import { ReconcilePolicy } from "./ReconcilePolicy.ts";
 import type { ReconcileReport } from "./ReconcileReport.ts";
 import { Builder as SchemaReconcilerBuilder, SchemaReconciler }
         from "./SchemaReconciler.ts";
+import type { HookStore } from "./HookStore.ts";
+import type { ExternalPartitionMatcher } from "./internal/ExternalPartitions.ts";
 import type { ObjectId } from "./model/ObjectId.ts";
 import type { ReconcilePlan } from "./model/ReconcilePlan.ts";
 import type { Dialect } from "./spi/Dialect.ts";
@@ -102,6 +105,9 @@ export class MultiNamespaceBuilder {
     private listener_: ReconcileListener = {};
     private objectFilter_: (id: ObjectId) => boolean = () => true;
     private concurrentIndexes_ = false;
+    private externalPartitionMatchers_: ExternalPartitionMatcher[] = [];
+    private pruneFilter_: (id: ObjectId) => boolean = () => true;
+    private hookStore_: HookStore | undefined;
     private readonly namespaces_: Registration[] = [];
 
     dataSource(dataSource: SqlDataSource): this {
@@ -173,6 +179,55 @@ export class MultiNamespaceBuilder {
         return this;
     }
 
+    /** Coexists with externally managed runtime partitions in every namespace. */
+    externalPartitions(parentTable: string,
+            match?: string | RegExp | ((partitionName: string) => boolean)): this;
+    externalPartitions(matcher: (parentTable: string, partitionName: string) => boolean): this;
+    externalPartitions(parentOrMatcher: string | ((parentTable: string, partitionName: string) => boolean),
+            match?: string | RegExp | ((partitionName: string) => boolean)): this {
+        if (typeof parentOrMatcher === "function") {
+            this.externalPartitionMatchers_.push(parentOrMatcher);
+            return this;
+        }
+        if (parentOrMatcher == null || parentOrMatcher === "") {
+            throw new IllegalArgumentError("parentTable must not be empty");
+        }
+        if (match === null) {
+            throw new TypeError("match must not be null");
+        }
+        if (match === undefined) {
+            this.externalPartitionMatchers_.push((parent, _partition) => parent === parentOrMatcher);
+        } else if (typeof match === "string") {
+            this.externalPartitionMatchers_.push((parent, partition) =>
+                    parent === parentOrMatcher && partition.startsWith(match));
+        } else if (match instanceof RegExp) {
+            this.externalPartitionMatchers_.push((parent, partition) =>
+                    parent === parentOrMatcher && match.test(partition));
+        } else {
+            this.externalPartitionMatchers_.push((parent, partition) =>
+                    parent === parentOrMatcher && match(partition));
+        }
+        return this;
+    }
+
+    /** Limits which unexpected objects prune may drop in every namespace. */
+    pruneFilter(allowPrune: (id: ObjectId) => boolean): this {
+        if (allowPrune == null) {
+            throw new TypeError("allowPrune is required");
+        }
+        this.pruneFilter_ = allowPrune;
+        return this;
+    }
+
+    /** Registers the shared hook store forwarded to every namespace. */
+    hookStore(store: HookStore): this {
+        if (store == null) {
+            throw new TypeError("store is required");
+        }
+        this.hookStore_ = store;
+        return this;
+    }
+
     /**
      * Registers a target namespace, preserving execution order. The
      * {@code desiredState} may be omitted only when the reconciler is
@@ -219,7 +274,14 @@ export class MultiNamespaceBuilder {
                     .lockTimeout(this.lockTimeout_)
                     .listener(this.listener_)
                     .filter(this.objectFilter_)
-                    .concurrentIndexes(this.concurrentIndexes_);
+                    .concurrentIndexes(this.concurrentIndexes_)
+                    .pruneFilter(this.pruneFilter_);
+            for (const matcher of this.externalPartitionMatchers_) {
+                b.externalPartitions(matcher);
+            }
+            if (this.hookStore_ !== undefined) {
+                b.hookStore(this.hookStore_);
+            }
             if (this.scratchDataSource_ !== undefined) {
                 b.scratchDataSource(this.scratchDataSource_);
             }

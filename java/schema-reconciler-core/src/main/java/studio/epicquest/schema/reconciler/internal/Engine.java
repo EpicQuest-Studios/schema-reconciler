@@ -12,6 +12,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.function.BiPredicate;
 import java.util.function.Predicate;
 import javax.sql.DataSource;
 import studio.epicquest.schema.reconciler.ApplyException;
@@ -19,6 +20,10 @@ import studio.epicquest.schema.reconciler.ConfigurationException;
 import studio.epicquest.schema.reconciler.Decision;
 import studio.epicquest.schema.reconciler.DesiredState;
 import studio.epicquest.schema.reconciler.DesiredStateException;
+import studio.epicquest.schema.reconciler.HookPhase;
+import studio.epicquest.schema.reconciler.HookContext;
+import studio.epicquest.schema.reconciler.HookStore;
+import studio.epicquest.schema.reconciler.SchemaHook;
 import studio.epicquest.schema.reconciler.LockTimeoutException;
 import studio.epicquest.schema.reconciler.PlanningException;
 import studio.epicquest.schema.reconciler.ReconcileListener;
@@ -111,10 +116,16 @@ public final class Engine {
     private final Predicate<ObjectId> objectFilter;
     private final boolean concurrentIndexes;
     private final List<RenameHint> renameHints;
+    private final List<ObjectId> configuredRetireTargets;
+    private final List<BiPredicate<String, String>> externalPartitionMatchers;
+    private final Predicate<ObjectId> pruneFilter;
+    private final List<SchemaHook> hooks;
+    private final HookStore hookStore;
     private final DialectResolver resolver;
     private final Map<IdentityKey, PlanMeta> planMeta = new HashMap<>();
     private final ReferenceQueue<ReconcilePlan> collectedPlans = new ReferenceQueue<>();
     private List<RenameHint> scriptHints = List.of();
+    private List<ObjectId> scriptRetireTargets = List.of();
 
     public Engine(DataSource dataSource, DataSource scratchDataSource, String namespace,
                   DesiredState desiredState, Dialect dialect, ReconcilePolicy policy,
@@ -122,7 +133,7 @@ public final class Engine {
                   ReconcileListener listener, Predicate<ObjectId> objectFilter) {
         this(dataSource, scratchDataSource, namespace, desiredState, dialect,
                 policy, lockTimeout, statementTimeout, listener, objectFilter,
-                false, List.of());
+                false, List.of(), List.of(), List.of(), id -> true, List.of(), null);
     }
 
     public Engine(DataSource dataSource, DataSource scratchDataSource, String namespace,
@@ -130,6 +141,21 @@ public final class Engine {
                   Duration lockTimeout, Duration statementTimeout,
                   ReconcileListener listener, Predicate<ObjectId> objectFilter,
                   boolean concurrentIndexes, List<RenameHint> renameHints) {
+        this(dataSource, scratchDataSource, namespace, desiredState, dialect,
+                policy, lockTimeout, statementTimeout, listener, objectFilter,
+                concurrentIndexes, renameHints, List.of(), List.of(), id -> true,
+                List.of(), null);
+    }
+
+    public Engine(DataSource dataSource, DataSource scratchDataSource, String namespace,
+                  DesiredState desiredState, Dialect dialect, ReconcilePolicy policy,
+                  Duration lockTimeout, Duration statementTimeout,
+                  ReconcileListener listener, Predicate<ObjectId> objectFilter,
+                  boolean concurrentIndexes, List<RenameHint> renameHints,
+                  List<ObjectId> retireTargets,
+                  List<BiPredicate<String, String>> externalPartitionMatchers,
+                  Predicate<ObjectId> pruneFilter, List<SchemaHook> hooks,
+                  HookStore hookStore) {
         this.dataSource = dataSource;
         this.scratchDataSource = scratchDataSource;
         this.namespace = namespace;
@@ -138,9 +164,21 @@ public final class Engine {
         this.lockTimeout = lockTimeout;
         this.statementTimeout = statementTimeout;
         this.listener = listener;
-        this.objectFilter = objectFilter;
         this.concurrentIndexes = concurrentIndexes;
-        this.renameHints = renameHints;
+        this.renameHints = List.copyOf(renameHints);
+        this.configuredRetireTargets = List.copyOf(retireTargets);
+        this.externalPartitionMatchers = List.copyOf(externalPartitionMatchers);
+        this.pruneFilter = pruneFilter;
+        this.hookStore = hookStore;
+        final var managed = hookStore == null ? java.util.Optional.<ObjectId>empty()
+                : hookStore.managedTable(namespace);
+        this.objectFilter = managed.<Predicate<ObjectId>>map(table ->
+                id -> !id.equals(table) && objectFilter.test(id)).orElse(objectFilter);
+        this.hooks = hooks.stream()
+                .sorted(java.util.Comparator.comparing(SchemaHook::phase)
+                        .thenComparingInt(SchemaHook::order)
+                        .thenComparing(SchemaHook::id))
+                .toList();
         this.resolver = new DialectResolver(dialect);
     }
 
@@ -178,7 +216,7 @@ public final class Engine {
             t = clock.now();
             final PlanBuilder.Built built;
             try {
-                built = buildPlan(session, actual, desired);
+                built = buildPlan(session, effectiveActual(actual, desired), desired);
             } finally {
                 clock.plan = clock.since(t);
             }
@@ -222,17 +260,18 @@ public final class Engine {
             } finally {
                 clock.loadDesired = clock.since(t);
             }
+            final var effectiveActual = effectiveActual(actual, desired);
             t = clock.now();
             final PlanBuilder.Built built;
             try {
-                built = buildPlan(session, actual, desired);
+                built = buildPlan(session, effectiveActual, desired);
             } finally {
                 clock.plan = clock.since(t);
             }
             notifyPlanned(built.plan(), List.of());
             PolicyEvaluator.Evaluation evaluation =
                     new PolicyEvaluator(session.dialect, policy)
-                            .evaluate(built.plan(), actual, desired);
+                            .evaluate(built.plan(), effectiveActual, desired);
             final var outcome = applyAndVerify(session, built.plan(), evaluation,
                     built.coveredByParent(), clock, desired);
             session.commit();
@@ -276,7 +315,9 @@ public final class Engine {
             } finally {
                 clock.readActual = clock.since(t);
             }
-            verifyPlan(plan, session.dialect, actual);
+            if (externalPartitionMatchers.isEmpty()) {
+                verifyPlan(plan, session.dialect, actual);
+            }
             t = clock.now();
             final SchemaSnapshot desired;
             try {
@@ -284,10 +325,14 @@ public final class Engine {
             } finally {
                 clock.loadDesired = clock.since(t);
             }
+            final var effectiveActual = effectiveActual(actual, desired);
+            if (!externalPartitionMatchers.isEmpty()) {
+                verifyPlan(plan, session.dialect, effectiveActual);
+            }
             notifyPlanned(plan, List.of());
             PolicyEvaluator.Evaluation evaluation =
                     new PolicyEvaluator(session.dialect, policy)
-                            .evaluate(plan, actual, desired);
+                            .evaluate(plan, effectiveActual, desired);
             Map<ObjectId, Map<ObjectId, Definition>> covered =
                     Optional.ofNullable(metaOf(plan))
                             .map(PlanMeta::coveredByParent)
@@ -316,7 +361,9 @@ public final class Engine {
     public String dump() {
         try (Session session = open(false)) {
             session.lock();
-            return DumpRenderer.render(session.dialect, namespace, session.readActual());
+            return DumpRenderer.render(session.dialect, namespace,
+                    ExternalPartitions.suppress(session.readActual(), null,
+                            externalPartitionMatchers, false));
         }
     }
 
@@ -368,8 +415,16 @@ public final class Engine {
         // verifies and commits
         final var deferred = new ArrayList<PlannedChange>();
         session.bindNamespace();
+        final var anyApply = plan.changes().stream()
+                .anyMatch(change -> evaluation.decisions().get(change) == Decision.APPLY);
+        // an up-to-date plan still runs hooks so run-once convergence work can
+        // be introduced without DDL; a purely reported plan must stay inert
+        final var hooksEligible = plan.changes().isEmpty() || anyApply;
         final var applyStart = clock.now();
         try {
+            if (hooksEligible) {
+                runHooks(session, HookPhase.PRE_APPLY, plan, applied);
+            }
             for (var change : plan.changes()) {
                 if (evaluation.decisions().get(change) == Decision.APPLY) {
                     if (change.nonTransactional()) {
@@ -393,6 +448,9 @@ public final class Engine {
                     notifyReported(change, applied);
                 }
             }
+            if (hooksEligible) {
+                runHooks(session, HookPhase.POST_APPLY, plan, applied);
+            }
         } finally {
             clock.apply = clock.since(applyStart);
         }
@@ -402,9 +460,11 @@ public final class Engine {
         } finally {
             clock.verify = clock.since(verifyStart);
         }
-        if (!deferred.isEmpty()) {
-            // commit the transactional work first: a non-transactional
-            // statement cannot run inside a transaction
+        // commit the transactional work before either non-transactional DDL or
+        // post-commit hooks; ordinary transactional work commits once in the caller
+        final var postCommit = hooksEligible && hooks.stream()
+                .anyMatch(hook -> hook.phase() == HookPhase.POST_COMMIT);
+        if (!deferred.isEmpty() || postCommit) {
             session.commit();
             session.autoCommit(true);
             final var phase1Count = applied.size();
@@ -412,17 +472,22 @@ public final class Engine {
                 for (final var change : deferred) {
                     executeChange(session, change, applied);
                 }
+                if (!deferred.isEmpty()) {
+                    final var deferredVerifyStart = clock.now();
+                    try {
+                        verify(session, applied.subList(phase1Count, applied.size()),
+                                coveredByParent, desired);
+                    } finally {
+                        clock.verify = clock.verify.plus(clock.since(deferredVerifyStart));
+                    }
+                }
+                if (postCommit) {
+                    runHooks(session, HookPhase.POST_COMMIT, plan, applied);
+                }
             } finally {
                 // restore the transactional session mode before the
                 // outer commit/close handling
                 session.autoCommit(false);
-            }
-            final var deferredVerifyStart = clock.now();
-            try {
-                verify(session, applied.subList(phase1Count, applied.size()),
-                        coveredByParent, desired);
-            } finally {
-                clock.verify = clock.verify.plus(clock.since(deferredVerifyStart));
             }
         }
         final var outcome = applied.isEmpty()
@@ -430,6 +495,44 @@ public final class Engine {
                         : ReconcileOutcome.REPORTED_ONLY)
                 : ReconcileOutcome.RECONCILED;
         return new RunOutcome(outcome, List.copyOf(applied), List.copyOf(reported));
+    }
+
+    /** Runs the deterministic hook slice of one phase, including run-once bookkeeping. */
+    private void runHooks(Session session, HookPhase phase, ReconcilePlan plan,
+                          List<PlannedChange> applied) {
+        for (final var hook : hooks) {
+            if (hook.phase() != phase) {
+                continue;
+            }
+            try {
+                final var checksum = hook.checksum() == null ? "" : hook.checksum();
+                var execute = true;
+                if (hook.runOnce()) {
+                    final var recorded = hookStore.recordedChecksum(
+                            session.conn, namespace, hook.id());
+                    if (recorded.isPresent() && recorded.orElseThrow().equals(checksum)) {
+                        execute = false;
+                    } else if (recorded.isPresent()) {
+                        throw new ApplyException("namespace '" + namespace + "': hook '"
+                                + hook.id() + "' is recorded with a different checksum",
+                                List.copyOf(applied), null);
+                    }
+                }
+                if (execute) {
+                    hook.run(new HookContext(namespace, session.dialect.id(), phase, plan,
+                            List.copyOf(applied), session.conn));
+                    if (hook.runOnce()) {
+                        hookStore.record(session.conn, namespace, hook.id(), phase, checksum);
+                    }
+                }
+            } catch (ApplyException e) {
+                throw e;
+            } catch (Exception e) {
+                throw new ApplyException("namespace '" + namespace + "': hook '" + hook.id()
+                        + "' failed in " + phase + ": " + e.getMessage(), e,
+                        List.copyOf(applied), null);
+            }
+        }
     }
 
     private void executeChange(Session session, PlannedChange change,
@@ -546,13 +649,23 @@ public final class Engine {
         }
     }
 
+    /** The actual snapshot external runtime partitions are hidden from. */
+    private SchemaSnapshot effectiveActual(SchemaSnapshot actual, SchemaSnapshot desired) {
+        return ExternalPartitions.suppress(actual, desired, externalPartitionMatchers, true);
+    }
+
     private PlanBuilder.Built buildPlan(Session session, SchemaSnapshot actual, SchemaSnapshot desired) {
         final var differences = Differ.diff(actual, desired, session.dialect);
         final var hints = new ArrayList<RenameHint>(renameHints.size() + scriptHints.size());
         hints.addAll(renameHints);
         hints.addAll(scriptHints);
+        final var retired = new ArrayList<ObjectId>(configuredRetireTargets.size()
+                + scriptRetireTargets.size());
+        retired.addAll(configuredRetireTargets);
+        retired.addAll(scriptRetireTargets);
         return new PlanBuilder(session.dialect, namespace, actual, desired,
-                policy.prune(), hints, new RenderOptions(concurrentIndexes, Map.of()))
+                policy.prune(), hints, retired, pruneFilter,
+                new RenderOptions(concurrentIndexes, Map.of()))
                 .build(differences);
     }
 
@@ -596,6 +709,7 @@ public final class Engine {
                 ScriptProcessor processor =
                         new ScriptProcessor(desiredState.script(), namespace, scratchNamespace, session.dialect);
                 this.scriptHints = processor.renameHints();
+                this.scriptRetireTargets = processor.retireTargets();
                 if (!processor.hasPlaceholder()
                         && !session.dialect.capabilities().sessionDefaultNamespace()) {
                     throw new DesiredStateException("namespace '" + namespace

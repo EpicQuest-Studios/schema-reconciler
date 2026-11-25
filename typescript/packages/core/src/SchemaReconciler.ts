@@ -1,4 +1,5 @@
 import { ConfigurationException } from "./ConfigurationException.ts";
+import { IllegalArgumentError } from "./IllegalArgumentError.ts";
 import type { DesiredState } from "./DesiredState.ts";
 import { Duration } from "./Duration.ts";
 import type { ReconcileListener } from "./ReconcileListener.ts";
@@ -6,11 +7,15 @@ import { ReconcilePolicy } from "./ReconcilePolicy.ts";
 import type { ReconcileReport } from "./ReconcileReport.ts";
 import type { TimedPlan } from "./TimedPlan.ts";
 import { Engine } from "./internal/Engine.ts";
+import type { ExternalPartitionMatcher } from "./internal/ExternalPartitions.ts";
 import { registeredDialects } from "./internal/dialects.ts";
 import type { ObjectId } from "./model/ObjectId.ts";
+import { ObjectKind } from "./model/ObjectKind.ts";
 import type { ReconcilePlan } from "./model/ReconcilePlan.ts";
 import { RenameHint } from "./model/RenameHint.ts";
 import type { Dialect } from "./spi/Dialect.ts";
+import type { HookStore } from "./HookStore.ts";
+import type { SchemaHook } from "./SchemaHook.ts";
 import type { SqlDataSource } from "./spi/Sql.ts";
 
 /**
@@ -90,6 +95,11 @@ export class Builder {
     private objectFilter_: (id: ObjectId) => boolean = () => true;
     private concurrentIndexes_ = false;
     private renameHints_: RenameHint[] = [];
+    private retireTargets_: ObjectId[] = [];
+    private externalPartitionMatchers_: ExternalPartitionMatcher[] = [];
+    private pruneFilter_: (id: ObjectId) => boolean = () => true;
+    private hooks_: SchemaHook[] = [];
+    private hookStore_: HookStore | undefined;
 
     dataSource(dataSource: SqlDataSource): this {
         if (dataSource == null) {
@@ -218,6 +228,78 @@ export class Builder {
         return this;
     }
 
+    /** Marks `id` for targeted retirement even when the prune policy is off. */
+    retire(id: ObjectId): this {
+        if (id == null) {
+            throw new TypeError("id is required");
+        }
+        if (id.kind === ObjectKind.OTHER) {
+            throw new IllegalArgumentError("OTHER objects cannot be retired: " + id);
+        }
+        this.retireTargets_.push(id);
+        return this;
+    }
+
+    /** Coexists with externally managed runtime partitions. */
+    externalPartitions(parentTable: string,
+            match?: string | RegExp | ((partitionName: string) => boolean)): this;
+    externalPartitions(matcher: (parentTable: string, partitionName: string) => boolean): this;
+    externalPartitions(parentOrMatcher: string | ((parentTable: string, partitionName: string) => boolean),
+            match?: string | RegExp | ((partitionName: string) => boolean)): this {
+        if (typeof parentOrMatcher === "function") {
+            this.externalPartitionMatchers_.push(parentOrMatcher);
+            return this;
+        }
+        if (parentOrMatcher == null || parentOrMatcher === "") {
+            throw new IllegalArgumentError("parentTable must not be empty");
+        }
+        if (match === null) {
+            throw new TypeError("match must not be null");
+        }
+        if (match === undefined) {
+            this.externalPartitionMatchers_.push((parent, _partition) => parent === parentOrMatcher);
+        } else if (typeof match === "string") {
+            this.externalPartitionMatchers_.push((parent, partition) =>
+                    parent === parentOrMatcher && partition.startsWith(match));
+        } else if (match instanceof RegExp) {
+            this.externalPartitionMatchers_.push((parent, partition) =>
+                    parent === parentOrMatcher && match.test(partition));
+        } else if (typeof match === "function") {
+            this.externalPartitionMatchers_.push((parent, partition) =>
+                    parent === parentOrMatcher && match(partition));
+        } else {
+            throw new TypeError("match must be a string, RegExp, or predicate");
+        }
+        return this;
+    }
+
+    /** Limits which unexpected objects prune may drop; visibility is unaffected. */
+    pruneFilter(allowPrune: (id: ObjectId) => boolean): this {
+        if (allowPrune == null) {
+            throw new TypeError("allowPrune is required");
+        }
+        this.pruneFilter_ = allowPrune;
+        return this;
+    }
+
+    /** Registers an ordered lifecycle hook (spec 3.8); repeatable. */
+    hook(hook: SchemaHook): this {
+        if (hook == null) {
+            throw new TypeError("hook is required");
+        }
+        this.hooks_.push(hook);
+        return this;
+    }
+
+    /** Registers the durable store checksum-protected run-once hooks use. */
+    hookStore(store: HookStore): this {
+        if (store == null) {
+            throw new TypeError("store is required");
+        }
+        this.hookStore_ = store;
+        return this;
+    }
+
     /**
      * Validates required properties and, when no dialect is set, that at
      * least one dialect is registered ({@link registerDialect}). Opens no
@@ -242,10 +324,36 @@ export class Builder {
                     "no Dialect provider registered for namespace "
                             + this.targetNamespace_);
         }
+        validateHooks(this.hooks_, this.hookStore_);
         return new SchemaReconciler(new Engine(
                 this.dataSource_, this.scratchDataSource_, this.targetNamespace_,
                 this.desiredState_, this.dialect_, this.policy_, this.lockTimeout_,
                 this.statementTimeout_, this.listener_, this.objectFilter_,
-                this.concurrentIndexes_, this.renameHints_));
+                this.concurrentIndexes_, this.renameHints_, this.retireTargets_,
+                this.externalPartitionMatchers_, this.pruneFilter_, this.hooks_,
+                this.hookStore_));
+    }
+}
+
+function validateHooks(hooks: readonly SchemaHook[], hookStore: HookStore | undefined): void {
+    const ids = new Set<string>();
+    for (const hook of hooks) {
+        if (hook.id == null || hook.id.trim() === "") {
+            throw new ConfigurationException("hook id must not be blank");
+        }
+        if (hook.phase == null) {
+            throw new ConfigurationException("hook '" + hook.id + "' has no phase");
+        }
+        if (typeof hook.run !== "function") {
+            throw new ConfigurationException("hook '" + hook.id + "' has no run action");
+        }
+        if (ids.has(hook.id)) {
+            throw new ConfigurationException("duplicate hook id '" + hook.id + "'");
+        }
+        ids.add(hook.id);
+        if (hook.runOnce === true && hookStore === undefined) {
+            throw new ConfigurationException("hook '" + hook.id
+                    + "' is runOnce but no hookStore is configured");
+        }
     }
 }

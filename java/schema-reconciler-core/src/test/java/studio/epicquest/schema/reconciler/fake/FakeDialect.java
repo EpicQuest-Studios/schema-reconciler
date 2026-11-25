@@ -226,7 +226,7 @@ public final class FakeDialect implements Dialect {
 
     /** OTHER categories whose stripped names occupy the relation namespace (mirrors PgRender). */
     private static final Set<String> RELATION_NAMESPACE_OTHERS = Set.of(
-            "inherited", "partindex",
+            "inherited",
             "toast", "relation", "type");
 
     @Override

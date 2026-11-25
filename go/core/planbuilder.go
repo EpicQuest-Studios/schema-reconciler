@@ -52,16 +52,23 @@ type planBuilder struct {
 	desired         model.SchemaSnapshot
 	prune           bool
 	renameHints     []model.RenameHint
+	retireTargets   []model.ObjectId
+	pruneFilter     ObjectFilter
 	options         spi.RenderOptions
 	renamedParents  map[string]string
 }
 
 func newPlanBuilder(d spi.Dialect, targetNamespace string,
 	actual, desired model.SchemaSnapshot, prune bool,
-	renameHints []model.RenameHint, options spi.RenderOptions) *planBuilder {
+	renameHints []model.RenameHint, retireTargets []model.ObjectId,
+	pruneFilter ObjectFilter, options spi.RenderOptions) *planBuilder {
+	if pruneFilter == nil {
+		pruneFilter = func(model.ObjectId) bool { return true }
+	}
 	return &planBuilder{
 		dialect: d, targetNamespace: targetNamespace, actual: actual,
 		desired: desired, prune: prune, renameHints: renameHints,
+		retireTargets: retireTargets, pruneFilter: pruneFilter,
 		options: options, renamedParents: map[string]string{},
 	}
 }
@@ -93,12 +100,16 @@ func (pb *planBuilder) build(differences []model.Difference) (*builtPlan, error)
 	// it depends on is dropped needs no DROP of its own — the parent's drop
 	// takes it down (indexes and constraints on a dropped table, owned
 	// sequences, mirrored annotations)
-	var pruned model.ObjectSet
-	if pb.prune {
-		pruned = pb.suppressedUnexpected(differences)
-	} else {
-		pruned = model.NewObjectSet()
+	retired, err := pb.activeRetireTargets()
+	if err != nil {
+		return nil, err
 	}
+	retireSet := model.NewObjectSet()
+	for _, id := range retired {
+		retireSet.Add(id)
+	}
+	pruneApproved := pb.pruneApproved(differences, retireSet)
+	pruned := pb.suppressedUnexpected(differences, pruneApproved)
 
 	// a parent rename carries its same-named children along: their
 	// UNEXPECTED(old.x)/MISSING(new.x) pairs are the same object with a
@@ -120,6 +131,19 @@ func (pb *planBuilder) build(differences []model.Difference) (*builtPlan, error)
 		}
 		changes = append(changes, rendered...)
 	}
+	for _, target := range retired {
+		if covered.Has(target) || pruned.Has(target) {
+			continue
+		}
+		have := pb.actual.Objects[target]
+		rendered, err := pb.renderRetired(model.Difference{
+			ID: target, Type: model.DifferenceUnexpected, Actual: &have.Definition,
+		})
+		if err != nil {
+			return nil, err
+		}
+		changes = append(changes, rendered...)
+	}
 	for _, d := range differences {
 		if covered.Has(d.ID) || pruned.Has(d.ID) {
 			continue
@@ -131,7 +155,7 @@ func (pb *planBuilder) build(differences []model.Difference) (*builtPlan, error)
 				return nil, err
 			}
 			changes = append(changes, rendered...)
-		case d.Type == model.DifferenceUnexpected && pb.prune && d.ID.Kind != model.KindOther:
+		case d.Type == model.DifferenceUnexpected && pruneApproved.Has(d.ID) && !retireSet.Has(d.ID):
 			rendered, err := pb.render(d)
 			if err != nil {
 				return nil, err
@@ -139,9 +163,7 @@ func (pb *planBuilder) build(differences []model.Difference) (*builtPlan, error)
 			changes = append(changes, rendered...)
 		}
 	}
-	if !pb.prune {
-		changes = append(changes, pb.tableShapeConflicts(differences, covered)...)
-	}
+	changes = append(changes, pb.tableShapeConflicts(differences, covered, pruneApproved)...)
 	kept := changes[:0]
 	for _, c := range changes {
 		if !covered.Has(c.Target) {
@@ -327,7 +349,8 @@ var pruneMirrored = map[model.ObjectKind]struct{}{
 // ordinary dependents need their own standalone DROP (5.5); only
 // containment, serial ownership and mirrored annotations are implicit
 // removals.
-func (pb *planBuilder) suppressedUnexpected(differences []model.Difference) model.ObjectSet {
+func (pb *planBuilder) suppressedUnexpected(differences []model.Difference,
+	approved model.ObjectSet) model.ObjectSet {
 	unexpected := model.NewObjectSet()
 	for _, d := range differences {
 		if d.Type == model.DifferenceUnexpected && d.ID.Kind != model.KindOther {
@@ -335,35 +358,140 @@ func (pb *planBuilder) suppressedUnexpected(differences []model.Difference) mode
 		}
 	}
 	suppressed := model.NewObjectSet()
-	if len(unexpected) == 0 {
+	if len(unexpected) == 0 || len(approved) == 0 {
 		return suppressed
 	}
 	prereqs := prerequisitesOf(pb.dialect, pb.actual)
 	for id := range unexpected {
 		deps := prereqs[id]
-		if containedInUnexpectedParent(id, deps, unexpected) ||
-			serialOwnedByUnexpectedTable(id, deps, unexpected) ||
-			mirroredOnUnexpected(id, deps, unexpected) {
+		if containedInUnexpectedParent(id, deps, approved) ||
+			serialOwnedByUnexpectedTable(id, deps, approved) ||
+			mirroredOnUnexpected(id, deps, approved) {
 			suppressed.Add(id)
 		}
 	}
 	return suppressed
 }
 
-func containedInUnexpectedParent(id model.ObjectId, prereqs, unexpected model.ObjectSet) bool {
-	if _, ok := pruneContained[id.Kind]; !ok || id.Parent == "" {
+func (pb *planBuilder) activeRetireTargets() ([]model.ObjectId, error) {
+	var active []model.ObjectId
+	seen := model.NewObjectSet()
+	for _, target := range pb.retireTargets {
+		if _, ok := pb.desired.Objects[target]; ok {
+			return nil, NewPlanningErrorf("namespace '%s': retire target %s is present in the desired state",
+				pb.targetNamespace, target)
+		}
+		for _, hint := range pb.renameHints {
+			if target == hint.From || target == hint.To {
+				return nil, NewPlanningErrorf("namespace '%s': %s is both a retire target and a rename endpoint",
+					pb.targetNamespace, target)
+			}
+		}
+		if _, ok := pb.actual.Objects[target]; ok && !seen.Has(target) {
+			seen.Add(target)
+			active = append(active, target)
+		}
+	}
+	slices.SortFunc(active, func(a, b model.ObjectId) int { return a.Compare(b) })
+	return active, nil
+}
+
+func (pb *planBuilder) pruneApproved(differences []model.Difference, retired model.ObjectSet) model.ObjectSet {
+	unexpected := model.NewObjectSet()
+	for _, d := range differences {
+		if d.Type == model.DifferenceUnexpected && d.ID.Kind != model.KindOther {
+			unexpected.Add(d.ID)
+		}
+	}
+	approved := model.NewObjectSet()
+	for id := range retired {
+		approved.Add(id)
+	}
+	if !pb.prune {
+		return approved
+	}
+	protectedObjects := pb.protectedUnexpected(unexpected)
+	for id := range unexpected {
+		if pb.pruneFilter(id) && !protectedObjects.Has(id) {
+			approved.Add(id)
+		}
+	}
+	return approved
+}
+
+func (pb *planBuilder) protectedUnexpected(unexpected model.ObjectSet) model.ObjectSet {
+	prereqs := prerequisitesOf(pb.dialect, pb.actual)
+	protectedObjects := model.NewObjectSet()
+	for id := range unexpected {
+		if _, container := pruneContainers[id.Kind]; container && !pb.pruneFilter(id) {
+			protectedObjects.Add(id)
+		}
+	}
+	containment := map[model.ObjectKind]bool{}
+	for kind := range pruneContained {
+		containment[kind] = true
+	}
+	containment[model.KindPartition] = true
+	for changed := true; changed; {
+		changed = false
+		for id := range unexpected {
+			if protectedObjects.Has(id) {
+				continue
+			}
+			deps := prereqs[id]
+			contained := false
+			serial := false
+			mirrored := false
+			for dep := range deps {
+				if !protectedObjects.Has(dep) {
+					continue
+				}
+				if id.Parent != "" && containment[id.Kind] && dep.Name == id.Parent {
+					contained = true
+				}
+				if id.Kind == model.KindSequence {
+					serial = true
+				}
+				if _, mirroredKind := pruneMirrored[id.Kind]; mirroredKind {
+					mirrored = true
+				}
+			}
+			if contained || serial || mirrored {
+				protectedObjects.Add(id)
+				changed = true
+			}
+		}
+	}
+	return protectedObjects
+}
+
+func (pb *planBuilder) renderRetired(difference model.Difference) ([]model.PlannedChange, error) {
+	rendered, err := pb.render(difference)
+	if err != nil {
+		return nil, err
+	}
+	for i := range rendered {
+		rendered[i].Reason = "retired " + difference.ID.String()
+	}
+	return rendered, nil
+}
+
+
+func containedInUnexpectedParent(id model.ObjectId, prereqs model.ObjectSet,
+	unexpected model.ObjectSet) bool {
+	if _, containedKind := pruneContained[id.Kind]; !containedKind || id.Parent == "" {
 		return false
 	}
 	for dep := range prereqs {
-		if _, container := pruneContainers[dep.Kind]; unexpected.Has(dep) &&
-			container && dep.Name == id.Parent {
+		if _, container := pruneContainers[dep.Kind]; unexpected.Has(dep) && container && dep.Name == id.Parent {
 			return true
 		}
 	}
 	return false
 }
 
-func serialOwnedByUnexpectedTable(id model.ObjectId, prereqs, unexpected model.ObjectSet) bool {
+func serialOwnedByUnexpectedTable(id model.ObjectId, prereqs model.ObjectSet,
+	unexpected model.ObjectSet) bool {
 	if id.Kind != model.KindSequence {
 		return false
 	}
@@ -375,8 +503,9 @@ func serialOwnedByUnexpectedTable(id model.ObjectId, prereqs, unexpected model.O
 	return false
 }
 
-func mirroredOnUnexpected(id model.ObjectId, prereqs, unexpected model.ObjectSet) bool {
-	if _, ok := pruneMirrored[id.Kind]; !ok {
+func mirroredOnUnexpected(id model.ObjectId, prereqs model.ObjectSet,
+	unexpected model.ObjectSet) bool {
+	if _, mirroredKind := pruneMirrored[id.Kind]; !mirroredKind {
 		return false
 	}
 	for dep := range prereqs {
@@ -390,10 +519,7 @@ func mirroredOnUnexpected(id model.ObjectId, prereqs, unexpected model.ObjectSet
 func (pb *planBuilder) render(difference model.Difference) ([]model.PlannedChange, error) {
 	options := pb.options
 	if difference.Type == model.DifferenceUnexpected && len(pb.renamedParents) > 0 {
-		options = spi.RenderOptions{
-			ConcurrentIndexes: pb.options.ConcurrentIndexes,
-			RenamedParents:    pb.renamedParents,
-		}
+		options.RenamedParents = pb.renamedParents
 	}
 	snapshot := pb.desired
 	if difference.Type == model.DifferenceUnexpected {
@@ -405,11 +531,11 @@ func (pb *planBuilder) render(difference model.Difference) ([]model.PlannedChang
 // tableShapeConflicts is spec 5.5: an unexpected COLUMN on an expected
 // table is a table-shape conflict.
 func (pb *planBuilder) tableShapeConflicts(differences []model.Difference,
-	covered model.ObjectSet) []model.PlannedChange {
+	covered model.ObjectSet, pruneApproved model.ObjectSet) []model.PlannedChange {
 	var out []model.PlannedChange
 	for _, d := range differences {
 		if d.Type != model.DifferenceUnexpected || d.ID.Kind != model.KindColumn ||
-			covered.Has(d.ID) || d.ID.Parent == "" {
+			covered.Has(d.ID) || pruneApproved.Has(d.ID) || d.ID.Parent == "" {
 			continue
 		}
 		table := model.ObjectId{Kind: model.KindTable, Name: d.ID.Parent}
@@ -472,7 +598,7 @@ func (pb *planBuilder) addDependentRebuilds(changes *[]model.PlannedChange,
 					return NewPlanningErrorf("namespace '%s': %s depends on %s but is not part of the desired state",
 						pb.targetNamespace, dependent, dropped)
 				}
-				if pb.prune && (targets.Has(dependent) || pruned.Has(dependent)) {
+				if targets.Has(dependent) || pruned.Has(dependent) {
 					// under prune this in-namespace dependent is itself
 					// being dropped (or implicitly removed); no rebuild
 					continue

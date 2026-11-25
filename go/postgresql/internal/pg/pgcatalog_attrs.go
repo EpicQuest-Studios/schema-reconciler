@@ -3,6 +3,8 @@ package pg
 // Attribute keys used by the renderer (PgCatalog.ts).
 const (
 	AttrCreateSQL  = "createSql"
+	// AttrPartitionedIndex is true on a relkind I partitioned index.
+	AttrPartitionedIndex = "partitionedIndex"
 	AttrDropSQL    = "dropSql"
 	AttrPostSQL    = "postSql"
 	AttrOwnedSQL   = "ownedSql"

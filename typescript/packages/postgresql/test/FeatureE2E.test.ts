@@ -1,13 +1,15 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { Decision, Definition, DesiredState, Difference, DifferenceType,
+import { Decision, DesiredState, DifferenceType,
         IllegalArgumentError, LockLevel, MultiNamespaceReconciler,
         ObjectId, ObjectKind,
-        PlanningException, ReconcileOutcome, ReconcilePolicy,
-        ReconcilePlan, SchemaObject, SchemaReconciler, SchemaSnapshot,
+        PlanningException, ApplyException, PolicyViolationException,
+        ReconcileOutcome, ReconcilePolicy,
+        ReconcilePlan, SchemaReconciler,
         StalePlanException, ChangeAction, ChangeSafety }
         from "@epicquest-studios/schema-reconciler-core";
 import { PostgreSqlDialect } from "../src/PostgreSqlDialect.ts";
+import { PgHookStore } from "../src/PgHookStore.ts";
 import { PgTestDataSource, available, execute } from "./PgTestDatabase.ts";
 
 /**
@@ -217,26 +219,23 @@ describe("FeatureE2ETest", {
         }
     });
 
-    it("an index on a partitioned parent stays transactional", () => {
-        // PostgreSQL catalogues an index on a partitioned table as an
-        // unsupported partindex (relkind 'I'), so the partitioned-parent
-        // fallback can only be exercised on a synthetic snapshot
-        const tableId = new ObjectId(ObjectKind.TABLE, "p");
-        const indexId = new ObjectId(ObjectKind.INDEX, "i", "p");
-        const table = new SchemaObject(tableId, new Definition("t"), [],
-                new Map([["partkey", "(id)"]]));
-        const index = new SchemaObject(indexId, new Definition("i"), [],
-                new Map([["createSql", "CREATE INDEX \"i\" ON"
-                        + " ${namespace}.\"p\" (\"id\")"]]));
-        const desired = SchemaSnapshot.of([[tableId, table],
-                [indexId, index]]);
-        const changes = dialect.render(new Difference(indexId,
-                DifferenceType.MISSING, index.definition, undefined),
-                desired, "ns", { concurrentIndexes: true });
-        assert.equal(changes.length, 1);
-        assert.equal(changes[0]!.nonTransactional, false);
-        assert.ok(!changes[0]!.statements[0]!.includes("CONCURRENTLY"),
-                String(changes[0]!.statements[0]));
+    it("an index on a partitioned parent stays transactional", async () => {
+        const ns = await namespace();
+        try {
+            const script = "CREATE TABLE p (id int) PARTITION BY RANGE (id);"
+                    + " CREATE TABLE p1 PARTITION OF p FOR VALUES FROM (1) TO (10);"
+                    + " CREATE INDEX i ON p (id)";
+            const report = await reconciler(ns, script).concurrentIndexes(true)
+                    .build().reconcile();
+            const index = report.applied.find(c => c.target.kind === ObjectKind.INDEX);
+            assert.ok(index !== undefined);
+            assert.equal(index.nonTransactional, false);
+            assert.ok(!index.statements[0]!.includes("CONCURRENTLY"));
+            assert.equal((await reconciler(ns, script).concurrentIndexes(true)
+                    .build().reconcile()).outcome, ReconcileOutcome.UP_TO_DATE);
+        } finally {
+            await drop(ns);
+        }
     });
 
     it("concurrentIndexes off keeps plain CREATE INDEX", async () => {
@@ -675,4 +674,349 @@ describe("FeatureE2ETest", {
             await execute(ds, "DROP ROLE " + dialect.quoteIdentifier(role));
         }
     });
+
+    it("managed partitioned indexes reconcile, stay transactional, dump and rename", async () => {
+        const ns = await namespace();
+        try {
+            const script = "CREATE FUNCTION usage_day(timestamptz) RETURNS date"
+                    + " LANGUAGE sql IMMUTABLE AS $$ SELECT $1::date $$;"
+                    + " CREATE TABLE usage_records (tenant_account_id bigint,"
+                    + " created_at timestamptz NOT NULL,"
+                    + " CONSTRAINT usage_records_pkey PRIMARY KEY (created_at, tenant_account_id),"
+                    + " CONSTRAINT usage_records_tenant_key UNIQUE (tenant_account_id, created_at))"
+                    + " PARTITION BY RANGE (created_at);"
+                    + " CREATE TABLE usage_records_p2026_11 PARTITION OF usage_records"
+                    + " FOR VALUES FROM ('2026-11-01') TO ('2026-12-01');"
+                    + " CREATE INDEX usage_records_tenant_idx ON usage_records (tenant_account_id)"
+                    + " WHERE tenant_account_id IS NOT NULL;"
+                    + " CREATE UNIQUE INDEX usage_records_tenant_created_uq"
+                    + " ON usage_records (tenant_account_id, created_at);"
+                    + " CREATE INDEX usage_records_day_idx ON usage_records (usage_day(created_at));"
+                    + " COMMENT ON INDEX usage_records_tenant_idx IS 'tenant index'";
+            const first = await reconciler(ns, script).concurrentIndexes(true)
+                    .build().reconcile();
+            assert.equal(first.outcome, ReconcileOutcome.RECONCILED);
+            const indexCreates = first.applied.filter(c =>
+                    c.target.kind === ObjectKind.INDEX);
+            assert.ok(indexCreates.length >= 2, JSON.stringify(first.applied));
+            assert.ok(indexCreates.every(c => !c.nonTransactional
+                    && !c.statements.some(sql => sql.includes("CONCURRENTLY"))));
+            assert.equal((await reconciler(ns, script).build().reconcile()).outcome,
+                    ReconcileOutcome.UP_TO_DATE);
+            const dump = await SchemaReconciler.builder().dataSource(ds).namespace(ns)
+                    .dialect(dialect).build().dump();
+            assert.ok(dump.includes("CREATE INDEX usage_records_tenant_idx ON ${namespace}.usage_records"), dump);
+            assert.ok(!dump.includes("ON ONLY"), dump);
+
+            const renamed = script.replaceAll("usage_records_tenant_idx",
+                    "usage_records_tenant_new_idx")
+                    + "\n-- @reconciler rename INDEX usage_records.usage_records_tenant_idx -> usage_records_tenant_new_idx";
+            const rename = await reconciler(ns, renamed).build().reconcile();
+            assert.equal(rename.outcome, ReconcileOutcome.RECONCILED);
+            assert.ok(rename.applied.some(c => c.action === ChangeAction.ALTER
+                    && c.target.kind === ObjectKind.INDEX
+                            && c.target.name === "usage_records_tenant_new_idx"));
+            assert.equal(await tableExists(ns, "usage_records_tenant_new_idx"), true);
+            assert.equal((await reconciler(ns, renamed).build().reconcile()).outcome,
+                    ReconcileOutcome.UP_TO_DATE);
+        } finally {
+            await drop(ns);
+        }
+    });
+
+    it("an invalid ON ONLY partitioned index recovers to valid", async () => {
+        const ns = await namespace();
+        try {
+            const base = "CREATE TABLE usage_records (tenant_account_id bigint,"
+                    + " created_at timestamptz NOT NULL) PARTITION BY RANGE (created_at);"
+                    + " CREATE TABLE usage_records_p2026_11 PARTITION OF usage_records"
+                    + " FOR VALUES FROM ('2026-11-01') TO ('2026-12-01');";
+            const invalid = base + " CREATE INDEX usage_records_tenant_idx"
+                    + " ON ONLY usage_records (tenant_account_id)";
+            assert.equal((await reconciler(ns, invalid).build().reconcile()).outcome,
+                    ReconcileOutcome.RECONCILED);
+            const valid = base + " CREATE INDEX usage_records_tenant_idx"
+                    + " ON usage_records (tenant_account_id)";
+            const recovered = await reconciler(ns, valid).build().reconcile();
+            assert.equal(recovered.outcome, ReconcileOutcome.RECONCILED);
+            const c = await ds.connect();
+            try {
+                const rows = await c.query<{ valid: boolean }>(
+                        "SELECT i.indisvalid AS valid FROM pg_index i"
+                        + " JOIN pg_class x ON x.oid = i.indexrelid"
+                        + " JOIN pg_namespace n ON n.oid = x.relnamespace"
+                        + " WHERE n.nspname = $1 AND x.relname = 'usage_records_tenant_idx'", [ns]);
+                assert.equal(rows[0]!.valid, true);
+            } finally {
+                await c.close();
+            }
+            assert.equal((await reconciler(ns, valid).build().reconcile()).outcome,
+                    ReconcileOutcome.UP_TO_DATE);
+        } finally {
+            await drop(ns);
+        }
+    });
+
+    it("external partitions coexist through reconcile, plan/apply, dump and prune", async () => {
+        const ns = await namespace();
+        try {
+            const base = "CREATE TABLE usage_records (tenant_account_id bigint,"
+                    + " created_at timestamptz NOT NULL) PARTITION BY RANGE (created_at);"
+                    + " CREATE TABLE usage_records_default PARTITION OF usage_records DEFAULT";
+            const build = (script: string, prune = false) => reconciler(ns, script,
+                    ReconcilePolicy.defaults().withDestructive(Decision.APPLY).withPrune(prune))
+                    .externalPartitions("usage_records", "usage_records_p");
+            assert.equal((await build(base).build().reconcile()).outcome,
+                    ReconcileOutcome.RECONCILED);
+            await execute(ds, "CREATE TABLE " + dialect.quoteIdentifier(ns)
+                    + ".usage_records_p2026_11 PARTITION OF " + dialect.quoteIdentifier(ns)
+                    + ".usage_records FOR VALUES FROM ('2026-11-01') TO ('2026-12-01')");
+            const upToDate = await build(base, true).build().reconcile();
+            assert.equal(upToDate.outcome, ReconcileOutcome.UP_TO_DATE);
+            assert.equal(upToDate.unexpected.length, 0, JSON.stringify(upToDate.unexpected));
+
+            const withIndex = base + "; CREATE INDEX usage_records_tenant_idx"
+                    + " ON usage_records (tenant_account_id)";
+            const plan = await build(withIndex).build().plan();
+            await execute(ds, "CREATE TABLE " + dialect.quoteIdentifier(ns)
+                    + ".usage_records_p2026_12 PARTITION OF " + dialect.quoteIdentifier(ns)
+                    + ".usage_records FOR VALUES FROM ('2026-12-01') TO ('2027-01-01')");
+            const applied = await build(withIndex).build().apply(plan);
+            assert.equal(applied.outcome, ReconcileOutcome.RECONCILED);
+            const dump = await SchemaReconciler.builder().dataSource(ds).namespace(ns)
+                    .dialect(dialect).externalPartitions("usage_records", "usage_records_p")
+                    .build().dump();
+            assert.ok(!dump.includes("usage_records_p2026_"), dump);
+            assert.ok(dump.includes("usage_records_default"), dump);
+        } finally {
+            await drop(ns);
+        }
+    });
+
+    it("retire drops a targeted constraint and pruneFilter protects a migration table tree", async () => {
+        const ns = await namespace();
+        try {
+            const q = (name: string) => dialect.quoteIdentifier(ns) + "." + dialect.quoteIdentifier(name);
+            await execute(ds, "CREATE TABLE " + q("router_models")
+                    + " (id bigint PRIMARY KEY, slug text NOT NULL, tenant_id bigint NOT NULL);"
+                    + " ALTER TABLE " + q("router_models")
+                    + " ADD CONSTRAINT router_models_slug_key UNIQUE (slug);"
+                    + " CREATE TABLE " + q("goose_db_version")
+                    + " (id bigserial PRIMARY KEY, version bigint NOT NULL)");
+            const script = "CREATE TABLE router_models (id bigint PRIMARY KEY,"
+                    + " slug text NOT NULL, tenant_id bigint NOT NULL,"
+                    + " CONSTRAINT router_models_global_slug_uq UNIQUE (slug),"
+                    + " CONSTRAINT router_models_tenant_slug_uq UNIQUE (tenant_id, slug));"
+                    + "\n-- @reconciler retire UNIQUE router_models.router_models_slug_key";
+            const report = await reconciler(ns, script).build().reconcile();
+            assert.equal(report.outcome, ReconcileOutcome.RECONCILED);
+            assert.ok(report.applied.some(c => c.action === ChangeAction.DROP
+                    && c.target.kind === ObjectKind.UNIQUE
+                    && c.target.name === "router_models_slug_key"
+                    && c.reason.includes("retired")), JSON.stringify(report.applied));
+            assert.equal(await tableExists(ns, "goose_db_version"), true);
+            assert.equal((await reconciler(ns, script).build().reconcile()).outcome,
+                    ReconcileOutcome.UP_TO_DATE);
+
+            await execute(ds, "ALTER TABLE " + q("router_models")
+                    + " ADD CONSTRAINT router_models_obsolete_uq UNIQUE (id, slug)");
+            const prunePolicy = ReconcilePolicy.defaults()
+                    .withDestructive(Decision.APPLY).withPrune(true);
+            const prune = await reconciler(ns, script, prunePolicy)
+                    .pruneFilter(id => id.name !== "goose_db_version")
+                    .build().reconcile();
+            assert.equal(prune.outcome, ReconcileOutcome.RECONCILED);
+            assert.equal(await tableExists(ns, "goose_db_version"), true);
+            assert.equal(await tableExists(ns, "goose_db_version_id_seq"), true);
+            assert.equal(prune.unexpected.some(d => d.id.name === "goose_db_version"), true,
+                    "protected objects remain visible as unexpected");
+        } finally {
+            await drop(ns);
+        }
+    });
+
+    it("schema hooks order, backfill atomically, roll back, and run once", async () => {
+        const ns = await namespace();
+        try {
+            const q = (name: string) => dialect.quoteIdentifier(ns) + "." + dialect.quoteIdentifier(name);
+            await execute(ds, "CREATE TABLE " + q("accounts")
+                    + " (id bigint PRIMARY KEY, slug text);"
+                    + " INSERT INTO " + q("accounts") + " (id, slug) VALUES (1, NULL)");
+            const events: string[] = [];
+            const store = PgHookStore.inSchema(ns);
+            const script = "CREATE TABLE accounts (id bigint PRIMARY KEY, slug text NOT NULL);"
+                    + " CREATE TABLE hook_audit (id int)";
+            const hookRun = SchemaReconciler.builder().dataSource(ds).namespace(ns)
+                    .desiredState(DesiredState.ofScript(script)).dialect(dialect)
+                    .policy(ReconcilePolicy.defaults().withDestructive(Decision.APPLY))
+                    .hookStore(store)
+                    .hook({ id: "z-post", phase: "POST_COMMIT", order: 2,
+                            run: async ctx => { events.push("z:" + ctx.applied.length); } })
+                    .hook({ id: "a-pre", phase: "PRE_APPLY", order: 1,
+                            run: async ctx => { events.push("a");
+                                await ctx.connection.execute("UPDATE accounts SET slug = 'x' WHERE slug IS NULL"); } })
+                    .hook({ id: "m-once", phase: "POST_APPLY", order: 0, runOnce: true,
+                            checksum: "v1",
+                            run: async ctx => { events.push("m");
+                                await ctx.connection.execute("INSERT INTO hook_audit (id) VALUES (1)"); } })
+                    .build();
+            const first = await hookRun.reconcile();
+            assert.equal(first.outcome, ReconcileOutcome.RECONCILED);
+            assert.deepEqual(events.map(e => e[0]), ["a", "m", "z"]);
+            const eventCount = events.length;
+            assert.equal((await hookRun.reconcile()).outcome, ReconcileOutcome.UP_TO_DATE);
+            assert.equal(events.length, eventCount + 2,
+                    "run-once hook skips but always-run hooks still run on an up-to-date apply");
+            assert.equal(events.filter(e => e.startsWith("m")).length, 1);
+            assert.equal(await tableExists(ns, "schema_reconciler_hooks"), true);
+            const changed = SchemaReconciler.builder().dataSource(ds).namespace(ns)
+                    .desiredState(DesiredState.ofScript(script)).dialect(dialect)
+                    .hookStore(store)
+                    .hook({ id: "m-once", phase: "POST_APPLY", runOnce: true,
+                            checksum: "v2", run: () => {} })
+                    .build();
+            await assert.rejects(() => changed.reconcile(), ApplyException);
+
+            const failing = SchemaReconciler.builder().dataSource(ds).namespace(ns)
+                    .desiredState(DesiredState.ofScript(
+                            "CREATE TABLE rollback_probe (id int)"))
+                    .dialect(dialect)
+                    .hook({ id: "fail", phase: "POST_APPLY", run: async ctx => {
+                        await ctx.connection.execute("INSERT INTO rollback_probe (id) VALUES (1)");
+                        throw new Error("boom");
+                    } })
+                    .build();
+            await assert.rejects(() => failing.reconcile(), ApplyException);
+            assert.equal(await tableExists(ns, "rollback_probe"), false,
+                    "POST_APPLY failure rolls back the DDL transaction");
+        } finally {
+            await drop(ns);
+        }
+    });
+    it("external partitions remain visible when their parent is pruned", async () => {
+        const ns = await namespace();
+        try {
+            const q = (n: string) => dialect.quoteIdentifier(ns) + "." + dialect.quoteIdentifier(n);
+            await execute(ds, "CREATE TABLE " + q("usage_records") + " (id bigint, created_at timestamptz) PARTITION BY RANGE (created_at);"
+                    + " CREATE TABLE " + q("usage_records_p2026_11") + " PARTITION OF " + q("usage_records")
+                    + " FOR VALUES FROM ('2026-11-01') TO ('2026-12-01')");
+            const report = await reconciler(ns, "", ReconcilePolicy.defaults()
+                    .withPrune(true).withDestructive(Decision.APPLY))
+                    .externalPartitions("usage_records", "usage_records_p").build().reconcile();
+            assert.equal(report.outcome, ReconcileOutcome.RECONCILED);
+            const drops = report.applied.filter(c => c.action === ChangeAction.DROP);
+            assert.ok(drops.some(c => c.target.kind === ObjectKind.PARTITION
+                    && c.target.name === "usage_records_p2026_11"), JSON.stringify(drops));
+            assert.ok(drops.some(c => c.target.kind === ObjectKind.TABLE
+                    && c.target.name === "usage_records"));
+        } finally { await drop(ns); }
+    });
+
+    it("retire edge cases cover columns, destructive policy and dependents", async () => {
+        const ns = await namespace();
+        try {
+            const q = (n: string) => dialect.quoteIdentifier(ns) + "." + dialect.quoteIdentifier(n);
+            await execute(ds, "CREATE TABLE " + q("t") + " (id int, old text)");
+            const column = await reconciler(ns, "CREATE TABLE t (id int)",
+                    ReconcilePolicy.defaults().withDestructive(Decision.APPLY))
+                    .retire(new ObjectId(ObjectKind.COLUMN, "old", "t")).build().reconcile();
+            assert.equal(column.outcome, ReconcileOutcome.RECONCILED);
+            assert.ok(column.applied.some(c => c.target.kind === ObjectKind.COLUMN
+                    && c.safety === ChangeSafety.DESTRUCTIVE
+                    && c.statements.some(sql => sql.includes("DROP COLUMN"))));
+            assert.equal(await columnExists(ns, "t", "old"), false);
+
+            await execute(ds, "CREATE TABLE " + q("victim") + " (id int)");
+            await rejects(reconciler(ns, "CREATE TABLE t (id int)")
+                    .retire(new ObjectId(ObjectKind.TABLE, "victim")).build().reconcile(),
+                    PolicyViolationException);
+
+            await execute(ds, "CREATE VIEW " + q("dependent") + " AS SELECT id FROM " + q("victim"));
+            await rejects(reconciler(ns, "CREATE TABLE t (id int)",
+                    ReconcilePolicy.defaults().withDestructive(Decision.APPLY))
+                    .retire(new ObjectId(ObjectKind.TABLE, "victim")).build().reconcile(),
+                    PlanningException);
+        } finally { await drop(ns); }
+    });
+
+    it("hooks skip reported-only plans and post-commit failures carry applied changes", async () => {
+        const ns = await namespace();
+        try {
+            const events: string[] = [];
+            const hook = (phase: "PRE_APPLY" | "POST_APPLY" | "POST_COMMIT") => ({
+                    id: phase, phase, run: () => { events.push(phase); } });
+            const reported = SchemaReconciler.builder().dataSource(ds).namespace(ns)
+                    .desiredState(DesiredState.ofScript("CREATE TABLE later (id int)"))
+                    .dialect(dialect).policy(ReconcilePolicy.reportOnly())
+                    .hook(hook("PRE_APPLY")).hook(hook("POST_APPLY")).hook(hook("POST_COMMIT"))
+                    .build();
+            assert.equal((await reported.reconcile()).outcome, ReconcileOutcome.REPORTED_ONLY);
+            assert.deepEqual(events, []);
+
+            const failing = SchemaReconciler.builder().dataSource(ds).namespace(ns)
+                    .desiredState(DesiredState.ofScript("CREATE TABLE later (id int)"))
+                    .dialect(dialect)
+                    .hook({ id: "boom", phase: "POST_COMMIT", run: () => { throw new Error("boom"); } })
+                    .build();
+            const error = await rejects(failing.reconcile(), ApplyException) as ApplyException;
+            assert.ok(error.applied.some(c => c.target.name === "later"),
+                    "post-commit context/error carries prior applied changes");
+        } finally { await drop(ns); }
+    });
+
+    it("PgHookStore works in a dedicated schema and sub-partition indexes stay transactional", async () => {
+        const ns = await namespace();
+        const internal = "_reconciler_internal_" + RUN_ID + "_" + (++sequence);
+        await execute(ds, "CREATE SCHEMA " + dialect.quoteIdentifier(internal));
+        try {
+            let runs = 0;
+            const store = PgHookStore.inSchema(internal);
+            const r = reconciler(ns, "CREATE TABLE hooked (id int)")
+                    .hookStore(store)
+                    .hook({ id: "once", phase: "POST_COMMIT", runOnce: true, checksum: "v1",
+                            run: () => { runs++; } }).build();
+            assert.equal((await r.reconcile()).outcome, ReconcileOutcome.RECONCILED);
+            assert.equal((await r.reconcile()).outcome, ReconcileOutcome.UP_TO_DATE);
+            assert.equal(runs, 1);
+
+            const sub = "CREATE TABLE measurement (city_id int, logdate date) PARTITION BY RANGE (logdate);"
+                    + " CREATE TABLE measurement_2026 PARTITION OF measurement"
+                    + " FOR VALUES FROM ('2026-01-01') TO ('2027-01-01') PARTITION BY LIST (city_id);"
+                    + " CREATE TABLE measurement_2026_x PARTITION OF measurement_2026 FOR VALUES IN (1);"
+                    + " CREATE INDEX measurement_city_idx ON measurement_2026 (city_id)";
+            const applied = await reconciler(ns, sub).concurrentIndexes(true).build().reconcile();
+            const idx = applied.applied.filter(c => c.target.kind === ObjectKind.INDEX
+                    && c.target.name === "measurement_city_idx");
+            assert.ok(idx.length > 0 && idx.every(c => !c.nonTransactional));
+        } finally { await drop(ns); await drop(internal); }
+    });
+
+    it("MultiNamespaceReconciler forwards 0.11 options", async () => {
+        const ns = await namespace();
+        try {
+            const q = (n: string) => dialect.quoteIdentifier(ns) + "." + dialect.quoteIdentifier(n);
+            await execute(ds, "CREATE TABLE " + q("usage_records") + " (id bigint, created_at timestamptz) PARTITION BY RANGE (created_at);"
+                    + " CREATE TABLE " + q("usage_records_p2026_11") + " PARTITION OF " + q("usage_records")
+                    + " FOR VALUES FROM ('2026-11-01') TO ('2026-12-01');"
+                    + " CREATE TABLE " + q("goose_db_version") + " (id int)");
+            let runs = 0;
+            const multi = MultiNamespaceReconciler.builder().dataSource(ds).dialect(dialect)
+                    .policy(ReconcilePolicy.defaults().withPrune(true).withDestructive(Decision.APPLY))
+                    .externalPartitions("usage_records", "usage_records_p")
+                    .pruneFilter(id => id.name !== "goose_db_version")
+                    .hookStore(PgHookStore.inSchema(ns))
+                    .namespace(ns, DesiredState.ofScript(
+                            "CREATE TABLE usage_records (id bigint, created_at timestamptz)"
+                            + " PARTITION BY RANGE (created_at)"),
+                            b => { b.hook({ id: "once", phase: "POST_COMMIT", runOnce: true,
+                                    checksum: "v1", run: () => { runs++; } }); })
+                    .build();
+            const report = await multi.reconcile();
+            assert.equal(report.reports.get(ns)!.outcome, ReconcileOutcome.UP_TO_DATE);
+            assert.equal(await tableExists(ns, "goose_db_version"), true);
+            assert.equal(runs, 1);
+            assert.equal(await tableExists(ns, "schema_reconciler_hooks"), true);
+        } finally { await drop(ns); }
+    });
+
 });

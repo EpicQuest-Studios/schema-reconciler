@@ -108,13 +108,17 @@ export class PlanBuilder {
     private readonly desired: SchemaSnapshot;
     private readonly prune: boolean;
     private readonly renameHints: readonly RenameHint[];
+    private readonly retireTargets: readonly ObjectId[];
+    private readonly pruneFilter: (id: ObjectId) => boolean;
     private readonly options: RenderOptions;
     private renamedParents: ReadonlyMap<string, string> = new Map();
 
     constructor(dialect: Dialect, targetNamespace: string,
                 actual: SchemaSnapshot, desired: SchemaSnapshot,
                 prune = false, renameHints: readonly RenameHint[] = [],
-                options: RenderOptions = {}) {
+                options: RenderOptions = {},
+                retireTargets: readonly ObjectId[] = [],
+                pruneFilter: (id: ObjectId) => boolean = () => true) {
         this.dialect = dialect;
         this.targetNamespace = targetNamespace;
         this.actual = actual;
@@ -122,6 +126,8 @@ export class PlanBuilder {
         this.prune = prune;
         this.renameHints = renameHints;
         this.options = options;
+        this.retireTargets = retireTargets;
+        this.pruneFilter = pruneFilter;
     }
 
     build(differences: Difference[]): Built {
@@ -145,7 +151,13 @@ export class PlanBuilder {
         // object it depends on is dropped needs no DROP of its own —
         // the parent's drop takes it down (indexes and constraints on a
         // dropped table, owned sequences, mirrored annotations)
-        const pruned = this.prune ? this.suppressedUnexpected(differences) : new ObjectSet();
+        const retired = this.activeRetireTargets();
+        const retireSet = new ObjectSet();
+        for (const id of retired) {
+            retireSet.add(id);
+        }
+        const pruneApproved = this.pruneApproved(differences, retireSet);
+        const pruned = this.suppressedUnexpected(differences, pruneApproved);
 
         // a parent rename carries its same-named children along: their
         // UNEXPECTED(old.x)/MISSING(new.x) pairs are the same object with
@@ -163,20 +175,25 @@ export class PlanBuilder {
         for (const drift of carried.drift) {
             changes.push(...this.render(drift));
         }
+        for (const target of retired) {
+            if (!covered.has(target) && !pruned.has(target)) {
+                const have = this.actual.objects.get(target)!;
+                changes.push(...this.renderRetired(new Difference(target,
+                        DifferenceType.UNEXPECTED, undefined, have.definition)));
+            }
+        }
         for (const d of differences) {
             if (covered.has(d.id) || pruned.has(d.id)) {
                 continue;
             }
             if (d.type === DifferenceType.MISSING || d.type === DifferenceType.DRIFTED) {
                 changes.push(...this.render(d));
-            } else if (d.type === DifferenceType.UNEXPECTED && this.prune
-                    && d.id.kind !== ObjectKind.OTHER) {
+            } else if (d.type === DifferenceType.UNEXPECTED
+                    && pruneApproved.has(d.id) && !retireSet.has(d.id)) {
                 changes.push(...this.render(d));
             }
         }
-        if (!this.prune) {
-            changes.push(...this.tableShapeConflicts(differences, covered));
-        }
+        changes.push(...this.tableShapeConflicts(differences, covered, pruneApproved));
         for (let i = changes.length - 1; i >= 0; i--) {
             if (covered.has(changes[i]!.target)) {
                 changes.splice(i, 1);
@@ -317,7 +334,7 @@ export class PlanBuilder {
      * own standalone DROP (5.5). Only containment, serial ownership and
      * mirrored annotations are implicit removals.
      */
-    private suppressedUnexpected(differences: Difference[]): ObjectSet {
+    private suppressedUnexpected(differences: Difference[], approved: ObjectSet): ObjectSet {
         const unexpected = new ObjectSet();
         for (const d of differences) {
             if (d.type === DifferenceType.UNEXPECTED && d.id.kind !== ObjectKind.OTHER) {
@@ -325,19 +342,109 @@ export class PlanBuilder {
             }
         }
         const suppressed = new ObjectSet();
-        if (unexpected.isEmpty) {
+        if (unexpected.isEmpty || approved.isEmpty) {
             return suppressed;
         }
         const prereqs = Dependencies.prerequisitesOf(this.dialect, this.actual);
         for (const id of unexpected) {
             const deps = prereqs.get(id) ?? new ObjectSet();
-            if (containedInUnexpectedParent(id, deps, unexpected)
-                    || serialOwnedByUnexpectedTable(id, deps, unexpected)
-                    || mirroredOnUnexpected(id, deps, unexpected)) {
+            if (containedInUnexpectedParent(id, deps, approved)
+                    || serialOwnedByUnexpectedTable(id, deps, approved)
+                    || mirroredOnUnexpected(id, deps, approved)) {
                 suppressed.add(id);
             }
         }
         return suppressed;
+    }
+
+    /** Retire targets present in actual, after contradiction validation. */
+    private activeRetireTargets(): ObjectId[] {
+        const active: ObjectId[] = [];
+        const seen = new ObjectSet();
+        for (const target of this.retireTargets) {
+            if (this.desired.objects.has(target)) {
+                throw new PlanningException("namespace '" + this.targetNamespace
+                        + "': retire target " + target + " is present in the desired state");
+            }
+            for (const hint of this.renameHints) {
+                if (target.equals(hint.from) || target.equals(hint.to)) {
+                    throw new PlanningException("namespace '" + this.targetNamespace
+                            + "': " + target + " is both a retire target and a rename endpoint");
+                }
+            }
+            if (this.actual.objects.has(target) && !seen.has(target)) {
+                seen.add(target);
+                active.push(target);
+            }
+        }
+        active.sort(ObjectIds.ORDER);
+        return active;
+    }
+
+    /** The UNEXPECTED objects approved for a standalone drop. */
+    private pruneApproved(differences: Difference[], retired: ObjectSet): ObjectSet {
+        const unexpected = new ObjectSet();
+        for (const d of differences) {
+            if (d.type === DifferenceType.UNEXPECTED && d.id.kind !== ObjectKind.OTHER) {
+                unexpected.add(d.id);
+            }
+        }
+        const approved = new ObjectSet();
+        for (const id of retired) {
+            approved.add(id);
+        }
+        if (!this.prune) {
+            return approved;
+        }
+        const protectedObjects = this.protectedUnexpected(unexpected);
+        for (const id of unexpected) {
+            if (this.pruneFilter(id) && !protectedObjects.has(id)) {
+                approved.add(id);
+            }
+        }
+        return approved;
+    }
+
+    /** Objects protected because an unexpected container failed pruneFilter. */
+    private protectedUnexpected(unexpected: ObjectSet): ObjectSet {
+        const prereqs = Dependencies.prerequisitesOf(this.dialect, this.actual);
+        const protectedObjects = new ObjectSet();
+        for (const id of unexpected) {
+            if (PRUNE_CONTAINERS.has(id.kind) && !this.pruneFilter(id)) {
+                protectedObjects.add(id);
+            }
+        }
+        const containment = new Set(PRUNE_CONTAINED);
+        containment.add(ObjectKind.PARTITION);
+        let changed = true;
+        while (changed) {
+            changed = false;
+            for (const id of unexpected) {
+                if (protectedObjects.has(id)) {
+                    continue;
+                }
+                const deps = prereqs.get(id) ?? new ObjectSet();
+                const contained = id.parent !== undefined && containment.has(id.kind)
+                        && [...deps].some(dep => protectedObjects.has(dep)
+                                && dep.name === id.parent);
+                const serial = id.kind === ObjectKind.SEQUENCE
+                        && [...deps].some(dep => protectedObjects.has(dep));
+                const mirrored = PRUNE_MIRRORED.has(id.kind)
+                        && [...deps].some(dep => protectedObjects.has(dep));
+                if (contained || serial || mirrored) {
+                    protectedObjects.add(id);
+                    changed = true;
+                }
+            }
+        }
+        return protectedObjects;
+    }
+
+    /** Renders a targeted retirement with a clear reason. */
+    private renderRetired(difference: Difference): PlannedChange[] {
+        return this.render(difference).map(c => new PlannedChange(0, c.target,
+                c.action, c.safety, c.statements, c.expected,
+                "retired " + difference.id, c.nonTransactional, c.hazard));
     }
 
     private render(difference: Difference): PlannedChange[] {
@@ -399,12 +506,14 @@ export class PlanBuilder {
 
     /** 5.5: an unexpected COLUMN on an expected table is a table-shape conflict. */
     private tableShapeConflicts(differences: Difference[],
-                                covered: ObjectSet): PlannedChange[] {
+                                covered: ObjectSet,
+                                pruneApproved: ObjectSet): PlannedChange[] {
         const out: PlannedChange[] = [];
         for (const d of differences) {
             if (d.type !== DifferenceType.UNEXPECTED
                     || d.id.kind !== ObjectKind.COLUMN
                     || covered.has(d.id)
+                    || pruneApproved.has(d.id)
                     || d.id.parent === undefined) {
                 continue;
             }
@@ -466,7 +575,7 @@ export class PlanBuilder {
                                 + dependent + " depends on " + dropped
                                 + " but is not part of the desired state");
                     }
-                    if (this.prune && (targets.has(dependent) || pruned.has(dependent))) {
+                    if (targets.has(dependent) || pruned.has(dependent)) {
                         // under prune this in-namespace dependent is itself
                         // being dropped (or implicitly removed); no rebuild
                         continue;

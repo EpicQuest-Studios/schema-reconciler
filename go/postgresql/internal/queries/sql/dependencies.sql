@@ -38,7 +38,7 @@ WHERE d.classid = 'pg_proc'::regclass
 -- name: dep_index_proc
 SELECT DISTINCT i.indexrelid AS idx, d.refobjid AS dep
 FROM pg_depend d
-JOIN pg_class ic ON ic.oid = d.objid AND ic.relkind = 'i'
+JOIN pg_class ic ON ic.oid = d.objid AND ic.relkind IN ('i', 'I')
 JOIN pg_index i ON i.indexrelid = ic.oid
 JOIN pg_namespace n ON n.oid = ic.relnamespace AND n.nspname = ?
 JOIN pg_proc p ON p.oid = d.refobjid
@@ -228,7 +228,7 @@ WHERE d.classid = 'pg_constraint'::regclass
 UNION
 SELECT DISTINCT d.refobjid, rn.nspname, ic.relname
 FROM pg_depend d
-JOIN pg_class ic ON ic.oid = d.objid AND ic.relkind = 'i'
+JOIN pg_class ic ON ic.oid = d.objid AND ic.relkind IN ('i', 'I')
 JOIN pg_namespace rn ON rn.oid = ic.relnamespace
 WHERE d.classid = 'pg_class'::regclass
   AND d.refclassid IN ('pg_proc'::regclass, 'pg_type'::regclass)

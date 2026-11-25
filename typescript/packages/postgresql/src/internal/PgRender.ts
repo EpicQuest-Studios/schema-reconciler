@@ -1117,8 +1117,8 @@ function unexpected(id: ObjectId, have: SchemaObject,
  */
 function parentPartitioned(id: ObjectId, snapshot: SchemaSnapshot): boolean {
     for (const o of snapshot.objects.values()) {
-        if (o.id.name === id.parent && o.id.parent === undefined
-                && (o.id.kind === ObjectKind.TABLE
+        if (o.id.name === id.parent
+                && ((o.id.kind === ObjectKind.TABLE && o.id.parent === undefined)
                         || o.id.kind === ObjectKind.PARTITION)
                 && o.attributes.get(PgCatalog.PARTKEY) !== undefined) {
             return true;
@@ -1130,8 +1130,10 @@ function parentPartitioned(id: ObjectId, snapshot: SchemaSnapshot): boolean {
 /** Whether concurrent index DDL applies to this index under the options. */
 function concurrentIndex(id: ObjectId, snapshot: SchemaSnapshot,
         options?: RenderOptions): boolean {
+    const object = snapshot.objects.get(id);
     return options?.concurrentIndexes === true
-            && !parentPartitioned(id, snapshot);
+            && !parentPartitioned(id, snapshot)
+            && object?.attributes.get(PgCatalog.PARTITIONED_INDEX) !== "true";
 }
 
 /**
@@ -1316,7 +1318,7 @@ export function coveredChildren(created: Difference,
  * prefixes `PgCatalog` assigns to those objects.
  */
 const RELATION_NAMESPACE_OTHERS = new Set([
-        "inherited", "partindex", "toast", "relation", "type"]);
+        "inherited", "toast", "relation", "type"]);
 
 export function nameScopes(id: ObjectId): Iterable<string> {
     switch (id.kind) {

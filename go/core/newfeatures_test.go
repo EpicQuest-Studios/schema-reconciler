@@ -566,3 +566,130 @@ func TestFeatPlanJsonStrictFields(t *testing.T) {
 		t.Fatalf("err = %v, want ErrInvalidArgument", err)
 	}
 }
+
+// ---- 0.11 targeted retirement, scoped prune and hooks -------------------
+
+func TestFeatRetireDropsWithoutPruneAndRejectsContradictions(t *testing.T) {
+	db, dialect := featFixture()
+	old := model.ObjectId{Kind: model.KindTable, Name: "old"}
+	db.executeDirect(featNS, "CREATE TABLE keep DEF k; CREATE TABLE old DEF o")
+	report, err := mustBuild(t, featReconciler(db, dialect, "CREATE TABLE keep DEF k",
+		DefaultPolicy().WithDestructive(DecisionApply)).Retire(old)).Reconcile(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.Outcome != OutcomeReconciled {
+		t.Fatalf("outcome = %s", report.Outcome)
+	}
+	if _, ok := db.objectsIn(featNS)[old]; ok {
+		t.Fatal("retired table must be dropped")
+	}
+	seen := false
+	for _, ch := range report.Applied {
+		if ch.Action == model.ChangeDrop && ch.Target == old && strings.Contains(ch.Reason, "retired") {
+			seen = true
+		}
+	}
+	if !seen {
+		t.Fatalf("retired drop missing: %#v", report.Applied)
+	}
+	contradictory := featReconciler(db, dialect, "CREATE TABLE old DEF o").Retire(old)
+	r, err := contradictory.Build()
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = r.Plan(context.Background())
+	var pe *PlanningError
+	if !errors.As(err, &pe) {
+		t.Fatalf("contradictory retire err = %v, want PlanningError", err)
+	}
+	bad := featReconciler(db, dialect, "CREATE TABLE keep DEF k").Retire(
+		model.ObjectId{Kind: model.KindOther, Name: "x"})
+	if _, err := bad.Build(); err == nil {
+		t.Fatal("retire of OTHER must fail at Build")
+	}
+}
+
+func TestFeatPruneFilterProtectsContainerTreeButKeepsItVisible(t *testing.T) {
+	db, dialect := featFixture()
+	db.executeDirect(featNS, "CREATE TABLE keep DEF k; CREATE TABLE stray DEF s;"+
+		" CREATE COLUMN stray.c DEF c")
+	report, err := mustBuild(t, featReconciler(db, dialect, "CREATE TABLE keep DEF k",
+		DefaultPolicy().WithPrune(true).WithDestructive(DecisionApply)).
+		PruneFilter(func(id model.ObjectId) bool { return id.Name != "stray" })).
+		Reconcile(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.Outcome != OutcomeUpToDate {
+		t.Fatalf("outcome = %s", report.Outcome)
+	}
+	if _, ok := db.objectsIn(featNS)[model.ObjectId{Kind: model.KindTable, Name: "stray"}]; !ok {
+		t.Fatal("protected table must remain")
+	}
+	if _, ok := db.objectsIn(featNS)[model.ObjectId{Kind: model.KindColumn, Name: "c", Parent: "stray"}]; !ok {
+		t.Fatal("protected column must remain")
+	}
+	tableVisible, columnVisible := false, false
+	for _, d := range report.Unexpected {
+		if d.ID.Name == "stray" {
+			tableVisible = true
+		}
+		if d.ID.Kind == model.KindColumn && d.ID.Parent == "stray" {
+			columnVisible = true
+		}
+	}
+	if !tableVisible || !columnVisible {
+		t.Fatalf("protected objects must stay visible: %#v", report.Unexpected)
+	}
+	for _, ch := range report.Plan.Changes {
+		if ch.Action == model.ChangeDrop {
+			t.Fatalf("protected tree produced a drop: %#v", report.Plan.Changes)
+		}
+	}
+}
+
+func TestFeatHooksRunInDeterministicOrderButNeverDuringPlanning(t *testing.T) {
+	db, dialect := featFixture()
+	events := []string{}
+	hook := func(id string, phase HookPhase, order int) SchemaHook {
+		return SchemaHook{ID: id, Phase: phase, Order: order,
+			Run: func(context.Context, HookContext) error {
+				events = append(events, id)
+				return nil
+			}}
+	}
+	r := mustBuild(t, featReconciler(db, dialect, "CREATE TABLE t DEF v").
+		Hook(hook("b", HookPreApply, 2)).
+		Hook(hook("c", HookPostApply, 0)).
+		Hook(hook("a", HookPreApply, 1)))
+	report, err := r.Reconcile(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.Outcome != OutcomeReconciled {
+		t.Fatalf("outcome = %s", report.Outcome)
+	}
+	if strings.Join(events, ",") != "a,b,c" {
+		t.Fatalf("hook order = %v", events)
+	}
+	count := len(events)
+	if _, err := r.Plan(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != count {
+		t.Fatal("plan() must not run hooks")
+	}
+	withoutStore := featReconciler(db, dialect, "CREATE TABLE x DEF v").Hook(
+		SchemaHook{ID: "x", Phase: HookPreApply, RunOnce: true,
+			Run: func(context.Context, HookContext) error { return nil }})
+	if _, err := withoutStore.Build(); err == nil {
+		t.Fatal("runOnce without HookStore must fail at Build")
+	}
+	duplicate := featReconciler(db, dialect, "CREATE TABLE x DEF v").
+		Hook(hook("x", HookPreApply, 0)).
+		Hook(hook("x", HookPostApply, 0))
+	if _, err := duplicate.Build(); err == nil {
+		t.Fatal("duplicate hook ids must fail at Build")
+	}
+}

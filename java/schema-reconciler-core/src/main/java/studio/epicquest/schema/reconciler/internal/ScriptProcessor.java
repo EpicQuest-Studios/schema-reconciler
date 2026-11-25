@@ -4,6 +4,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.regex.Pattern;
 import studio.epicquest.schema.reconciler.DesiredStateException;
+import studio.epicquest.schema.reconciler.model.ObjectId;
 import studio.epicquest.schema.reconciler.model.RenameHint;
 import studio.epicquest.schema.reconciler.spi.Dialect;
 
@@ -21,6 +22,7 @@ public final class ScriptProcessor {
     private final String substituted;
     private final boolean hasPlaceholder;
     private final List<RenameHint> renameHints;
+    private final List<ObjectId> retireTargets;
 
     /**
      * @param script the raw script
@@ -54,7 +56,9 @@ public final class ScriptProcessor {
         }
         this.substituted = out.toString().replace("\0", TOKEN);
         this.hasPlaceholder = found;
-        this.renameHints = RenameHints.parse(script);
+        final var directives = RenameHints.parseDirectives(script);
+        this.renameHints = directives.renameHints();
+        this.retireTargets = directives.retireTargets();
     }
 
     /** The script with every placeholder replaced by the quoted scratch namespace. */
@@ -70,6 +74,11 @@ public final class ScriptProcessor {
     /** The {@code -- @reconciler rename} directives found in the script (spec 5.5.1). */
     public List<RenameHint> renameHints() {
         return renameHints;
+    }
+
+    /** The {@code -- @reconciler retire} directives found in the script. */
+    public List<ObjectId> retireTargets() {
+        return retireTargets;
     }
 
     /**

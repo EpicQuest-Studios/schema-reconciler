@@ -1,4 +1,5 @@
 import { DesiredStateException } from "../DesiredStateException.ts";
+import type { ObjectId } from "../model/ObjectId.ts";
 import type { RenameHint } from "../model/RenameHint.ts";
 import type { Dialect } from "../spi/Dialect.ts";
 import * as RenameHints from "./RenameHints.ts";
@@ -23,6 +24,9 @@ export class ScriptProcessor {
 
     /** The `-- @reconciler rename` directives found in the script (spec 5.5.1). */
     readonly renameHints: readonly RenameHint[];
+
+    /** The `-- @reconciler retire` directives found in the script. */
+    readonly retireTargets: readonly ObjectId[];
 
     /**
      * @param script the raw script
@@ -56,7 +60,9 @@ export class ScriptProcessor {
         }
         this.substituted = out.join("").replaceAll("\u0000", TOKEN);
         this.hasPlaceholder = found;
-        this.renameHints = RenameHints.parse(script);
+        const directives = RenameHints.parseDirectives(script);
+        this.renameHints = directives.renameHints;
+        this.retireTargets = directives.retireTargets;
     }
 }
 

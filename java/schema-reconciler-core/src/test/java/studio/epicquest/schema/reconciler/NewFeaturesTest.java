@@ -373,4 +373,66 @@ class NewFeaturesTest {
         }
     }
 
+    // ---- 0.11 targeted retirement, scoped prune and hooks -------------------
+
+    @Test
+    void retireDropsWithoutPruneAndRejectsContradictions() {
+        final var old = new ObjectId(ObjectKind.TABLE, "old");
+        db.executeDirect(NS, "CREATE TABLE keep DEF k; CREATE TABLE old DEF o");
+        final var report = reconciler("CREATE TABLE keep DEF k",
+                ReconcilePolicy.defaults().withDestructive(Decision.APPLY))
+                .retire(old).build().reconcile();
+        assertEquals(ReconcileOutcome.RECONCILED, report.outcome());
+        assertFalse(db.objectsIn(NS).containsKey(old));
+        assertTrue(report.applied().stream().anyMatch(c ->
+                c.action() == ChangeAction.DROP && c.target().equals(old)
+                        && c.reason().contains("retired")));
+
+        assertThrows(PlanningException.class, () -> reconciler("CREATE TABLE old DEF o")
+                .retire(old).build().plan());
+        assertThrows(IllegalArgumentException.class, () -> reconciler("CREATE TABLE keep DEF k")
+                .retire(new ObjectId(ObjectKind.OTHER, "x")));
+    }
+
+    @Test
+    void pruneFilterProtectsAContainerTreeButKeepsItVisible() {
+        db.executeDirect(NS, "CREATE TABLE keep DEF k; CREATE TABLE stray DEF s;"
+                + " CREATE COLUMN stray.c DEF c");
+        final var report = reconciler("CREATE TABLE keep DEF k",
+                ReconcilePolicy.defaults().withPrune(true).withDestructive(Decision.APPLY))
+                .pruneFilter(id -> !id.name().equals("stray"))
+                .build().reconcile();
+        assertEquals(ReconcileOutcome.UP_TO_DATE, report.outcome());
+        assertTrue(db.objectsIn(NS).containsKey(new ObjectId(ObjectKind.TABLE, "stray")));
+        assertTrue(db.objectsIn(NS).containsKey(new ObjectId(ObjectKind.COLUMN, "c", "stray")));
+        assertTrue(report.unexpected().stream().anyMatch(d -> d.id().name().equals("stray")));
+        assertTrue(report.unexpected().stream().anyMatch(d ->
+                d.id().kind() == ObjectKind.COLUMN && d.id().parent().orElse("").equals("stray")));
+        assertTrue(report.plan().changes().stream().noneMatch(c -> c.action() == ChangeAction.DROP));
+    }
+
+    @Test
+    void hooksRunInDeterministicOrderButNeverDuringPlanning() {
+        final var events = new java.util.ArrayList<String>();
+        final var r = reconciler("CREATE TABLE t DEF v")
+                .hook(SchemaHook.of("b-pre", HookPhase.PRE_APPLY, 2, ctx -> events.add("b")))
+                .hook(SchemaHook.of("c-post", HookPhase.POST_APPLY, ctx -> events.add("c")))
+                .hook(SchemaHook.of("a-pre", HookPhase.PRE_APPLY, 1, ctx -> events.add("a")))
+                .build();
+        assertEquals(ReconcileOutcome.RECONCILED, r.reconcile().outcome());
+        assertEquals(List.of("a", "b", "c"), events);
+        final var count = events.size();
+        r.plan();
+        assertEquals(count, events.size(), "plan() must not run hooks");
+
+        assertThrows(ConfigurationException.class, () -> reconciler("CREATE TABLE x DEF v")
+                .hook(SchemaHook.runOnce("x", HookPhase.PRE_APPLY, "v1", ctx -> { }))
+                .build());
+        assertThrows(ConfigurationException.class, () -> reconciler("CREATE TABLE x DEF v")
+                .hook(SchemaHook.of("x", HookPhase.PRE_APPLY, ctx -> { }))
+                .hook(SchemaHook.of("x", HookPhase.POST_APPLY, ctx -> { }))
+                .build());
+    }
+
+
 }

@@ -15,7 +15,7 @@ var mirroredKinds = map[model.ObjectKind]struct{}{
 
 // relationOthers are the OTHER prefixes whose rows can own catalog children.
 var relationOthers = map[string]struct{}{
-	"inherited": {}, "partindex": {}, "toast": {}, "relation": {},
+	"inherited": {}, "toast": {}, "relation": {},
 }
 
 // annotationOthers are the OTHER prefixes that name a target — the

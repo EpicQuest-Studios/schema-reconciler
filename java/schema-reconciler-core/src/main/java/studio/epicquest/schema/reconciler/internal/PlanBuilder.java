@@ -11,6 +11,7 @@ import java.util.Optional;
 import java.util.PriorityQueue;
 import java.util.Set;
 import java.util.stream.Collectors;
+import java.util.function.Predicate;
 import java.util.stream.IntStream;
 import studio.epicquest.schema.reconciler.PlanningException;
 import studio.epicquest.schema.reconciler.model.ChangeAction;
@@ -52,16 +53,26 @@ final class PlanBuilder {
     private final SchemaSnapshot desired;
     private final boolean prune;
     private final List<RenameHint> renameHints;
+    private final List<ObjectId> retireTargets;
+    private final Predicate<ObjectId> pruneFilter;
     private final RenderOptions options;
     private Map<String, String> renamedParents = Map.of();
 
     PlanBuilder(Dialect dialect, String targetNamespace, SchemaSnapshot actual, SchemaSnapshot desired) {
         this(dialect, targetNamespace, actual, desired, false, List.of(),
-                RenderOptions.DEFAULT);
+                List.of(), id -> true, RenderOptions.DEFAULT);
     }
 
     PlanBuilder(Dialect dialect, String targetNamespace, SchemaSnapshot actual,
                 SchemaSnapshot desired, boolean prune, List<RenameHint> renameHints,
+                RenderOptions options) {
+        this(dialect, targetNamespace, actual, desired, prune, renameHints,
+                List.of(), id -> true, options);
+    }
+
+    PlanBuilder(Dialect dialect, String targetNamespace, SchemaSnapshot actual,
+                SchemaSnapshot desired, boolean prune, List<RenameHint> renameHints,
+                List<ObjectId> retireTargets, Predicate<ObjectId> pruneFilter,
                 RenderOptions options) {
         this.dialect = dialect;
         this.targetNamespace = targetNamespace;
@@ -69,6 +80,8 @@ final class PlanBuilder {
         this.desired = desired;
         this.prune = prune;
         this.renameHints = renameHints;
+        this.retireTargets = retireTargets;
+        this.pruneFilter = pruneFilter;
         this.options = options;
     }
 
@@ -86,11 +99,15 @@ final class PlanBuilder {
             covered.add(hint.from());
             covered.add(hint.to());
         }
-        // prune: an UNEXPECTED object dropped because another UNEXPECTED
-        // object it depends on is dropped needs no DROP of its own —
-        // the parent's drop takes it down (indexes and constraints on a
-        // dropped table, owned sequences, mirrored annotations)
-        final var pruned = prune ? suppressedUnexpected(differences) : Set.<ObjectId>of();
+        // targeted retirements are standalone drops even when prune is off;
+        // scoped pruning decides which other UNEXPECTED objects are approved
+        final var retired = activeRetireTargets();
+        final var retireSet = new HashSet<>(retired);
+        final var pruneApproved = pruneApproved(differences, retireSet);
+        // an UNEXPECTED object implicitly removed by an approved container's
+        // DROP needs no DROP of its own — containment, serial ownership and
+        // mirrored annotations only; ordinary dependents still fail planning
+        final var pruned = suppressedUnexpected(differences, pruneApproved);
 
         // a parent rename carries its same-named children along: their
         // UNEXPECTED(old.x)/MISSING(new.x) pairs are the same object with
@@ -106,20 +123,25 @@ final class PlanBuilder {
         for (final var drift : carried.drift()) {
             changes.addAll(render(drift));
         }
+        for (final var target : retired) {
+            if (!covered.contains(target) && !pruned.contains(target)) {
+                final var have = actual.objects().get(target);
+                changes.addAll(renderRetired(new Difference(target, DifferenceType.UNEXPECTED,
+                        Optional.empty(), Optional.of(have.definition()))));
+            }
+        }
         for (final var d : differences) {
             if (covered.contains(d.id()) || pruned.contains(d.id())) {
                 continue;
             }
             if (d.type() == DifferenceType.MISSING || d.type() == DifferenceType.DRIFTED) {
                 changes.addAll(render(d));
-            } else if (d.type() == DifferenceType.UNEXPECTED && prune
-                    && d.id().kind() != ObjectKind.OTHER) {
+            } else if (d.type() == DifferenceType.UNEXPECTED
+                    && pruneApproved.contains(d.id()) && !retireSet.contains(d.id())) {
                 changes.addAll(render(d));
             }
         }
-        if (!prune) {
-            changes.addAll(tableShapeConflicts(differences, covered));
-        }
+        changes.addAll(tableShapeConflicts(differences, covered, pruneApproved));
         changes.removeIf(c -> covered.contains(c.target()));
 
         // rename changes arrive after the covered-children splice: they
@@ -251,6 +273,99 @@ final class PlanBuilder {
     private record CarriedChildren(Set<ObjectId> suppressed, List<Difference> drift,
                                    Map<String, String> parentNames) { }
 
+    /** Retire targets present in actual, after contradiction validation. */
+    private List<ObjectId> activeRetireTargets() {
+        final var active = new ArrayList<ObjectId>();
+        final var seen = new HashSet<ObjectId>();
+        for (final var target : retireTargets) {
+            if (desired.objects().containsKey(target)) {
+                throw new PlanningException("namespace '" + targetNamespace
+                        + "': retire target " + target + " is present in the desired state");
+            }
+            for (final var hint : renameHints) {
+                if (target.equals(hint.from()) || target.equals(hint.to())) {
+                    throw new PlanningException("namespace '" + targetNamespace
+                            + "': " + target + " is both a retire target and a rename endpoint");
+                }
+            }
+            if (actual.objects().containsKey(target) && seen.add(target)) {
+                active.add(target);
+            }
+        }
+        active.sort(ObjectIds.ORDER);
+        return active;
+    }
+
+    /** The UNEXPECTED objects approved for a standalone drop. */
+    private Set<ObjectId> pruneApproved(List<Difference> differences, Set<ObjectId> retired) {
+        final var unexpected = differences.stream()
+                .filter(d -> d.type() == DifferenceType.UNEXPECTED
+                        && d.id().kind() != ObjectKind.OTHER)
+                .map(Difference::id)
+                .collect(Collectors.toSet());
+        final var approved = new HashSet<ObjectId>(retired);
+        if (!prune) {
+            return approved;
+        }
+        final var protectedObjects = protectedUnexpected(unexpected);
+        for (final var id : unexpected) {
+            if (pruneFilter.test(id) && !protectedObjects.contains(id)) {
+                approved.add(id);
+            }
+        }
+        return approved;
+    }
+
+    /**
+     * Objects protected because an unexpected container failed pruneFilter.
+     * The cascade follows containment, serial ownership, mirrored annotations
+     * and nested partitions transitively; explicit retire targets are added
+     * back to the approved set by the caller.
+     */
+    private Set<ObjectId> protectedUnexpected(Set<ObjectId> unexpected) {
+        final var prereqs = Dependencies.prerequisitesOf(dialect, actual);
+        final var protectedObjects = new HashSet<ObjectId>();
+        for (final var id : unexpected) {
+            if (PRUNE_CONTAINERS.contains(id.kind()) && !pruneFilter.test(id)) {
+                protectedObjects.add(id);
+            }
+        }
+        final var containment = new HashSet<>(PRUNE_CONTAINED);
+        containment.add(ObjectKind.PARTITION);
+        var changed = true;
+        while (changed) {
+            changed = false;
+            for (final var id : unexpected) {
+                if (protectedObjects.contains(id)) {
+                    continue;
+                }
+                final var deps = prereqs.getOrDefault(id, Set.of());
+                final var contained = id.parent().isPresent()
+                        && containment.contains(id.kind())
+                        && deps.stream().anyMatch(dep -> protectedObjects.contains(dep)
+                                && dep.name().equals(id.parent().orElseThrow()));
+                final var serial = id.kind() == ObjectKind.SEQUENCE
+                        && deps.stream().anyMatch(protectedObjects::contains);
+                final var mirrored = PRUNE_MIRRORED.contains(id.kind())
+                        && deps.stream().anyMatch(protectedObjects::contains);
+                if (contained || serial || mirrored) {
+                    protectedObjects.add(id);
+                    changed = true;
+                }
+            }
+        }
+        return protectedObjects;
+    }
+
+    /** Renders a targeted retirement with a reason policy and verification can report clearly. */
+    private List<PlannedChange> renderRetired(Difference difference) {
+        return render(difference).stream()
+                .map(c -> new PlannedChange(0, c.target(), c.action(), c.safety(),
+                        c.statements(), c.expected(), "retired " + difference.id(),
+                        c.nonTransactional(), c.hazard()))
+                .toList();
+    }
+
     private static final Set<ObjectKind> PRUNE_CONTAINERS = Set.of(
             ObjectKind.TABLE, ObjectKind.PARTITION, ObjectKind.FOREIGN_TABLE,
             ObjectKind.VIEW, ObjectKind.MATERIALIZED_VIEW);
@@ -272,22 +387,23 @@ final class PlanBuilder {
      * own standalone DROP (5.5). Only containment, serial ownership and
      * mirrored annotations are implicit removals.
      */
-    private Set<ObjectId> suppressedUnexpected(List<Difference> differences) {
+    private Set<ObjectId> suppressedUnexpected(List<Difference> differences,
+                                                Set<ObjectId> approved) {
+        if (approved.isEmpty()) {
+            return Set.of();
+        }
         final var unexpected = differences.stream()
                 .filter(d -> d.type() == DifferenceType.UNEXPECTED
                         && d.id().kind() != ObjectKind.OTHER)
                 .map(Difference::id)
                 .collect(Collectors.toSet());
-        if (unexpected.isEmpty()) {
-            return Set.of();
-        }
         final var prereqs = Dependencies.prerequisitesOf(dialect, actual);
         final var suppressed = new HashSet<ObjectId>();
         for (final var id : unexpected) {
             final var deps = prereqs.getOrDefault(id, Set.of());
-            if (containedInUnexpectedParent(id, deps, unexpected)
-                    || serialOwnedByUnexpectedTable(id, deps, unexpected)
-                    || mirroredOnUnexpected(id, deps, unexpected)) {
+            if (containedInUnexpectedParent(id, deps, approved)
+                    || serialOwnedByUnexpectedTable(id, deps, approved)
+                    || mirroredOnUnexpected(id, deps, approved)) {
                 suppressed.add(id);
             }
         }
@@ -422,11 +538,13 @@ final class PlanBuilder {
 
     /** 5.5: an unexpected COLUMN on an expected table is a table-shape conflict. */
     private List<PlannedChange> tableShapeConflicts(List<Difference> differences,
-                                                    Set<ObjectId> covered) {
+                                                    Set<ObjectId> covered,
+                                                    Set<ObjectId> pruneApproved) {
         return differences.stream()
                 .filter(d -> d.type() == DifferenceType.UNEXPECTED
                         && d.id().kind() == ObjectKind.COLUMN
                         && !covered.contains(d.id())
+                        && !pruneApproved.contains(d.id())
                         && d.id().parent().isPresent())
                 .filter(d -> desired.objects().containsKey(
                         new ObjectId(ObjectKind.TABLE, d.id().parent().get())))
@@ -485,9 +603,9 @@ final class PlanBuilder {
                                 + dependent + " depends on " + dropped
                                 + " but is not part of the desired state");
                     }
-                    if (prune && (targets.contains(dependent) || pruned.contains(dependent))) {
-                        // under prune this in-namespace dependent is itself
-                        // being dropped (or implicitly removed); no rebuild
+                    if (targets.contains(dependent) || pruned.contains(dependent)) {
+                        // this in-namespace dependent is itself being dropped
+                        // (or implicitly removed by an approved container); no rebuild
                         continue;
                     }
                     throw new PlanningException("namespace '" + targetNamespace + "': "

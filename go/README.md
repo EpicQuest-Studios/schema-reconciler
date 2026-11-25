@@ -20,7 +20,7 @@ live PostgreSQL suite.
 ## Getting started
 
 ```bash
-go get github.com/EpicQuest-Studios/schema-reconciler/go@v0.10.0
+go get github.com/EpicQuest-Studios/schema-reconciler/go@v0.11.0
 ```
 
 Or through the **static GOPROXY on GitHub Pages** — the same mechanism
@@ -28,7 +28,7 @@ as the Maven and npm registries:
 
 ```bash
 export GOPROXY=https://epicquest-studios.github.io/schema-reconciler/go
-go get github.com/EpicQuest-Studios/schema-reconciler/go@v0.10.0
+go get github.com/EpicQuest-Studios/schema-reconciler/go@v0.11.0
 ```
 
 Implementing a dialect for another database? Depend on `…/go/core` +
@@ -41,7 +41,7 @@ script writes the `@v/` layout (`list`, `<version>.info`, `.mod`,
 `.zip`, `@latest`) into a checkout of the `gh-pages` branch:
 
 ```bash
-scripts/publish-pages.sh --pages <checkout-of-gh-pages> --version v0.10.0
+scripts/publish-pages.sh --pages <checkout-of-gh-pages> --version v0.11.0
 # then commit + push gh-pages — removal works the same as Maven:
 # git rm the version files, drop the entry from @v/list, and push
 ```

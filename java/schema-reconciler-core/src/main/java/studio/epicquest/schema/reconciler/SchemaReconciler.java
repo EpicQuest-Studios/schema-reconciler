@@ -5,6 +5,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
 import java.util.ServiceLoader;
+import java.util.function.BiPredicate;
 import java.util.function.Predicate;
 import javax.sql.DataSource;
 import studio.epicquest.schema.reconciler.internal.Engine;
@@ -82,6 +83,11 @@ public final class SchemaReconciler {
         private Predicate<ObjectId> objectFilter = id -> true;
         private boolean concurrentIndexes;
         private final List<RenameHint> renameHints = new ArrayList<>();
+        private final List<ObjectId> retireTargets = new ArrayList<>();
+        private final List<BiPredicate<String, String>> externalPartitionMatchers = new ArrayList<>();
+        private Predicate<ObjectId> pruneFilter = id -> true;
+        private final List<SchemaHook> hooks = new ArrayList<>();
+        private HookStore hookStore;
 
         private Builder() {
         }
@@ -185,6 +191,72 @@ public final class SchemaReconciler {
         }
 
         /**
+         * Marks {@code id} for targeted retirement: when it exists in the
+         * actual snapshot and is absent from the desired state it is dropped
+         * even when the prune policy is off (spec 5.5). {@code OTHER} objects
+         * are unsupported shadows and cannot be retired.
+         */
+        public Builder retire(ObjectId id) {
+            Objects.requireNonNull(id, "id");
+            if (id.kind() == studio.epicquest.schema.reconciler.model.ObjectKind.OTHER) {
+                throw new IllegalArgumentException("OTHER objects cannot be retired: " + id);
+            }
+            this.retireTargets.add(id);
+            return this;
+        }
+
+        /** Coexists with every runtime partition directly parented on {@code parentTable}. */
+        public Builder externalPartitions(String parentTable) {
+            validateParentTable(parentTable);
+            this.externalPartitionMatchers.add((parent, partition) -> parent.equals(parentTable));
+            return this;
+        }
+
+        /** Coexists with runtime partitions of {@code parentTable} whose names start with {@code namePrefix}. */
+        public Builder externalPartitions(String parentTable, String namePrefix) {
+            validateParentTable(parentTable);
+            Objects.requireNonNull(namePrefix, "namePrefix");
+            this.externalPartitionMatchers.add((parent, partition) ->
+                    parent.equals(parentTable) && partition.startsWith(namePrefix));
+            return this;
+        }
+
+        /** Coexists with runtime partitions {@code matcher} accepts as {@code (parentTable, partitionName)}. */
+        public Builder externalPartitions(BiPredicate<String, String> matcher) {
+            this.externalPartitionMatchers.add(Objects.requireNonNull(matcher, "matcher"));
+            return this;
+        }
+
+        private static void validateParentTable(String parentTable) {
+            Objects.requireNonNull(parentTable, "parentTable");
+            if (parentTable.isEmpty()) {
+                throw new IllegalArgumentException("parentTable must not be empty");
+            }
+        }
+
+        /**
+         * Limits which unexpected objects {@code prune=true} may drop; visibility
+         * in plans and reports is unaffected. Rejecting a container protects its
+         * contained objects transitively unless they are explicitly retired.
+         */
+        public Builder pruneFilter(Predicate<ObjectId> allowPrune) {
+            this.pruneFilter = Objects.requireNonNull(allowPrune, "allowPrune");
+            return this;
+        }
+
+        /** Registers an ordered lifecycle hook (spec 3.8); repeatable. */
+        public Builder hook(SchemaHook hook) {
+            this.hooks.add(Objects.requireNonNull(hook, "hook"));
+            return this;
+        }
+
+        /** Registers the durable store checksum-protected {@code runOnce} hooks use. */
+        public Builder hookStore(HookStore hookStore) {
+            this.hookStore = Objects.requireNonNull(hookStore, "hookStore");
+            return this;
+        }
+
+        /**
          * Validates required properties and, when no dialect is set, that at
          * least one {@code Dialect} provider is discoverable. Opens no
          * connection: dialect selection happens on first use (spec 3.1, 3.4).
@@ -208,10 +280,33 @@ public final class SchemaReconciler {
                         "no Dialect provider discoverable via ServiceLoader for namespace "
                         + targetNamespace);
             }
+            validateHooks(hooks, hookStore);
             return new SchemaReconciler(new Engine(
                     dataSource, scratchDataSource, targetNamespace, desiredState,
                     dialect, policy, lockTimeout, statementTimeout, listener,
-                    objectFilter, concurrentIndexes, List.copyOf(renameHints)));
+                    objectFilter, concurrentIndexes, List.copyOf(renameHints),
+                    List.copyOf(retireTargets), List.copyOf(externalPartitionMatchers),
+                    pruneFilter, List.copyOf(hooks), hookStore));
+        }
+
+        private static void validateHooks(List<SchemaHook> hooks, HookStore hookStore) {
+            final var ids = new java.util.HashSet<String>();
+            for (final var hook : hooks) {
+                final var id = hook.id();
+                if (id == null || id.isBlank()) {
+                    throw new ConfigurationException("hook id must not be blank");
+                }
+                if (hook.phase() == null) {
+                    throw new ConfigurationException("hook '" + id + "' has no phase");
+                }
+                if (!ids.add(id)) {
+                    throw new ConfigurationException("duplicate hook id '" + id + "'");
+                }
+                if (hook.runOnce() && hookStore == null) {
+                    throw new ConfigurationException("hook '" + id
+                            + "' is runOnce but no hookStore is configured");
+                }
+            }
         }
     }
 }

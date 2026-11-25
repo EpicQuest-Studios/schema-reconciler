@@ -16,6 +16,8 @@ import * as PgQueries from "./PgQueries.ts";
 
 /** Attribute keys used by the renderer. */
 export const CREATE_SQL = "createSql";
+/** True when the index itself is a relkind `I` partitioned index. */
+export const PARTITIONED_INDEX = "partitionedIndex";
 export const DROP_SQL = "dropSql";
 export const POST_SQL = "postSql";
 export const OWNED_SQL = "ownedSql";
@@ -84,6 +86,7 @@ export async function read(conn: SqlConnection, namespace: string): Promise<Sche
     await data.loadOther(conn);
     await data.loadComments(conn);
     await data.loadDependencies(conn);
+    data.depInvalidPartitionedIndexesOnPartitions();
     await data.loadExternalDependents(conn);
     data.computeDumpSql();
     return data.snapshot();
@@ -594,9 +597,6 @@ class Data {
                 // a documented category prefix per relkind (3.3):
                 // tolerating one non-managed relation kind must
                 // not exempt the others
-                case "I":
-                    id = new ObjectId(ObjectKind.OTHER, "partindex:" + name);
-                    break;
                 // a standalone composite's 'c' row is the type's
                 // backing — the managed TYPE object claims it in
                 // loadComposites
@@ -818,18 +818,24 @@ class Data {
                 continue;
             }
             const name = str(row.relname);
+            const relkind = str(row.relkind);
             const parent = str(row.parent);
             const def = strOrNull(row.def);
+            const valid = bool(row.valid);
             const id = new ObjectId(ObjectKind.INDEX, name, parent);
             this.relByOid.set(num(row.oid), id);
             const attrs = new Map<string, string>();
-            attrs.set(CREATE_SQL, def!);
+            attrs.set(CREATE_SQL, relkind === "I" && valid
+                    ? PgIdentifiers.stripIndexOnOnly(def!) : def!);
+            if (relkind === "I") {
+                attrs.set(PARTITIONED_INDEX, "true");
+            }
             attrs.set(DROP_SQL, "DROP INDEX " + this.qNs + "." + PgIdentifiers.quote(name));
             if (bool(row.replident)) {
                 attrs.set(POST_SQL, "ALTER TABLE " + this.tableRef(parent)
                         + " REPLICA IDENTITY USING INDEX " + PgIdentifiers.quote(name));
             }
-            this.define(id, def! + (bool(row.valid) ? "" : ";valid=false"), attrs);
+            this.define(id, def! + (valid ? "" : ";valid=false"), attrs);
         }
     }
 
@@ -1380,6 +1386,30 @@ class Data {
             }
             this.define(id, def + ";enabled=" + enabled, attrs);
             this.dep(id, this.relByOid.get(num(row.ev_class)));
+        }
+    }
+
+    /**
+     * `CREATE INDEX ... ON ONLY` is order-sensitive: when partitions already
+     * exist it leaves the partitioned parent invalid, while creating it
+     * before those partitions can converge as valid once they attach. Tie an
+     * intentionally invalid partitioned index to the desired/actual
+     * partitions of its parent so creation order preserves that distinction.
+     */
+    depInvalidPartitionedIndexesOnPartitions(): void {
+        for (const [id, o] of this.objects) {
+            if (id.kind !== ObjectKind.INDEX
+                    || o.attrs.get(PARTITIONED_INDEX) !== "true"
+                    || !o.def!.canonical.endsWith(";valid=false")
+                    || id.parent === undefined) {
+                continue;
+            }
+            for (const [partition, _po] of this.objects) {
+                if (partition.kind === ObjectKind.PARTITION
+                        && partition.parent === id.parent) {
+                    this.dep(id, partition);
+                }
+            }
         }
     }
 

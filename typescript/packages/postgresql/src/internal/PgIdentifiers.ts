@@ -73,6 +73,50 @@ export function isConstantDefault(expression: string | null | undefined): boolea
     return false;
 }
 
+
+/** Removes the leading ONLY table qualifier pg_get_indexdef emits for a valid partitioned index. */
+export function stripIndexOnOnly(definition: string): string {
+    let pos = skipSpace(definition, 0);
+    pos = consumeWord(definition, pos, "CREATE");
+    if (pos < 0) return definition;
+    pos = skipSpace(definition, pos);
+    const afterUnique = consumeWord(definition, pos, "UNIQUE");
+    if (afterUnique >= 0) pos = skipSpace(definition, afterUnique);
+    pos = consumeWord(definition, pos, "INDEX");
+    if (pos < 0) return definition;
+    pos = skipSpace(definition, pos);
+    if (pos >= definition.length) return definition;
+    if (definition.charAt(pos) === '"') {
+        pos++;
+        while (pos < definition.length) {
+            if (definition.charAt(pos) === '"') {
+                if (definition.charAt(pos + 1) === '"') pos += 2;
+                else { pos++; break; }
+            } else pos++;
+        }
+    } else {
+        while (pos < definition.length && !/\s/.test(definition.charAt(pos))) pos++;
+    }
+    pos = skipSpace(definition, pos);
+    pos = consumeWord(definition, pos, "ON");
+    if (pos < 0) return definition;
+    pos = skipSpace(definition, pos);
+    const onlyEnd = consumeWord(definition, pos, "ONLY");
+    if (onlyEnd < 0 || onlyEnd >= definition.length || !/\s/.test(definition.charAt(onlyEnd))) {
+        return definition;
+    }
+    return definition.substring(0, pos) + definition.substring(skipSpace(definition, onlyEnd));
+}
+function skipSpace(text: string, pos: number): number {
+    while (pos < text.length && /\s/.test(text.charAt(pos))) pos++;
+    return pos;
+}
+function consumeWord(text: string, pos: number, word: string): number {
+    if (text.substring(pos, pos + word.length).toUpperCase() !== word) return -1;
+    const end = pos + word.length;
+    return end === text.length || /\s/.test(text.charAt(end)) ? end : -1;
+}
+
 /**
  * A scratch namespace name (6.3.1): `<target>__rcl_<12 hex>`,
  * truncated to 63 bytes. The prefix is lower-cased: unquoted references

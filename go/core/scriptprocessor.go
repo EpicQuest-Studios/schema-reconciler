@@ -30,6 +30,8 @@ type scriptProcessor struct {
 	// RenameHints are the `-- @reconciler rename` directives found in the
 	// script (spec 5.5.1).
 	RenameHints []model.RenameHint
+	// RetireTargets are the `-- @reconciler retire` directives found in the script.
+	RetireTargets []model.ObjectId
 }
 
 // newScriptProcessor runs spec 3.2 over the raw script for
@@ -67,14 +69,15 @@ func newScriptProcessor(script, targetNamespace, scratchNamespace string,
 			i++
 		}
 	}
-	hints, err := parseRenameDirectives(script)
+	directives, err := parseScriptDirectives(script)
 	if err != nil {
 		return nil, err
 	}
 	return &scriptProcessor{
 		Substituted:    strings.ReplaceAll(out.String(), "\x00", scriptToken),
 		HasPlaceholder: found,
-		RenameHints:    hints,
+		RenameHints:    directives.renames,
+		RetireTargets: directives.retires,
 	}, nil
 }
 
