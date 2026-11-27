@@ -1,6 +1,7 @@
 # schema-reconciler — Java
 
-Java reference implementation of [SPEC.md](../SPEC.md). See the
+Java reference implementation of the language-neutral [SPEC.md](../SPEC.md),
+under the normative [Java binding](BINDING.md). See the
 [root README](../README.md) for what schema reconciliation is and how the
 engine works.
 

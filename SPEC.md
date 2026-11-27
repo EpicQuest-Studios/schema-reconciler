@@ -1,23 +1,31 @@
 # Schema Reconciler Specification
 
-*Declarative, data-safe schema reconciliation for relational databases in Java*
+*Declarative, data-safe schema reconciliation for relational databases*
 
 | | |
 |---|---|
 | **Version** | 0.11, Draft |
 | **Date** | 2026-10-25 |
-| **Maven group** | `studio.epicquest.schema` |
-| **Java baseline** | Java SE 25 |
-| **Reference implementation** | PostgreSQL 14+ dialect (`schema-reconciler-postgresql`) |
-| **Conformance suite** | `schema-reconciler-tck` |
+| **Reference profile** | PostgreSQL 14+ (Appendix A) |
+| **Conformance scenarios** | C-01 through C-67 (section 9.2) |
+| **Language bindings** | [Java](java/BINDING.md), [TypeScript](typescript/BINDING.md), [Go](go/BINDING.md) |
 
-This document is the working specification of the schema-reconciler project: the contract the core, the PostgreSQL dialect and every third-party dialect are held to, plus background appendices. It is a draft and may change until version 1.0.
+This document is the working specification of the schema-reconciler project: the language-neutral contract that cores, database dialects and conformance suites in every implementation language are held to, plus background appendices. It is a draft and may change until version 1.0.
+
+The specification defines semantics, not a programming-language syntax. The normative mapping of these semantics onto a concrete programming language — package names, object construction syntax, error classes, discovery mechanisms and runtime baselines — is defined in that implementation's binding document:
+
+- [Java binding](java/BINDING.md)
+- [TypeScript binding](typescript/BINDING.md)
+- [Go binding](go/BINDING.md)
 
 ## Document conventions
 
-- Sections 1–11 and Appendices A and D define required behaviour. The preface, examples and rationale embedded in them, and Appendices B and C are background and establish no requirements.
+- Sections 1–11 and Appendix A define required behaviour. The preface, examples and rationale embedded in them, and Appendices B and C are background and establish no requirements.
 - Requirements are stated in plain words: **must** is binding, **should** is a recommendation an implementation may deviate from for good reason, **may** marks a permitted option.
-- Text in `monospace` is program text. Type and member signatures shown in Java blocks are the API surface; the prose beneath each block defines its contract.
+- Text in `monospace` is program text, SQL, a stable identifier or a conceptual type or operation name. Capitalization in this document is canonical for the specification, not a prescription for capitalization in any programming language.
+- Structural definitions use language-neutral types: `string`, `boolean`, `integer`, `duration`, `list of T`, `set of T`, `ordered map of K to V`, and `T or absent`. They are semantic types, not references to a particular standard library.
+- Operation descriptions name inputs, outputs, preconditions, postconditions and failure modes. An operation that performs I/O may be synchronous or asynchronous according to the language binding; concurrency style must not alter the required ordering, isolation or failure semantics.
+- "Fail" means raise, return or otherwise surface the named error in the manner defined by the language binding. Database and driver failures are causes and must be wrapped in the domain error appropriate to the phase in which they occurred.
 
 ## Contents
 
@@ -30,7 +38,7 @@ This document is the working specification of the schema-reconciler project: the
   - [1.6 Platform dependencies](#16-platform-dependencies)
 - [2. Architecture](#2-architecture)
   - [2.1 Modules](#21-modules)
-  - [2.2 Java packages and JPMS](#22-java-packages-and-jpms)
+  - [2.2 Language bindings](#22-language-bindings)
   - [2.3 General API rules](#23-general-api-rules)
 - [3. API](#3-api)
   - [3.1 `SchemaReconciler`](#31-schemareconciler)
@@ -39,7 +47,7 @@ This document is the working specification of the schema-reconciler project: the
   - [3.4 Dialect resolution](#34-dialect-resolution)
   - [3.5 Results](#35-results)
   - [3.6 `ReconcileListener`](#36-reconcilelistener)
-  - [3.7 Multi-namespace reconciliation](#37-multi-namespace-reconciliation)
+  - [3.7 `MultiNamespaceReconciler`](#37-multinamespacereconciler)
   - [3.8 Lifecycle hooks](#38-lifecycle-hooks)
 - [4. Model](#4-model)
   - [4.1 Object identity](#41-object-identity)
@@ -60,7 +68,7 @@ This document is the working specification of the schema-reconciler project: the
   - [6.2 Locking](#62-locking)
   - [6.3 Scratch namespaces](#63-scratch-namespaces)
   - [6.4 Non-transactional DDL](#64-non-transactional-ddl)
-- [7. Exceptions](#7-exceptions)
+- [7. Errors](#7-errors)
 - [8. Security](#8-security)
 - [9. Conformance](#9-conformance)
   - [9.1 The conformance suite](#91-the-conformance-suite)
@@ -79,7 +87,6 @@ This document is the working specification of the schema-reconciler project: the
   - [A.7 Migration path for an existing deployment script](#a7-migration-path-for-an-existing-deployment-script)
 - [Appendix B. Example](#appendix-b-example)
 - [Appendix C. PostgreSQL 14–19 feature coverage and test corpus](#appendix-c-postgresql-1419-feature-coverage-and-test-corpus)
-- [Appendix D. TypeScript binding](#appendix-d-typescript-binding)
   - [Reconciled constructs (managed kinds)](#reconciled-constructs-managed-kinds)
   - [Detected but unsupported (`OTHER` → `UNSUPPORTED` per 5.4)](#detected-but-unsupported-other--unsupported-per-54)
   - [Out of scope (cluster-level or statement-only, per 1.5/3.2)](#out-of-scope-cluster-level-or-statement-only-per-1532)
@@ -89,16 +96,17 @@ This document is the working specification of the schema-reconciler project: the
 
 | Reference | Relevance |
 |---|---|
-| Java SE 25 (`java.base`, `java.sql`, `java.time`, `java.util`) | Runtime baseline (10.5) |
-| JDBC 4.3 (`java.sql`, `javax.sql`) | `javax.sql.DataSource`, `java.sql.Connection`, `DatabaseMetaData`, `SQLException` |
-| Java Platform Module System | `uses`/`provides` dialect discovery (2.2) |
-| `java.lang.System.Logger` | Logging façade (2.3) |
+| SQL:2023 (ISO/IEC 9075) | Namespace, schema-object and dependency terminology |
+| PostgreSQL 14–19 documentation, SQL command reference | Versioned command coverage in Appendix C and the PostgreSQL profile in Appendix A |
+| UTF-8 (RFC 3629) | Required encoding of scripts, SQL output and canonical text |
+| SHA-256 (FIPS 180-4 / RFC 6234) | Snapshot fingerprints (5.7) |
+| Semantic Versioning 2.0.0 | Version compatibility (10.1) |
 
 ## 1. Introduction
 
 ### 1.1 Purpose
 
-This specification defines a Java library that brings a relational database schema to a *desired state* declared as a SQL script. It does so safely, repeatably, and without ever losing data unless a caller explicitly allows it. The model is the declarative one Kubernetes popularised: the script is the single source of truth, and a reconciler drives actual state toward it — here on demand rather than in a continuous control loop. The specification defines:
+This specification defines a library that brings a relational database schema to a *desired state* declared as a SQL script. It does so safely, repeatably, and without ever losing data unless a caller explicitly allows it. The model is the declarative one Kubernetes popularised: the script is the single source of truth, and a reconciler drives actual state toward it — here on demand rather than in a continuous control loop. The specification defines:
 
 - a vendor-neutral **API** used by applications,
 - a **Service Provider Interface (SPI)** implemented once per database product (a *dialect*),
@@ -111,7 +119,7 @@ This specification defines a Java library that brings a relational database sche
 Hand-written schema checkers keep their expected state in code (maps of tables, constraints, indexes and views) duplicated from the schema script, and rarely verify function bodies, trigger definitions or view bodies. This specification generalises the scratch-and-compare approach so that:
 
 1. the expected state is derived from the script itself, never written twice, and
-2. the same contract can be implemented for other relational databases.
+2. the same contract can be implemented for other relational databases and in other programming languages.
 
 ### 1.3 Design principles
 
@@ -123,7 +131,7 @@ Hand-written schema checkers keep their expected state in code (maps of tables, 
 | P4 | **Fail loudly, never silently.** Unsupported constructs, unknown objects and failed verification are errors or explicit report entries, never ignored. |
 | P5 | **Plan before apply.** Every run produces an inspectable plan. Applying is a separate, policy-governed step. |
 | P6 | **Converge and verify.** After applying, the implementation re-reads the catalog and proves that the applied objects now match. |
-| P7 | **No dependencies in the core.** The API, SPI and core depend only on the Java SE platform (`java.base`, `java.sql`). |
+| P7 | **Zero external runtime dependencies in the core.** The API, SPI and reconciliation core use only the implementation language's standard library and the connection abstraction defined by this specification. Database drivers are supplied by the application or dialect integration, never required as a core dependency. |
 
 ### 1.4 Terminology
 
@@ -138,6 +146,8 @@ Hand-written schema checkers keep their expected state in code (maps of tables, 
 | Canonical definition | The engine-rendered definition of an object, after the normalisation rules in section 5.3. |
 | Dialect | An SPI implementation for one database product. |
 | Change | One planned unit of DDL, with an action and a safety class. |
+| Data source | A factory or provider of dedicated database sessions. |
+| Session | One pinned database connection used by at most one reconcile run at a time. |
 
 ### 1.5 Scope
 
@@ -154,166 +164,156 @@ Non-goals for version 1:
 
 ### 1.6 Platform dependencies
 
-- **JDBC 4.3**: all database access uses `javax.sql.DataSource` and `java.sql` types; this specification adds no new connection or statement model and requires no driver beyond what the application already supplies.
-- **Java Platform Module System**: dialect discovery uses `ServiceLoader` under both JPMS (`uses`/`provides`) and the class path (`META-INF/services`), per 2.2.
-- **Logging**: `java.lang.System.Logger` only; no logging framework is required or configured.
-- No third-party schema-management tool is reused or depended on.
+The specification is database-driver-agnostic and language-agnostic. An implementation must satisfy these platform requirements:
+
+1. **Database access abstraction.** The application supplies a data source that yields dedicated sessions. A session is pinned to one underlying database connection for the duration of a run and is never shared concurrently. The abstraction must expose statement execution, catalog querying, database product metadata (at minimum product name and major version), transaction state, commit and rollback, and session close.
+2. **Transaction model.** The session model is the familiar auto-commit model: with auto-commit enabled each statement commits independently; with it disabled subsequent statements join one unit of work; commit or rollback ends that unit; re-enabling auto-commit commits any pending unit. A language binding may adapt a native transaction API to this model, but the observable semantics must be the same.
+3. **Execution environment.** Implementations run on the stable, production runtime documented by their language binding. They must not depend on preview, experimental, incubator or deprecated-for-removal platform facilities.
+4. **Standard library only in the core.** The core must have zero third-party runtime dependencies. Test-only and driver-integration dependencies do not violate this rule when they are not required to use the core API.
+5. **Text encoding.** All scripts, catalog definitions, rendered statements, SQL output and JSON plan text are UTF-8.
+6. **Time.** Run timings are monotonic elapsed durations, never wall-clock timestamps. Output that must be deterministic must not contain timestamps.
+7. **Logging and diagnostics.** Diagnostic logging uses the language's standard-library or lowest-level logging facility and must not require a third-party logging framework. Logging is diagnostic only; reports and errors carry the normative result.
+8. **Concurrency.** Public reconciler instances are immutable after construction and safe for concurrent use according to the binding's execution model. Concurrent runs against the same target namespace are serialised by the namespace lock (section 6.2).
+
+No third-party schema-management tool is reused or depended on.
 
 ## 2. Architecture
 
 ### 2.1 Modules
 
-| Artifact | Contents | Dependencies |
+Implementations are conceptually divided into three modules. A language binding may map them to packages, namespaces, libraries or artifacts as appropriate, but their dependency direction and responsibilities are fixed:
+
+| Module | Contents | Dependencies |
 |---|---|---|
-| `studio.epicquest.schema:schema-reconciler-core` | API, SPI, core algorithm | Java SE only |
-| `studio.epicquest.schema:schema-reconciler-postgresql` | PostgreSQL dialect (reference implementation) | core, PostgreSQL JDBC driver (runtime, provided by the application) |
-| `studio.epicquest.schema:schema-reconciler-tck` | Conformance suite | core, JUnit Jupiter |
+| Core | Application API, snapshot and plan model, dialect SPI, reconciliation engine, dependency graph, diffing, policy evaluation, verification and transaction control | Standard library only |
+| Dialect | Database-specific provider implementing the SPI; the PostgreSQL dialect is the reference profile | Core plus the database driver or driver adapter supplied by the application/dialect integration |
+| TCK | Executable conformance suite implementing the scenarios of section 9.2 against a disposable database | Core plus the language binding's standard test runner |
 
-### 2.2 Java packages and JPMS
+The core owns diffing, dependency expansion, ordering, policy evaluation, verification and transaction control. A dialect owns only vendor-specific catalog access and SQL rendering.
 
-| Package | Role | Stability |
+### 2.2 Language bindings
+
+The following bindings are part of this project and define the implementation-language-specific surface of this contract:
+
+| Binding | Implementation | Normative binding document |
 |---|---|---|
-| `studio.epicquest.schema.reconciler` | API for applications | Stable, semantic versioning |
-| `studio.epicquest.schema.reconciler.model` | Snapshot and plan model | Stable, semantic versioning |
-| `studio.epicquest.schema.reconciler.spi` | Dialect SPI | Stable for implementers; additions may be made in minor versions as `default` methods only |
-| `studio.epicquest.schema.reconciler.internal` | Core algorithm | Not exported |
+| Java | `java/` | [java/BINDING.md](java/BINDING.md) |
+| TypeScript | `typescript/` | [typescript/BINDING.md](typescript/BINDING.md) |
+| Go | `go/` | [go/BINDING.md](go/BINDING.md) |
 
-The core module must be a named JPMS module `studio.epicquest.schema.reconciler` that `exports` the first three packages and `uses studio.epicquest.schema.reconciler.spi.Dialect`. Each dialect module must `provides studio.epicquest.schema.reconciler.spi.Dialect with ...` and must also register itself in `META-INF/services` for class-path use.
+A binding must preserve the semantics of this document exactly. It may choose idiomatic names, type representations, synchrony or asynchrony, error representation, construction syntax and dialect-registration mechanics, but it must not weaken validation, determinism, safety classification, ordering, transactional behaviour, verification or conformance requirements. Where this document and a binding appear to conflict, the semantic contract in this document controls; the binding controls only how that contract is spelled in the language.
 
 ### 2.3 General API rules
 
 All public types must follow these rules:
 
-1. Public methods must not return `null`. Absent values are `Optional<T>`; empty collections are returned as empty, unmodifiable collections.
-2. Public methods must reject `null` arguments with `NullPointerException`.
-3. Data carriers are `record`s that validate their components in the compact constructor and defensively copy collections (`List.copyOf`, `Map.copyOf`, `Set.copyOf`).
-4. Domain failures are unchecked and extend `SchemaReconcilerException` (section 7). `SQLException`s are wrapped, never leaked. Argument validation uses `NullPointerException` and `IllegalArgumentException`.
-5. Logging uses `System.Logger` (`System.getLogger("studio.epicquest.schema.reconciler")`), so the core has no logging dependency.
-6. `SchemaReconciler` instances are immutable and thread-safe. Concurrent runs against the same target namespace are serialised by the namespace lock (section 6.2).
-7. All text read or produced through the API — scripts, statements, definitions, `toSql()` output — is UTF-8.
-8. Public signatures expose only Java SE types and types defined by this specification; no third-party types appear in the API surface.
+1. Public operations must use an explicit representation of absence defined by the binding. They must not use an ambiguous null or missing value as a valid result. Empty collections are returned as empty immutable collections or the binding's closest immutable/read-only equivalent.
+2. Public operations must reject missing or invalid arguments at the boundary closest to construction or invocation. Argument-validation failures are distinct from domain failures defined in section 7.
+3. Data carriers are immutable values: construction validates their invariants, collection contents are defensively copied or otherwise protected from mutation, and equality is value-based where the language supports it.
+4. Domain failures use the error taxonomy of section 7. Database/driver errors are wrapped as causes, never exposed unwrapped. Argument validation uses the binding's ordinary invalid-argument or missing-argument mechanism.
+5. Logging uses the binding's standard-library diagnostic facility and carries no required behavioural information.
+6. `SchemaReconciler` instances are immutable and thread-safe (or safe for concurrent use under the binding's execution model). Concurrent runs against the same target namespace are serialised by the namespace lock (section 6.2).
+7. All text read or produced through the API — scripts, statements, definitions, SQL and JSON plan output — is UTF-8.
+8. Public signatures expose only standard-library types and types defined by this specification or its binding; no third-party types appear in the core API surface.
+9. An asynchronous binding must preserve callback ordering and must await or otherwise complete each asynchronous operation at the same point at which a synchronous binding would complete it.
 
 ## 3. API
 
-The signatures below define the API surface; the Javadoc generated from the reference implementation is part of the specification by reference. All types live in the packages of 2.2.
+The definitions below are the logical API surface. Bindings may use idiomatic capitalization, construction and error propagation, but every operation, input, output, validation and side effect named here is normative.
 
 ### 3.1 `SchemaReconciler`
 
-```java
-package studio.epicquest.schema.reconciler;
+`SchemaReconciler` is the application entry point. It is immutable after construction and safe for concurrent use.
 
-public final class SchemaReconciler {
+| Operation | Input | Output | Contract |
+|---|---|---|---|
+| `plan` | none beyond configuration | `ReconcilePlan` | Computes a plan without changing the target namespace. Requires `desiredState`. |
+| `planTimed` | none beyond configuration | `TimedPlan` | Like `plan`, also returning the phase timings of the planning run (3.5). |
+| `reconcile` | none beyond configuration | `ReconcileReport` | Plans and applies under the configured policy, holding one namespace lock. Requires `desiredState`. |
+| `apply` | `plan: ReconcilePlan` | `ReconcileReport` | Applies a plan previously returned by `plan`; fails if the target has changed since. Requires `desiredState`. |
+| `applyJson` | `serializedPlan: string` | `ReconcileReport` | Deserialises a JSON plan produced by `ReconcilePlan.toJson` and applies it (4.4). Requires `desiredState`. |
+| `dump` | none beyond configuration | UTF-8 `string` | Reads the target namespace under the lock and returns an equivalent namespace-neutral desired-state script. Does not require `desiredState` and never mutates the target. |
 
-    public static Builder builder() { ... }
+A reconciler is assembled through a builder or idiomatic equivalent. The configuration properties are:
 
-    /** Computes a plan without changing the target namespace. */
-    public ReconcilePlan plan() { ... }
-    /** Like plan(), also returning the phase timings of the planning run (3.5). */
-    public TimedPlan planTimed() { ... }
-
-    /** Plans and applies under the configured policy, holding one namespace lock. */
-    public ReconcileReport reconcile() { ... }
-
-    /** Applies a plan previously returned by plan(); fails if the target has changed since. */
-    public ReconcileReport apply(ReconcilePlan plan) { ... }
-
-    /** Deserialises a JSON plan produced by ReconcilePlan.toJson() and applies it (4.4). */
-    public ReconcileReport applyJson(String serializedPlan) { ... }
-
-    /** Reads the target namespace under the lock and returns an equivalent desired-state script. */
-    public String dump() { ... }
-
-    public static final class Builder {
-        public Builder dataSource(DataSource dataSource) { ... }          // required
-        public Builder namespace(String targetNamespace) { ... }          // required
-        public Builder desiredState(DesiredState desiredState) { ... }    // required for plan/reconcile/apply; optional for dump()
-        public Builder dialect(Dialect dialect) { ... }                   // optional, see 3.4
-        public Builder scratchDataSource(DataSource dataSource) { ... }   // optional, see 6.3
-        public Builder policy(ReconcilePolicy policy) { ... }             // default ReconcilePolicy.defaults()
-        public Builder lockTimeout(Duration timeout) { ... }              // default 60 s
-        public Builder statementTimeout(Duration timeout) { ... }         // optional, unbounded by default
-        public Builder concurrentIndexes(boolean enabled) { ... }         // optional, default false (6.4)
-        public Builder rename(ObjectId from, ObjectId to) { ... }         // optional, repeatable explicit rename hint
-        public Builder retire(ObjectId id) { ... }                        // optional, repeatable targeted retirement
-        public Builder externalPartitions(String parentTable) { ... }     // optional, repeatable coexistence rule
-        public Builder externalPartitions(String parentTable, String namePrefix) { ... }
-        public Builder externalPartitions(BiPredicate<String, String> matcher) { ... }
-        public Builder pruneFilter(Predicate<ObjectId> allowPrune) { ... } // optional, default allows every prune
-        public Builder hook(SchemaHook hook) { ... }                      // optional, repeatable lifecycle hook
-        public Builder hookStore(HookStore hookStore) { ... }             // optional run-once hook records
-        public Builder listener(ReconcileListener listener) { ... }       // optional
-        public Builder filter(Predicate<ObjectId> include) { ... }        // optional, default includes all objects
-        public SchemaReconciler build() { ... }
-    }
-}
-```
+| Property | Type | Required/default | Contract |
+|---|---|---|---|
+| `dataSource` | data source | required | Source of dedicated target-database sessions. |
+| `namespace` | `string` | required, non-empty | Target namespace. |
+| `desiredState` | `DesiredState` | required for `plan`, `reconcile`, `apply` and `applyJson`; optional for `dump` | Desired-state script. |
+| `dialect` | `Dialect` | optional | Explicit dialect; otherwise resolved per 3.4. |
+| `scratchDataSource` | data source | optional | Separate scratch-database source (6.3). |
+| `policy` | `ReconcilePolicy` | default `ReconcilePolicy.defaults()` | Apply/report/fail policy. |
+| `lockTimeout` | `duration` | default 60 seconds | Maximum wait for the namespace lock; must be positive. |
+| `statementTimeout` | `duration or absent` | absent, meaning unbounded | Per-statement bound when present; must be positive. |
+| `concurrentIndexes` | `boolean` | default `false` | Enables non-transactional concurrent index forms where supported (6.4). |
+| `rename` | `(from: ObjectId, to: ObjectId)` | optional, repeatable | Explicit rename hint. |
+| `retire` | `ObjectId` | optional, repeatable | Targeted retirement of one managed object. |
+| `externalPartitions` | parent name, parent+prefix, or `(parentTable, partitionName)` predicate | optional, repeatable | Runtime-created partition coexistence rule. |
+| `pruneFilter` | `ObjectId` predicate | default accepts every object | Restricts which unexpected objects may be dropped when pruning is enabled. |
+| `hook` | `SchemaHook` | optional, repeatable | Lifecycle hook (3.8). |
+| `hookStore` | `HookStore` | optional | Durable records for run-once hooks (3.8). |
+| `listener` | `ReconcileListener` | optional no-op | Run callbacks (3.6). |
+| `filter` | `ObjectId` predicate | default includes all objects | Visibility filter applied to both snapshots. |
 
 `filter` excludes objects from both snapshots — actual and desired alike — before comparison: an object the predicate rejects produces no difference, no change and no unexpected-object report, and its children (`ObjectId.parent`), mirrored annotations — managed or `OTHER`-prefixed — (comments, security labels, ownership, privileges, publication bindings, `constraint:<target>.<member>` shadows) and follower objects it covers (a serial `SEQUENCE`'s `OWNED BY` dependency) are invisible with it. Dependency edges an excluded object records are invisible too, and the staleness fingerprint (5.7) covers only visible objects. Filtering is how a caller coexists with objects another tool manages; it is not a safety valve — an excluded object that should have been reconciled is simply never seen.
 
 `externalPartitions` is the narrower coexistence API for runtime-created PostgreSQL partitions. Rules are repeatable and OR-matched: a rule either names a partitioned parent, names a parent plus a prefix, or is a `(parentTable, partitionName)` predicate. A matching actual `PARTITION` is hidden only when it is not declared in desired and its partitioned-table ancestor is declared in desired; hiding cascades to its columns, local indexes, constraints, triggers, annotations and sub-partitions through the same cascade as `filter`. A declared `DEFAULT` or bootstrap partition reconciles normally even when its name matches. If the partitioned parent itself is absent from desired, its partitions remain visible so `prune` never renders a parent `DROP TABLE` whose non-CASCADE semantics the hidden children would contradict. `dump()` omits rule-matching partitions and their children.
 
-`retire` marks one managed object for targeted removal even when `policy.prune()` is false. `pruneFilter` does not affect visibility: unexpected objects remain in plans and reports, but when pruning is enabled only objects accepted by the predicate receive standalone drops. Rejecting an unexpected container protects its contained columns, constraints, indexes, triggers, policies, mirrored annotations, serial-owned sequences and nested partitions transitively, unless such a child is explicitly retired.
+`retire` marks one managed object for targeted removal even when `policy.prune` is false. `pruneFilter` does not affect visibility: unexpected objects remain in plans and reports, but when pruning is enabled only objects accepted by the predicate receive standalone drops. Rejecting an unexpected container protects its contained columns, constraints, indexes, triggers, policies, mirrored annotations, serial-owned sequences and nested partitions transitively, unless such a child is explicitly retired.
 
-`build()` must fail with `ConfigurationException` if a required property is missing, if `lockTimeout` or `statementTimeout` is zero or negative, or — when no dialect is set — if no `Dialect` provider is discoverable via `ServiceLoader` at all. An empty namespace counts as missing. `desiredState` is required for `plan()`, `reconcile()` and `apply()` but may be omitted when the reconciler is built for `dump()` alone; those methods then fail with `ConfigurationException` naming the missing property. `build()` must not open a connection: the `supports(DatabaseMetaData)` check of 3.4 needs one, so final dialect selection is deferred to the first use of the reconciler.
+Builder completion must fail with `ConfigurationError` if a required property is missing, if `lockTimeout` or `statementTimeout` is zero or negative, or — when no dialect is set — if no dialect provider is registered or discoverable by the binding's mechanism. An empty namespace counts as missing. `desiredState` is required for `plan`, `reconcile`, `apply` and `applyJson` but may be omitted when the reconciler is built for `dump` alone; those operations then fail with `ConfigurationError` naming the missing property. Builder completion must not open a connection: dialect `supports` needs connection metadata, so final dialect selection is deferred to the first use of the reconciler.
 
-`dump()` performs steps 1 to 3 of 5.1 — connect, lock, read the actual snapshot — and renders the snapshot as a desired-state script: a deterministic header comment naming the dialect id, the target namespace and the actual fingerprint (never a timestamp), then for each object, in `dependsOn` order, the create-fragment statements the dialect returns from `dumpStatements` (6.1), each terminated by `;`. Objects whose `dumpStatements` is empty are emitted as comment lines — `-- folded: <id>` for an object folded into its parent's create fragment (columns, serial-owned sequences), `-- unsupported: <id>` for `ObjectKind.OTHER` objects and anything else the dialect cannot render — so nothing is silently dropped. Feeding the output back as a desired-state script on an equal database produces an empty plan and a byte-identical second dump.
+`dump` performs steps 1 to 3 of 5.1 — connect, lock, read the actual snapshot — and renders the snapshot as a desired-state script: a deterministic header comment naming the dialect id, the target namespace and the actual fingerprint (never a timestamp), then for each object, in `dependsOn` order, the create-fragment statements the dialect returns from `dumpStatements` (6.1), each terminated by `;`. Objects whose `dumpStatements` is empty are emitted as comment lines — `-- folded: <id>` for an object folded into its parent's create fragment (columns, serial-owned sequences), `-- unsupported: <id>` for `ObjectKind.OTHER` objects and anything else the dialect cannot render — so nothing is silently dropped. Feeding the output back as a desired-state script on an equal database produces an empty plan and a byte-identical second dump.
 
-`plan()` and `planTimed()` perform the planning steps of 5.1 without changing the target; `planTimed()` additionally returns the run's `RunTimings` (3.5). A `ReconcileListener` exception during planning aborts as `PlanningException` (3.6).
+`plan` and `planTimed` perform the planning steps of 5.1 without changing the target; `planTimed` additionally returns the run's `RunTimings` (3.5). A listener failure during planning aborts as `PlanningError` (3.6).
 
 ### 3.2 `DesiredState`
 
-```java
-public record DesiredState(String script) {
-    public static DesiredState ofScript(String sql) { ... }
-    public static DesiredState ofResource(ClassLoader loader, String resourceName) { ... }
-    public static DesiredState ofPath(Path path) { ... }
+```text
+structure DesiredState {
+    script: string   // UTF-8 SQL script
 }
 ```
 
-Namespace references inside the script must be written as the placeholder `${namespace}`, for example `CREATE TABLE ${namespace}.plans (...)`. The core replaces every occurrence with the scratch namespace identifier, quoted by the dialect, before executing the script. The replacement is already quoted, so the script must not quote the placeholder itself: `"${namespace}"` would be quoted twice. The core must reject a placeholder directly enclosed in the dialect's identifier quotes with `DesiredStateException`. To write the literal text `${namespace}`, for example inside a routine body that builds SQL, the script writes `$${namespace}`, which the core emits as `${namespace}` without substitution. Only the exact token `${namespace}` is recognised; any other `${...}` text is left unchanged. A script may instead leave every object name unqualified; the core then binds the scratch connection's session namespace before executing it (`bindSessionNamespace`, 6.1), which requires `DialectCapabilities.sessionDefaultNamespace`. If the script contains no `${namespace}` placeholder and the dialect does not support a session default namespace, `plan()` must fail with `DesiredStateException`.
+Every binding must provide construction from an in-memory string and from a UTF-8 file or path. It may additionally provide resource- or stream-based construction idiomatic to the platform. Construction reads the complete script once; read failures surface as `DesiredStateError`.
 
-The desired script is a trusted build artefact. It is executed with the privileges of the configured `DataSource`. Its content is constrained:
+Namespace references inside the script must be written as the placeholder `${namespace}`, for example `CREATE TABLE ${namespace}.plans (...)`. The core replaces every occurrence with the scratch namespace identifier, quoted by the dialect, before executing the script. The replacement is already quoted, so the script must not quote the placeholder itself: `"${namespace}"` would be quoted twice. The core must reject a placeholder directly enclosed in the dialect's identifier quotes with `DesiredStateError`. To write the literal text `${namespace}`, for example inside a routine body that builds SQL, the script writes `$${namespace}`, which the core emits as `${namespace}` without substitution. Only the exact token `${namespace}` is recognised; any other `${...}` text is left unchanged. A script may instead leave every object name unqualified; the core then binds the scratch connection's session namespace before executing it (`bindSessionNamespace`, 6.1), which requires `DialectCapabilities.sessionDefaultNamespace`. If the script contains no `${namespace}` placeholder and the dialect does not support a session default namespace, `plan` must fail with `DesiredStateError`.
+
+The desired script is a trusted build artefact. It is executed with the privileges of the configured data source. Its content is constrained:
 
 1. The script should create objects only inside `${namespace}` (or unqualified). A statement that creates an object in another namespace escapes the scratch namespace — it can neither be detected nor cleaned up — so its behaviour is undefined. A dialect may instead reject a statement it can determine would create an object with no namespace anchor at all — a role or a server, for example — since such an object could never appear in a snapshot (5.4).
 2. The script must not create, alter or drop namespaces, must not acquire session-level locks (for example `pg_advisory_lock`), and must not change session state (for example `SET` without `LOCAL`, `RESET`, `LOAD`, or `set_config` with `is_local` other than the literal `true`): session-level effects can leak onto a pooled connection (C-21). A dialect should detect these statically, including inside anonymous code blocks, and must release any session-level lock a script took indirectly (for example inside a function it invoked) before the scratch connection is reused (A.2). A dialect may also reject a statement whose created, altered or dropped object name is qualified by a namespace other than the scratch namespace — the statement would escape the scratch namespace even though its text parses.
-3. On transactional dialects, the script must not contain transaction control (`BEGIN`, `COMMIT`, `ROLLBACK`, `SAVEPOINT`), nor statements that cannot run inside a transaction block, for example `CREATE INDEX CONCURRENTLY` or `VACUUM` (OI-3). After executing the script, the dialect must check that the run's transaction and scratch savepoint are still intact. If they are not, it must remove the scratch namespace and fail with `DesiredStateException`.
+3. On transactional dialects, the script must not contain transaction control (`BEGIN`, `COMMIT`, `ROLLBACK`, `SAVEPOINT`), nor statements that cannot run inside a transaction block, for example `CREATE INDEX CONCURRENTLY` or `VACUUM` (OI-3). After executing the script, the dialect must check that the run's transaction and scratch savepoint are still intact. If they are not, it must remove the scratch namespace and fail with `DesiredStateError`.
 4. Other non-DDL statements may appear; their effects are confined to the scratch connection. A dialect may instead reject a statement whose catalog effect its snapshot cannot represent — it would apply during the scratch replay yet leave no detectable trace, so a plan could claim success while the target never changed. The PostgreSQL check therefore rejects comments and security labels on the reconcile unit itself (`COMMENT ON SCHEMA`, `SECURITY LABEL ... ON SCHEMA` — its acl and owner are snapshot state, its annotations are not), storage-placement clauses (`TABLESPACE`, `REINDEX ... TABLESPACE`), typed tables (`OF`), non-heap access methods (`CREATE TABLE ... USING`), clustering-index membership (`CLUSTER ... USING`, `ALTER ... CLUSTER ON`), planner tuning (`SET STATISTICS`), sequence `RESTART`, `OWNER TO` on targets whose owner column is not modeled (including `ALTER INDEX`, whose owner silently follows its table), partition-index attach, operator member mutations beyond an operator class's `ADD|DROP OPERATOR|FUNCTION` forms (snapshot state — standalone `OPERATOR FAMILY` members stay unmodeled) and text-search member mutations beyond a configuration's `MAPPING` forms and a dictionary's option redefinition, `DEPENDS ON EXTENSION`, collation `REFRESH VERSION` and view column defaults.
-5. The script must not refer to the target namespace by its literal name; it uses `${namespace}` or unqualified names instead. Before substitution, the core must search the script for the target namespace identifier — bare or enclosed in the dialect's identifier quotes, compared case-insensitively — immediately followed by `.` and not preceded by an identifier character (letter, digit, `_`, `$`) or by `.`. On a match, `plan()` must fail with `DesiredStateException` giving the position of the first match.
+5. The script must not refer to the target namespace by its literal name; it uses `${namespace}` or unqualified names instead. Before substitution, the core must search the script for the target namespace identifier — bare or enclosed in the dialect's identifier quotes, compared case-insensitively — immediately followed by `.` and not preceded by an identifier character (letter, digit, `_`, `$`) or by `.`. On a match, `plan` must fail with `DesiredStateError` giving the position of the first match.
 
    Rationale: in the scratch namespace a literal reference stays literal. In the actual snapshot, normalisation rule 5.3(1) turns the same reference into `${namespace}.`. The object would therefore be `DRIFTED` on every run and never pass verification. The check is lexical, so a match inside a comment or string literal also fails; this follows P4, and the script author can rewrite the text. The same failure has a second form on the placeholder side: substitution replaces `${namespace}` textually, so a bare token inside a string literal — `DEFAULT '${namespace}'` — bakes the scratch name itself into the catalog, where it stays literal and drifts on every run; and a literal the escape leaves behind — `DEFAULT '$${namespace}'` — stores the token text, which binding replaces with the quoted target on apply while normalisation sees no `.` qualifier, drifting forever. The PostgreSQL dialect therefore rejects a string literal whose whole content is the substituted scratch name (bare or in identifier quotes) and any literal containing the token text unless it is followed by `.`; the qualified form `'${namespace}.seq'` inside a literal stays legal because binding and normalisation both see the `.` qualifier.
 
 ### 3.3 `ReconcilePolicy`
 
-```java
-public enum Decision { APPLY, REPORT, FAIL }
+```text
+enumeration Decision { APPLY, REPORT, FAIL }
 
-public record ReconcilePolicy(
-        Decision additive,                          // default APPLY
-        Decision rebuild,                           // default APPLY
-        Decision destructive,                       // default FAIL
-        Decision unsupported,                       // default FAIL; APPLY is not permitted
-        Map<String, Decision> unsupportedCategories,// per-category overrides; APPLY is not permitted
-        boolean prune) {                            // default false; opt-in DROP for UNEXPECTED objects
-
-    public static ReconcilePolicy defaults() { ... }
-    public static ReconcilePolicy reportOnly() { ... }  // REPORT for every class, prune = false
-
-    public ReconcilePolicy withDestructive(Decision decision) { ... }
-    public ReconcilePolicy withUnsupportedCategory(String category, Decision decision) { ... }
-    public ReconcilePolicy withPrune(boolean prune) { ... }
-    // with... for each component
+structure ReconcilePolicy {
+    additive: Decision                                      // default APPLY
+    rebuild: Decision                                       // default APPLY
+    destructive: Decision                                   // default FAIL
+    unsupported: Decision                                   // default FAIL; APPLY is not permitted
+    unsupportedCategories: ordered map of string to Decision // per-category overrides; APPLY is not permitted
+    prune: boolean                                          // default false; opt-in DROP for UNEXPECTED objects
 }
 ```
 
-The compact constructor must reject `unsupported == APPLY` and any `unsupportedCategories` value of `APPLY` with `IllegalArgumentException`. The safety classes are defined in section 5.6.
+`ReconcilePolicy.defaults()` returns the defaults above. `ReconcilePolicy.reportOnly()` returns `REPORT` for every class with `prune = false`. A policy is immutable; each `with...` operation returns a modified copy. Construction must reject `unsupported = APPLY` and every `unsupportedCategories` value of `APPLY` as invalid arguments. The safety classes are defined in section 5.6.
 
-`unsupportedCategories` overrides `unsupported` per *difference category*. The category of an `UNSUPPORTED` difference is, for an `ObjectKind.OTHER` object, the dialect's documented name prefix before `:` (for example `privileges`, `comment`, `constraint`, `cast`, `inherited`; an `OTHER` name without a prefix is `relation`), and for any other kind the lowercased `ObjectKind` name (for example `table`, `routine`). A policy can therefore tolerate objects it deliberately leaves to other tooling — grants or comments, for example — while still failing on unsupported constructs that carry reconciliation risk, such as inheritance children or uncreatable types. Categories are stable identifiers, never free-text matching: a category not present in the map falls back to `unsupported`, which defaults to `FAIL` — unknown or unclassified objects fail closed. The decision for a difference is `unsupportedCategories.getOrDefault(category, unsupported)`. The PostgreSQL prefix list is in A.5.
+`unsupportedCategories` overrides `unsupported` per *difference category*. The category of an `UNSUPPORTED` difference is, for an `ObjectKind.OTHER` object, the dialect's documented name prefix before `:` (for example `privileges`, `comment`, `constraint`, `cast`, `inherited`; an `OTHER` name without a prefix is `relation`), and for any other kind the lowercased `ObjectKind` name (for example `table`, `routine`). A policy can therefore tolerate objects it deliberately leaves to other tooling — grants or comments, for example — while still failing on unsupported constructs that carry reconciliation risk, such as inheritance children or uncreatable types. Categories are stable identifiers, never free-text matching: a category not present in the map falls back to `unsupported`, which defaults to `FAIL` — unknown or unclassified objects fail closed. The decision for a difference is the category override when present, otherwise `unsupported`. The PostgreSQL prefix list is in A.5.
 
-`additive`, `rebuild` and `destructive` govern *changes* by their `ChangeSafety`. `unsupported` governs *differences*: an `UNSUPPORTED` difference (5.4) never produces a `PlannedChange`, so it is evaluated against `plan.differences()`, not `plan.changes()`. Semantics of each decision:
+`additive`, `rebuild` and `destructive` govern *changes* by their `ChangeSafety`. `unsupported` governs *differences*: an `UNSUPPORTED` difference (5.4) never produces a `PlannedChange`, so it is evaluated against `plan.differences`, not `plan.changes`. Semantics of each decision:
 
 - `APPLY`: the change is executed.
-- `REPORT`: the change is not executed. It appears in `ReconcileReport.reported()` and is logged at `WARNING`. For `unsupported`, each `UNSUPPORTED` difference appears in `ReconcileReport.unsupported()` and is logged at `WARNING`.
-- `FAIL`: if the plan contains at least one change of this class — or, for `unsupported`, at least one `UNSUPPORTED` difference — `reconcile()` and `apply(plan)` must throw `PolicyViolationException` **before executing any change**.
+- `REPORT`: the change is not executed. It appears in `ReconcileReport.reported` and is logged as a warning. For `unsupported`, each `UNSUPPORTED` difference appears in `ReconcileReport.unsupported` and is logged as a warning.
+- `FAIL`: if the plan contains at least one change of this class — or, for `unsupported`, at least one `UNSUPPORTED` difference — `reconcile` and `apply(plan)` must fail with `PolicyViolationError` **before executing any change**.
 
 Unexpected objects (section 5.5) never produce changes when `prune` is `false` (the default), except for targeted retirements and the table-shape conflict defined there. When `prune` is `true`, `UNEXPECTED` managed objects accepted by `pruneFilter` produce standalone `DROP` changes classified by data risk (`REBUILD` for indexes, views, routines, constraints, etc.; `DESTRUCTIVE` for tables, columns, materialized views, partitions, sequences) and governed by `rebuild` / `destructive` like any other change.
 
@@ -321,45 +321,52 @@ A change whose `statements` list is empty is a *manual change*: the dialect can 
 
 **Evaluation** (step 7 of 5.1) proceeds in this order:
 
-1. *Fail check.* Map every change to its class's decision, treating a manual change mapped to `APPLY` as `FAIL`. If any change maps to `FAIL`, or any `UNSUPPORTED` difference resolves to `FAIL` under `unsupported` and `unsupportedCategories`, throw `PolicyViolationException` carrying the plan.
+1. *Fail check.* Map every change to its class's decision, treating a manual change mapped to `APPLY` as `FAIL`. If any change maps to `FAIL`, or any `UNSUPPORTED` difference resolves to `FAIL` under `unsupported` and `unsupportedCategories`, raise `PolicyViolationError` carrying the plan.
 2. *Recreate pairing.* The `DROP` and `CREATE` halves of one recreate (4.4) always receive the same decision.
 3. *Prerequisite closure.* A change mapped to `APPLY` must be demoted to `REPORT` when its target depends — through `dependsOn` in the desired snapshot, transitively, or through `ObjectId.parent` — on a *blocked* object. An object is blocked when either:
    - it has a change in the plan that is not applied (mapped to `REPORT`, or demoted), or
    - it is the subject of an `UNSUPPORTED` difference and the actual snapshot has no object with an equal `ObjectId` and canonical definition.
 
-   Demotion repeats until no further change is demoted. The `DROP` half of a demoted recreate is demoted with it. A demoted change appears in `reported()` and its `WARNING` log entry must name the blocking object. This keeps the applied part of a plan executable: the core never runs a change against a prerequisite it has not created or brought up to date.
+   Demotion repeats until no further change is demoted. The `DROP` half of a demoted recreate is demoted with it. A demoted change appears in `reported` and its warning log entry must name the blocking object. This keeps the applied part of a plan executable: the core never runs a change against a prerequisite it has not created or brought up to date.
 
 ### 3.4 Dialect resolution
 
-Dialects are discovered with `ServiceLoader.load(Dialect.class)`. When the dialect is not set explicitly, the core must select the single candidate whose `supports(DatabaseMetaData)` returns `true` for a connection from the configured `DataSource`; zero or several matches must raise `ConfigurationException`, naming the product and the candidate dialects. Because `supports()` needs a connection and `build()` opens none, this selection happens on the first `plan()`, `reconcile()` or `apply()` call, which is where `ConfigurationException` for an unresolvable dialect is thrown. `SQLException`s from `supports()` are wrapped in `ConfigurationException`.
+A language binding must provide a deterministic way to register or discover dialect candidates, and the builder always permits an explicit dialect. When the dialect is not set explicitly, the core must select the single registered or discoverable candidate whose `supports` operation returns `true` for metadata obtained from a connection from the configured data source; zero or several matches must raise `ConfigurationError`, naming the product and the candidate dialects. Because `supports` needs connection metadata and builder completion opens no connection, this selection happens on the first `plan`, `reconcile`, `apply`, `applyJson` or `dump` call, which is where `ConfigurationError` for an unresolvable dialect is surfaced. Database/driver failures from `supports` or metadata lookup are wrapped in `ConfigurationError`.
 
-When the dialect is set explicitly, the core must still verify `supports()` on first use and raise `ConfigurationException` on a mismatch, so that wiring errors surface early.
+When the dialect is set explicitly, the core must still verify `supports` on first use and raise `ConfigurationError` on a mismatch, so that wiring errors surface early.
 
 ### 3.5 Results
 
-```java
-public enum ReconcileOutcome { UP_TO_DATE, RECONCILED, REPORTED_ONLY }
+```text
+enumeration ReconcileOutcome { UP_TO_DATE, RECONCILED, REPORTED_ONLY }
 
-public record ReconcileReport(
-        ReconcileOutcome outcome,
-        ReconcilePlan plan,
-        List<PlannedChange> applied,
-        List<PlannedChange> reported,
-        List<Difference> unexpected,
-        List<Difference> unsupported,   // UNSUPPORTED differences reported under policy REPORT (3.3)
-        Duration elapsed,
-        RunTimings timings) { }
+structure ReconcileReport {
+    outcome: ReconcileOutcome
+    plan: ReconcilePlan
+    applied: list of PlannedChange
+    reported: list of PlannedChange
+    unexpected: list of Difference
+    unsupported: list of Difference   // UNSUPPORTED differences reported under policy REPORT (3.3)
+    elapsed: duration
+    timings: RunTimings
+}
 
-public record RunTimings(
-        Duration lockWait,      // time spent acquiring the namespace lock — contention shows here
-        Duration readActual,    // catalog read of the target namespace
-        Duration loadDesired,   // scratch namespace + script + snapshot + cleanup
-        Duration plan,          // diff, render and plan assembly
-        Duration apply,         // the window in which applied DDL holds its locks
-        Duration verify) { }    // post-apply snapshot re-read and comparison
+structure RunTimings {
+    lockWait: duration      // time spent acquiring the namespace lock — contention shows here
+    readActual: duration    // catalog read of the target namespace
+    loadDesired: duration   // scratch namespace + script + snapshot + cleanup
+    plan: duration          // diff, render and plan assembly
+    apply: duration         // the window in which applied DDL holds its locks
+    verify: duration        // post-apply snapshot re-read and comparison
+}
+
+structure TimedPlan {
+    plan: ReconcilePlan
+    timings: RunTimings
+}
 ```
 
-`timings` measures the run so adopters can size its locking impact on a realistic database (OI-6). `SchemaReconciler.planTimed()` (3.1) returns the same measurements for a planning run as a `TimedPlan(plan, timings)`; its `apply` and `verify` phases are zero. DDL locks release only at commit, so the lock-holding window is `apply` + `verify`. All phases are monotonic elapsed times measured with `System.nanoTime`, never wall-clock differences. On failure the run still surfaces its timings: the exception's `timings()` returns the completed phases plus the partial duration of the phase that failed (section 7). `statementTimeout` bounds each *statement*, not the run — a run of many short statements can exceed it.
+`timings` measures the run so adopters can size its locking impact on a realistic database (OI-6). `SchemaReconciler.planTimed` (3.1) returns the same measurements for a planning run as a `TimedPlan`; its `apply` and `verify` phases are zero. DDL locks release only at commit, so the lock-holding window is `apply` + `verify`. All phases are monotonic elapsed times measured with a monotonic clock, never wall-clock differences. On failure the run still surfaces its timings: the error's `timings` value returns the completed phases plus the partial duration of the phase that failed (section 7). `statementTimeout` bounds each *statement*, not the run — a run of many short statements can exceed it.
 
 - `UP_TO_DATE`: the plan had no changes. Unexpected objects and `UNSUPPORTED` differences reported under `REPORT` do not prevent `UP_TO_DATE`. They are listed in `unexpected` and `unsupported` respectively and never produce changes (5.4, 5.5).
 - `RECONCILED`: at least one change was applied and verified.
@@ -367,112 +374,85 @@ public record RunTimings(
 
 ### 3.6 `ReconcileListener`
 
-```java
-public interface ReconcileListener {
-    default void planned(ReconcilePlan plan) { }
-    default void applying(PlannedChange change) { }
-    default void applied(PlannedChange change, Duration elapsed) { }
-    default void reported(PlannedChange change) { }
-}
-```
+A listener may implement any subset of these callbacks; an omitted callback is a no-op:
 
-Listeners are called on the reconciling thread. An exception thrown by a listener must abort the run as `ApplyException`, carrying the changes applied so far (possibly none) and, when thrown from `applying` or `applied`, the change being processed. This holds even when the exception comes from `planned`, before anything is applied. `plan()` applies nothing, so there a listener exception aborts as `PlanningException`. In transactional dialects the abort rolls everything back.
+| Callback | Input | When invoked |
+|---|---|---|
+| `planned` | `plan: ReconcilePlan` | After the plan is computed. |
+| `applying` | `change: PlannedChange` | Before a change's statements execute. |
+| `applied` | `change: PlannedChange`, `elapsed: duration` | After a change executes. |
+| `reported` | `change: PlannedChange` | For each change the policy maps or demotes to `REPORT`. |
+
+Listeners are called on the reconcile run's execution context, in plan and phase order. A failure thrown or returned by a listener must abort the run as `ApplyError`, carrying the changes applied so far (possibly none) and, when raised from `applying` or `applied`, the change being processed. This holds even when the failure comes from `planned`, before anything is applied. `plan` applies nothing, so there a listener failure aborts as `PlanningError`. In transactional dialects the abort rolls everything back. An asynchronous binding must complete each listener callback before continuing.
 
 ### 3.7 `MultiNamespaceReconciler`
 
-```java
-public final class MultiNamespaceReconciler {
+`MultiNamespaceReconciler` coordinates independent single-namespace reconcilers. It preserves configured namespace order.
 
-    public static Builder builder() { ... }
+| Operation | Output | Contract |
+|---|---|---|
+| `plan` | ordered map of namespace `string` to `ReconcilePlan` | One `plan` per namespace, in configured order. |
+| `reconcile` | `MultiReconcileReport` | One `reconcile` per namespace in configured order; fails fast on the first error. |
+| `dump` | ordered map of namespace `string` to UTF-8 script `string` | One `dump` per namespace, in configured order. |
 
-    /** One plan() per namespace, in configured order. */
-    public Map<String, ReconcilePlan> plan() { ... }
-
-    /** One reconcile() per namespace in configured order; fails fast on the first exception. */
-    public MultiReconcileReport reconcile() { ... }
-
-    /** One dump() per namespace, in configured order. */
-    public Map<String, String> dump() { ... }
-
-    public static final class Builder {
-        // shared defaults forwarded to each namespace's SchemaReconciler.Builder
-        public Builder dataSource(DataSource dataSource) { ... }          // required
-        public Builder scratchDataSource(DataSource dataSource) { ... }   // optional, see 6.3
-        public Builder dialect(Dialect dialect) { ... }                   // optional, see 3.4
-        public Builder policy(ReconcilePolicy policy) { ... }             // default ReconcilePolicy.defaults()
-        public Builder lockTimeout(Duration timeout) { ... }              // default 60 s
-        public Builder statementTimeout(Duration timeout) { ... }         // optional, unbounded by default
-        public Builder concurrentIndexes(boolean enabled) { ... }         // optional, default false (6.4)
-        public Builder listener(ReconcileListener listener) { ... }       // optional
-        public Builder filter(Predicate<ObjectId> include) { ... }        // optional, default includes all objects
-
-        /** Registers a target namespace, preserving execution order. */
-        public Builder namespace(String namespace) { ... }                                // dump()-only usage
-        public Builder namespace(String namespace, DesiredState desiredState) { ... }
-        public Builder namespace(String namespace, DesiredState desiredState,
-                                 Consumer<SchemaReconciler.Builder> customize) { ... }
-        public MultiNamespaceReconciler build() { ... }
-    }
+```text
+structure MultiReconcileReport {
+    outcome: ReconcileOutcome
+    reports: ordered map of string to ReconcileReport   // ordered by configured namespace order
+    elapsed: duration
 }
-
-public record MultiReconcileReport(
-        ReconcileOutcome outcome,
-        Map<String, ReconcileReport> reports,   // insertion-ordered by configured namespace order
-        Duration elapsed) { }
 ```
 
-`build()` must fail with `ConfigurationException` when `dataSource` is missing, when no namespace is registered, or when a namespace name is empty or a duplicate (compared case-sensitively); it also builds every registered `SchemaReconciler` up front — applying the shared defaults first, then the optional `customize` — so a per-namespace configuration error fails at `build()` without opening a connection (3.1). `reconcile()` runs the namespaces sequentially in configured order, each under its own namespace lock, so a later namespace's desired script may reference an earlier namespace's objects — a cross-schema `REFERENCES`, an external dependency (5.8.3) — and aborts the whole run on the first exception. `MultiReconcileReport.outcome` aggregates the per-namespace outcomes: `RECONCILED` when any namespace reconciled, else `REPORTED_ONLY` when any reported, else `UP_TO_DATE`; `elapsed` is the call's total monotonic run time.
+The multi-namespace builder accepts the shared defaults `dataSource`, `scratchDataSource`, `dialect`, `policy`, `lockTimeout`, `statementTimeout`, `concurrentIndexes`, `listener`, `filter`, `externalPartitions`, `pruneFilter` and `hookStore`, with the same defaults and validation as the single-namespace builder. Each namespace registration carries a non-empty unique namespace name, an optional `DesiredState` (required except for dump-only use), and an optional per-namespace customization operation. Shared defaults are applied first, then the customization operation.
 
-`externalPartitions`, `pruneFilter` and `hookStore` are also available on `MultiNamespaceReconciler.Builder` and are forwarded to every per-namespace builder before its customization callback runs.
+Builder completion must fail with `ConfigurationError` when `dataSource` is missing, when no namespace is registered, or when a namespace name is empty or a duplicate (compared case-sensitively); it also builds every registered `SchemaReconciler` up front so a per-namespace configuration error fails at builder completion without opening a connection (3.1). `reconcile` runs the namespaces sequentially in configured order, each under its own namespace lock, so a later namespace's desired script may reference an earlier namespace's objects — a cross-schema `REFERENCES`, an external dependency (5.8.3) — and aborts the whole run on the first error. `MultiReconcileReport.outcome` aggregates the per-namespace outcomes: `RECONCILED` when any namespace reconciled, else `REPORTED_ONLY` when any reported, else `UP_TO_DATE`; `elapsed` is the call's total monotonic run time.
 
 ### 3.8 Lifecycle hooks
 
-```java
-public enum HookPhase { PRE_APPLY, POST_APPLY, POST_COMMIT }
+```text
+enumeration HookPhase { PRE_APPLY, POST_APPLY, POST_COMMIT }
 
-public record HookContext(String namespace, String dialectId, HookPhase phase,
-        ReconcilePlan plan, List<PlannedChange> applied, Connection connection) { }
-
-public interface SchemaHook {
-    String id();
-    HookPhase phase();
-    default int order() { return 0; }
-    default boolean runOnce() { return false; }
-    default String checksum() { return ""; }
-    void run(HookContext context) throws Exception;
-
-    static SchemaHook of(String id, HookPhase phase, HookAction action) { ... }
-    static SchemaHook of(String id, HookPhase phase, int order, HookAction action) { ... }
-    static SchemaHook runOnce(String id, HookPhase phase, String checksum, HookAction action) { ... }
-    static SchemaHook runOnce(String id, HookPhase phase, int order, String checksum, HookAction action) { ... }
+structure HookContext {
+    namespace: string
+    dialectId: string
+    phase: HookPhase
+    plan: ReconcilePlan
+    applied: list of PlannedChange
+    connection: database session or executor
 }
 
-@FunctionalInterface
-public interface HookAction {
-    void run(HookContext context) throws Exception;
+structure SchemaHook {
+    id: string
+    phase: HookPhase
+    order: integer       // default 0
+    runOnce: boolean     // default false
+    checksum: string     // default empty
+    run: HookContext -> completion or failure
 }
 
-public interface HookStore {
-    Optional<String> recordedChecksum(Connection conn, String namespace, String hookId) throws SQLException;
-    void record(Connection conn, String namespace, String hookId, HookPhase phase, String checksum) throws SQLException;
-    default Optional<ObjectId> managedTable(String targetNamespace) { return Optional.empty(); }
+interface HookStore {
+    recordedChecksum(session, namespace: string, hookId: string) -> string or absent
+    record(session, namespace: string, hookId: string, phase: HookPhase, checksum: string) -> completion or failure
+    managedTable(targetNamespace: string) -> ObjectId or absent   // optional; absent by default
 }
 ```
 
-Hooks are repeatable and execute in deterministic `(phase, order, id)` order. `build()` rejects a blank or duplicate hook id, a missing phase or action, and `runOnce` without a `hookStore`. Hooks never execute for `plan()`, `planTimed()`, `dump()`, a policy violation, or a wholly reported plan. They do execute during `reconcile()`, `apply(plan)` and `applyJson(...)` when policy evaluation enters apply — including an empty, up-to-date plan.
+Bindings must provide convenient construction of a hook from `(id, phase, action)`, optionally with `order`, and of a checksum-protected run-once hook from `(id, phase, checksum, action)`, optionally with `order`.
 
-`PRE_APPLY` hooks run after namespace binding and before transactional DDL; `POST_APPLY` hooks run after transactional DDL and before verification, in the same transaction. On transactional dialects, a hook failure therefore rolls back prior DDL, hook mutations and run-once records. Verification then runs and the transaction commits. Deferred non-transactional changes run in auto-commit mode; `POST_COMMIT` hooks run after them, still under the namespace lock, with the full applied list. Hook and hook-store failures are `ApplyException`s carrying the changes applied so far.
+Hooks are repeatable and execute in deterministic `(phase, order, id)` order. Builder completion rejects a blank or duplicate hook id, a missing phase or action, and `runOnce` without a `hookStore`. Hooks never execute for `plan`, `planTimed`, `dump`, a policy violation, or a wholly reported plan. They do execute during `reconcile`, `apply(plan)` and `applyJson(...)` when policy evaluation enters apply — including an empty, up-to-date plan.
 
-For a `runOnce` hook the engine reads the recorded checksum first. An equal checksum skips execution; a different checksum fails with `ApplyException`; otherwise the hook runs and the checksum is recorded. `PgHookStore` is the PostgreSQL implementation, constructed as `PgHookStore.inSchema(schema)` or `PgHookStore.of(schema, table)` (`schema_reconciler_hooks` by default). It lazily creates a table with columns `(namespace, hook_id, phase, checksum, applied_at)` and primary key `(namespace, hook_id)`, using parameterized lookups and `ON CONFLICT DO NOTHING` recording. When that table is inside the target namespace, `managedTable` makes the engine filter it from both snapshots so it is neither unexpected nor pruned; a dedicated schema such as `_reconciler_internal` is also supported.
+`PRE_APPLY` hooks run after namespace binding and before transactional DDL; `POST_APPLY` hooks run after transactional DDL and before verification, in the same transaction. On transactional dialects, a hook failure therefore rolls back prior DDL, hook mutations and run-once records. Verification then runs and the transaction commits. Deferred non-transactional changes run in auto-commit mode; `POST_COMMIT` hooks run after them, still under the namespace lock, with the full applied list. Hook and hook-store failures are `ApplyError`s carrying the changes applied so far.
+
+For a `runOnce` hook the engine reads the recorded checksum first. An equal checksum skips execution; a different checksum fails with `ApplyError`; otherwise the hook runs and the checksum is recorded. The PostgreSQL profile includes a hook-store implementation configured with a schema and optional table (`schema_reconciler_hooks` by default); binding documents define its constructor names. It lazily creates a table with columns `(namespace, hook_id, phase, checksum, applied_at)` and primary key `(namespace, hook_id)`, using parameterized lookups and `ON CONFLICT DO NOTHING` recording. When that table is inside the target namespace, `managedTable` makes the engine filter it from both snapshots so it is neither unexpected nor pruned; a dedicated schema such as `_reconciler_internal` is also supported.
 
 ## 4. Model
 
-All model types live in `studio.epicquest.schema.reconciler.model`.
+The model is language-neutral and value-based. Bindings may represent structures as records, classes, structs or immutable data types according to their idioms.
 
 ### 4.1 Object identity
 
-```java
-public enum ObjectKind {
+```text
+enumeration ObjectKind {
     TABLE, COLUMN, PRIMARY_KEY, UNIQUE, FOREIGN_KEY, CHECK,
     INDEX, VIEW, SEQUENCE, ROUTINE, TRIGGER, OTHER, EXCLUSION,
     MATERIALIZED_VIEW, TYPE, DOMAIN, POLICY, EXTENSION, COMMENT,
@@ -483,103 +463,112 @@ public enum ObjectKind {
     TEXT_SEARCH_CONFIGURATION, OPERATOR, OPERATOR_CLASS, OPERATOR_FAMILY
 }
 
-/** Namespace-neutral identity. */
-public record ObjectId(ObjectKind kind, String name, Optional<String> parent) { }
+structure ObjectId {            // namespace-neutral identity
+    kind: ObjectKind
+    name: string
+    parent: string or absent
+}
 ```
 
 - `name` is the identifier as stored by the engine (case as the catalog reports it).
-- `parent` is required for `COLUMN`, all constraint kinds, `INDEX`, `TRIGGER`, `POLICY`, `RULE`, `EXCLUSION` and `PARTITION` (the owning table or view). For the mirrored kinds — `COMMENT`, `SECURITY_LABEL`, `PUBLICATION`, `OWNERSHIP` and `PRIVILEGES` — it mirrors the target's `parent`: one on a column, index, constraint, trigger, policy or partition carries the parent's name, one on a top-level object carries none. It must be empty for other kinds. A present `parent` and `name` must be non-empty strings. The compact constructor enforces these rules with `IllegalArgumentException`.
+- `parent` is required for `COLUMN`, all constraint kinds, `INDEX`, `TRIGGER`, `POLICY`, `RULE`, `EXCLUSION` and `PARTITION` (the owning table or view). For the mirrored kinds — `COMMENT`, `SECURITY_LABEL`, `PUBLICATION`, `OWNERSHIP` and `PRIVILEGES` — it mirrors the target's `parent`: one on a column, index, constraint, trigger, policy or partition carries the parent's name, one on a top-level object carries none. It must be absent for other kinds. A present `parent` and `name` must be non-empty strings. Construction enforces these rules as invalid-argument failures.
 - For `ROUTINE`, `name` must include the identity signature, because routines can be overloaded. The signature is the routine name followed by the parenthesised list of its input argument types (`IN`, `INOUT` and `VARIADIC` arguments; never `OUT`), separated by `, `, for example `extract_ts(text)` or `merge_plan(bigint, jsonb)`. Each type is written by the engine's canonical type formatter. Argument names are omitted, because they belong to the canonical definition: renaming a parameter makes the routine `DRIFTED`, not a missing routine plus an unexpected one. A type of the snapshot's own namespace is written unqualified when the dialect binds the search path to that namespace (A.5), as the PostgreSQL profile does; any qualifier that remains is replaced by the `${namespace}.` token of 5.3.
 - `ObjectId` never contains a namespace. Two snapshots of different namespaces are directly comparable.
 - **Cluster-reference boundary.** Every `ObjectId` names a namespace-anchored catalog object. A namespace object may *reference* a cluster-level object — a role (ownership, `GRANT` grantee), a foreign server or user mapping (`FOREIGN TABLE`), a publication (`FOR TABLE` binding) or a tablespace — but the referenced object is never itself in a snapshot: the reference lives inside the referencing object's canonical definition (for example a foreign table's `SERVER` name), so drift on the reference reconciles the *namespace* object. Existence of the referenced cluster object is a preflight concern: the dialect renders statements that name it and the engine reports a failure if it does not exist — it is never diffed and never created or dropped by a plan.
 
 ### 4.2 Schema objects and snapshots
 
-```java
-public record Definition(String canonical) { }   // see 5.3
+```text
+structure Definition {
+    canonical: string   // see 5.3
+}
 
-public record SchemaObject(
-        ObjectId id,
-        Definition definition,
-        Set<ObjectId> dependsOn,                  // objects this one requires
-        Map<String, String> attributes) { }       // informational only, never compared
+structure SchemaObject {
+    id: ObjectId
+    definition: Definition
+    dependsOn: set of ObjectId                  // objects this one requires
+    attributes: ordered map of string to string // informational only, never compared
+}
 
-public record SchemaSnapshot(
-        Map<ObjectId, SchemaObject> objects,
-        String fingerprint) { }                   // see 5.7
+structure SchemaSnapshot {
+    objects: map of ObjectId to SchemaObject
+    fingerprint: string                         // see 5.7
+}
 ```
 
 `attributes` carry dialect-specific details such as a column's type or nullability, for display and diagnostics. Comparison must use `definition` only, so that the core stays vendor-neutral. The only attributes the core reads are the markers `Dialect.EXTERNAL_DEPENDENT_ATTRIBUTE` (5.8.3) and `Dialect.CONTENT_COMPARED_ATTRIBUTE` (5.4); neither takes part in equality.
 
 ### 4.3 Differences
 
-```java
-public enum DifferenceType { MISSING, DRIFTED, UNEXPECTED, UNSUPPORTED }
+```text
+enumeration DifferenceType { MISSING, DRIFTED, UNEXPECTED, UNSUPPORTED }
 
-public record Difference(
-        ObjectId id,
-        DifferenceType type,
-        Optional<Definition> expected,
-        Optional<Definition> actual) { }
+structure Difference {
+    id: ObjectId
+    type: DifferenceType
+    expected: Definition or absent
+    actual: Definition or absent
+}
 ```
 
 ### 4.4 Plan
 
-```java
-public enum ChangeAction { CREATE, ALTER, DROP }
-public enum ChangeSafety { ADDITIVE, REBUILD, DESTRUCTIVE }
-public enum LockLevel { NONE, SHARE_UPDATE_EXCLUSIVE, SHARE, SHARE_ROW_EXCLUSIVE, ACCESS_EXCLUSIVE }
+```text
+enumeration ChangeAction { CREATE, ALTER, DROP }
+enumeration ChangeSafety { ADDITIVE, REBUILD, DESTRUCTIVE }
+enumeration LockLevel { NONE, SHARE_UPDATE_EXCLUSIVE, SHARE, SHARE_ROW_EXCLUSIVE, ACCESS_EXCLUSIVE }
 
-public record ChangeHazard(
-        LockLevel lockLevel,
-        boolean rewritesTable,
-        boolean validatesRows,
-        List<String> notes) {
-    public static final ChangeHazard NONE = new ChangeHazard(LockLevel.NONE, false, false, List.of());
-}
-
-public record PlannedChange(
-        int order,                          // 1-based execution order
-        ObjectId target,
-        ChangeAction action,
-        ChangeSafety safety,
-        List<String> statements,            // final SQL, already bound to the target namespace
-        Optional<Definition> expected,      // definition the target must have after apply; empty for DROP changes and changes against unexpected objects
-        String reason,                      // human-readable cause, e.g. "definition drift", "dependency of <id>"
-        boolean nonTransactional,           // true when change must run post-commit with autoCommit=true (e.g. CONCURRENTLY)
-        ChangeHazard hazard) { }            // estimated lock/rewrite/validation hazard metadata
-
-public record ReconcilePlan(
-        String targetNamespace,
-        String dialectId,
-        String actualFingerprint,
-        String desiredFingerprint,
-        List<Difference> differences,
-        List<PlannedChange> changes) {
-
-    public boolean isEmpty() { return changes.isEmpty(); }
-
-    /** All statements in order, each preceded by a comment with its order,
-        target, action, safety, hazard and reason; manual changes are marked MANUAL. */
-    public String toSql() { ... }
-
-    /** Deterministic JSON representation (schemaVersion: 1) for machine review and cross-process apply. */
-    public String toJson() { ... }
-
-    /** Parses and validates a JSON plan produced by toJson(). */
-    public static ReconcilePlan fromJson(String json) { ... }
+structure ChangeHazard {
+    lockLevel: LockLevel
+    rewritesTable: boolean
+    validatesRows: boolean
+    notes: list of string
 }
 ```
+
+`ChangeHazard.NONE` is the value `(lockLevel = NONE, rewritesTable = false, validatesRows = false, notes = empty)`.
+
+```text
+structure PlannedChange {
+    order: positive integer        // 1-based execution order
+    target: ObjectId
+    action: ChangeAction
+    safety: ChangeSafety
+    statements: list of string     // final SQL, already bound to the target namespace
+    expected: Definition or absent // definition the target must have after apply; absent for DROP changes and changes against unexpected objects
+    reason: string                 // human-readable cause, e.g. "definition drift", "dependency of <id>"
+    nonTransactional: boolean      // true when change must run post-commit in auto-commit mode (e.g. CONCURRENTLY)
+    hazard: ChangeHazard           // estimated lock/rewrite/validation hazard metadata
+}
+
+structure ReconcilePlan {
+    targetNamespace: string
+    dialectId: string
+    actualFingerprint: string
+    desiredFingerprint: string
+    differences: list of Difference
+    changes: list of PlannedChange
+}
+```
+
+Plan operations:
+
+| Operation | Input | Output | Contract |
+|---|---|---|---|
+| `isEmpty` | none | `boolean` | True exactly when `changes` is empty. |
+| `toSql` | none | UTF-8 `string` | All statements in order, each preceded by a comment with its order, target, action, safety, hazard and reason; manual changes are marked `MANUAL`. |
+| `toJson` | none | UTF-8 JSON `string` | Deterministic JSON representation (`schemaVersion: 1`) for machine review and cross-process apply. |
+| `fromJson` | `json: string` | `ReconcilePlan` | Parses and validates a JSON plan produced by `toJson`; malformed or schema-incompatible input is an invalid-argument failure. |
 
 Each `PlannedChange` is one unit of execution, placed by its own `order`. Actions:
 
 - `CREATE`: creates an object that does not exist, including creating it again after its `DROP` half (below), and adding a column or constraint to an existing table.
 - `ALTER`: modifies an existing object in place, for example `CREATE OR REPLACE` of a routine, and every manual change.
-- `DROP`: removes an object. A `DROP` is either the first half of a *recreate* — whenever an object must be dropped and created again, `render` returns a `DROP` change and a `CREATE` change carrying `expected` with the same safety class and reason — or a standalone drop of an `UNEXPECTED` object when `ReconcilePolicy.prune()` is `true`. A `DROP` for a `DRIFTED` object without a matching `CREATE` for the same target is invalid, and the core must reject it with `PlanningException`. The core ties the two halves of a recreate together: they are always both applied or both reported (3.3).
+- `DROP`: removes an object. A `DROP` is either the first half of a *recreate* — whenever an object must be dropped and created again, rendering returns a `DROP` change and a `CREATE` change carrying `expected` with the same safety class and reason — or a standalone drop of an `UNEXPECTED` object when `ReconcilePolicy.prune` is `true`. A `DROP` for a `DRIFTED` object without a matching `CREATE` for the same target is invalid, and the core must reject it with `PlanningError`. The core ties the two halves of a recreate together: they are always both applied or both reported (3.3).
 
 Splitting a recreate into two changes lets the drop and create halves be ordered separately (5.8.5): dependents are dropped before their prerequisites and created after them.
 
-A plan must be serialisable as plain text for review via `toSql()`. The output must begin with a deterministic header comment naming `targetNamespace`, `dialectId` and both fingerprints plus the session context the statements assume (see `bindSessionNamespace`, 6.1), and must not contain timestamps, so that two runs of the same input produce byte-identical output (5.2).
+A plan must be serialisable as plain text for review via `toSql`. The output must begin with a deterministic header comment naming `targetNamespace`, `dialectId` and both fingerprints plus the session context the statements assume (see `bindSessionNamespace`, 6.1), and must not contain timestamps, so that two runs of the same input produce byte-identical output (5.2).
 
 ## 5. Reconciliation semantics
 
@@ -587,18 +576,18 @@ A plan must be serialisable as plain text for review via `toSql()`. The output m
 
 `reconcile()` must behave as the following steps. `plan()` performs steps 1 to 6 and then releases the lock without changing the target; before releasing it must roll back (transactional dialects) or clean up (non-transactional dialects) so the returned connection carries no session state (C-21). `apply(plan)` performs steps 1 to 3, checks the fingerprint (5.7), then performs steps 7 to 10 with the given plan. `reconcile()` holds one lock throughout and may skip the fingerprint recheck.
 
-1. **Connect.** Obtain one connection from the `DataSource`. Call `Dialect.checkAccess` to verify the connection's privileges on the target namespace — a missing namespace or insufficient privileges must fail the run before any lock is taken. If `capabilities().transactionalDdl()` is true, disable auto-commit. The core must restore the connection's original auto-commit setting on every exit path, before closing the connection and returning it to its pool (C-21).
-2. **Lock.** Acquire the namespace lock (6.2) within `lockTimeout`, or fail with `LockTimeoutException`. If `statementTimeout` is configured, the dialect applies it now (for example `SET LOCAL statement_timeout`), so it bounds applied statements and catalog reads but never the lock wait itself.
+1. **Connect.** Obtain one dedicated session from the configured data source. Call `Dialect.checkAccess` to verify the session's privileges on the target namespace — a missing namespace or insufficient privileges must fail the run before any lock is taken. If `capabilities.transactionalDdl` is true, disable auto-commit. The core must restore the connection's original auto-commit setting on every exit path, before closing the session and returning it to its pool (C-21).
+2. **Lock.** Acquire the namespace lock (6.2) within `lockTimeout`, or fail with `LockTimeoutError`. If `statementTimeout` is configured, the dialect applies it now (for example `SET LOCAL statement_timeout`), so it bounds applied statements and catalog reads but never the lock wait itself.
 3. **Read actual.** Read the snapshot of the target namespace.
 4. **Load desired.** Create a scratch namespace (6.3), bind the session namespace to it (`bindSessionNamespace`, 6.1), execute the desired script in it, read its snapshot, then remove the scratch namespace. Removal must happen even if loading fails. When `scratchDataSource` supplies a separate connection and `statementTimeout` is configured, the dialect applies the bound on that connection as well before the script runs.
 5. **Diff.** Compute differences (5.4, 5.5) against the effective actual snapshot: when `externalPartitions` rules are configured, rule-matching externally managed partitions and their contained objects are suppressed before diffing and before the actual fingerprint is taken.
 6. **Plan.** Ask the dialect to render changes for each difference, add dependent rebuilds (5.8), assign execution order and safety classes, and build the `ReconcilePlan`.
-7. **Evaluate policy.** Evaluate the plan as defined in 3.3: fail check, recreate pairing, then prerequisite closure. On a `FAIL`, throw `PolicyViolationException` carrying the plan. Nothing is executed.
-8. **Apply.** Bind the session namespace to the target namespace (6.1). Run `PRE_APPLY` hooks in deterministic order, execute the transactional changes (`!nonTransactional`) that remain mapped to `APPLY` in plan order, then run `POST_APPLY` hooks in deterministic order with the transactional applied list. Collect the changes mapped to or demoted to `REPORT`, and the `UNSUPPORTED` differences reported under `REPORT`.
-9. **Verify.** Re-read the actual snapshot in the same transaction. The target of every applied transactional change whose `expected` is present must now have a definition equal to it (4.4); for an applied standalone `DROP` (from `prune` or `retire`), the target must now be absent. Otherwise throw `VerificationException`, listing each object that did not converge. `DROP` changes that are part of a recreate are verified through the `CREATE` half.
-10. **Finish, non-transactional phase, and post-commit hooks.** Commit (transactional dialects). If any applied-policy changes have `nonTransactional == true` (for example `CREATE INDEX CONCURRENTLY` when `concurrentIndexes` is enabled), switch the connection to `autoCommit = true`, execute them in plan order, and re-verify their targets (catching invalid indexes). Then run `POST_COMMIT` hooks in deterministic order in auto-commit mode with the full applied list. Restore the connection's original auto-commit setting before releasing the lock. Release the lock and return the report.
+7. **Evaluate policy.** Evaluate the plan as defined in 3.3: fail check, recreate pairing, then prerequisite closure. On a `FAIL`, fail with `PolicyViolationError` carrying the plan. Nothing is executed.
+8. **Apply.** Bind the session namespace to the target namespace (6.1). Run `PRE_APPLY` hooks in deterministic order, execute the transactional changes (those with `nonTransactional = false`) that remain mapped to `APPLY` in plan order, then run `POST_APPLY` hooks in deterministic order with the transactional applied list. Collect the changes mapped to or demoted to `REPORT`, and the `UNSUPPORTED` differences reported under `REPORT`.
+9. **Verify.** Re-read the actual snapshot in the same transaction. The target of every applied transactional change whose `expected` is present must now have a definition equal to it (4.4); for an applied standalone `DROP` (from `prune` or `retire`), the target must now be absent. Otherwise fail with `VerificationError`, listing each object that did not converge. `DROP` changes that are part of a recreate are verified through the `CREATE` half.
+10. **Finish, non-transactional phase, and post-commit hooks.** Commit (transactional dialects). If any applied-policy changes have `nonTransactional = true` (for example `CREATE INDEX CONCURRENTLY` when `concurrentIndexes` is enabled), switch the session to auto-commit mode, execute them in plan order, and re-verify their targets (catching invalid indexes). Then run `POST_COMMIT` hooks in deterministic order in auto-commit mode with the full applied list. Restore the connection's original auto-commit setting before releasing the lock. Release the lock and return the report.
 
-On any exception in steps 3 to 9, transactional dialects must roll back the whole run. For non-transactional dialects see 6.4.
+On any error in steps 3 to 9, transactional dialects must roll back the whole run. For non-transactional dialects see 6.4.
 
 ### 5.2 Determinism
 
@@ -620,21 +609,21 @@ Two objects are equal if and only if their `ObjectId`s and canonical definitions
 
 - `MISSING`: present in desired, absent in actual.
 - `DRIFTED`: present in both with different canonical definitions.
-- `UNSUPPORTED`: present in desired with a kind the dialect does not support (`ObjectKind.OTHER`, or a kind absent from `capabilities().supportedKinds()`). It takes precedence over `MISSING` and `DRIFTED` for such an object, and the dialect is never asked to render it. One exception: a dialect may mark an unsupported-kind object whose canonical definition is a faithful rendering of its content (`Dialect.CONTENT_COMPARED_ATTRIBUTE`, 4.2); when the actual snapshot holds an object with the same `ObjectId` and an equal definition, no difference is reported for it. When the object is absent from the actual snapshot or its definition differs, the `UNSUPPORTED` difference stands, with the actual definition attached when there is one. Policy `unsupported` governs these as differences (3.3); `APPLY` is not permitted.
+- `UNSUPPORTED`: present in desired with a kind the dialect does not support (`ObjectKind.OTHER`, or a kind absent from `capabilities.supportedKinds`). It takes precedence over `MISSING` and `DRIFTED` for such an object, and the dialect is never asked to render it. One exception: a dialect may mark an unsupported-kind object whose canonical definition is a faithful rendering of its content (`Dialect.CONTENT_COMPARED_ATTRIBUTE`, 4.2); when the actual snapshot holds an object with the same `ObjectId` and an equal definition, no difference is reported for it. When the object is absent from the actual snapshot or its definition differs, the `UNSUPPORTED` difference stands, with the actual definition attached when there is one. Policy `unsupported` governs these as differences (3.3); `APPLY` is not permitted.
 
 A dialect must detect every object in the scratch namespace, including kinds it does not manage, so that nothing created by the script is silently ignored.
 
 ### 5.5 Unexpected objects
 
-`UNEXPECTED`: present in actual, absent in desired. Unexpected objects must be listed in the report and logged at `WARNING`. When `ReconcilePolicy.prune()` is `false` (the default), they do not produce changes, except for targeted retirements and the table-shape conflict below; removing them otherwise is an operator decision outside this library. When `ReconcilePolicy.prune()` is `true`, `UNEXPECTED` managed objects accepted by `pruneFilter` produce standalone `DROP` changes classified by data risk (`REBUILD` for indexes, views, routines, constraints, triggers, etc.; `DESTRUCTIVE` for tables, columns, materialized views, partitions, sequences), ordered in reverse dependency order of `actual`. `pruneFilter` controls dropping, never visibility: protected objects still appear as `UNEXPECTED`.
+`UNEXPECTED`: present in actual, absent in desired. Unexpected objects must be listed in the report and logged as warnings. When `ReconcilePolicy.prune` is `false` (the default), they do not produce changes, except for targeted retirements and the table-shape conflict below; removing them otherwise is an operator decision outside this library. When `ReconcilePolicy.prune` is `true`, `UNEXPECTED` managed objects accepted by `pruneFilter` produce standalone `DROP` changes classified by data risk (`REBUILD` for indexes, views, routines, constraints, triggers, etc.; `DESTRUCTIVE` for tables, columns, materialized views, partitions, sequences), ordered in reverse dependency order of `actual`. `pruneFilter` controls dropping, never visibility: protected objects still appear as `UNEXPECTED`.
 
-A retirement target is supplied by `Builder.retire(ObjectId)` or by a whole-line script directive `-- @reconciler retire <KIND> [<parent>.]<name>`, using the same SQL identifier-path syntax as rename directives. `OTHER` targets, malformed paths, a target present in desired, and a target used as either endpoint of a rename are rejected (`DesiredStateException` for a malformed directive, otherwise `IllegalArgumentException` or `PlanningException`). A target present in actual and absent from desired is dropped even when `prune` is false, with its normal safety class and a reason containing `retired`; an already absent target is an idempotent no-op. Containment suppression and the no-CASCADE dependent rules are the same as for pruning.
+A retirement target is supplied by `retire` builder configuration or by a whole-line script directive `-- @reconciler retire <KIND> [<parent>.]<name>`, using the same SQL identifier-path syntax as rename directives. `OTHER` targets, malformed paths, a target present in desired, and a target used as either endpoint of a rename are rejected (`DesiredStateError` for a malformed directive, otherwise an invalid-argument failure or `PlanningError`). A target present in actual and absent from desired is dropped even when `prune` is false, with its normal safety class and a reason containing `retired`; an already absent target is an idempotent no-op. Containment suppression and the no-CASCADE dependent rules are the same as for pruning.
 
 Externally managed partitions matching `externalPartitions` are removed from the effective actual snapshot before diffing and before its fingerprint is taken. `apply(plan)` loads desired before this suppression when rules are configured, so a runtime partition created between `plan()` and `apply(plan)` does not by itself stale the plan.
 
-Exception: an unexpected `COLUMN` whose parent table is expected is a table-shape conflict when it is neither approved for pruning nor retired. The core must add a `DESTRUCTIVE` change for the owning table with the reason `unexpected column <name>`, so that the default policy fails loudly instead of running against a foreign table shape. When the column itself is approved under `prune` or explicitly retired, it instead renders `ALTER TABLE ... DROP COLUMN` (`DESTRUCTIVE`).
+Special case: an unexpected `COLUMN` whose parent table is expected is a table-shape conflict when it is neither approved for pruning nor retired. The core must add a `DESTRUCTIVE` change for the owning table with the reason `unexpected column <name>`, so that the default policy fails loudly instead of running against a foreign table shape. When the column itself is approved under `prune` or explicitly retired, it instead renders `ALTER TABLE ... DROP COLUMN` (`DESTRUCTIVE`).
 
-**Explicit rename hints.** A caller may supply rename hints via `Builder.rename(from, to)` or SQL comment directives (`-- @reconciler rename <KIND> [<parent>.]<old_name> -> <new_name>`). When `from` is present in `actual` (and absent from `desired`) and `to` is present in `desired` (and absent from `actual`), the core suppresses `UNEXPECTED(from)` and `MISSING(to)` and asks the dialect to render a `REBUILD` `ALTER ... RENAME` change (followed by a `DRIFTED` change if the definition also changed). If the rename has already occurred, the hint is an idempotent no-op.
+**Explicit rename hints.** A caller may supply rename hints via `rename` builder configuration or SQL comment directives (`-- @reconciler rename <KIND> [<parent>.]<old_name> -> <new_name>`). When `from` is present in `actual` (and absent from `desired`) and `to` is present in `desired` (and absent from `actual`), the core suppresses `UNEXPECTED(from)` and `MISSING(to)` and asks the dialect to render a `REBUILD` `ALTER ... RENAME` change (followed by a `DRIFTED` change if the definition also changed). If the rename has already occurred, the hint is an idempotent no-op.
 
 The asymmetry applies to comments too: a `COMMENT` object exists only where a script's `COMMENT ON` produced one in the scratch snapshot, so removing the statement from the desired script never drops the comment — the actual comment is reported `UNEXPECTED` instead. Version 1 has no desired-state spelling of "no comment"; deleting one is an operator decision.
 
@@ -651,7 +640,7 @@ A `MISSING` table and the children its create covers (5.8.4) are created as one 
 1. Any change to an existing `TABLE` must be classified `DESTRUCTIVE`. A change to an existing `COLUMN` must be classified `DESTRUCTIVE` unless the dialect renders it as in-place alterations that cannot lose data and cannot fail on any existing value — a default change, `DROP NOT NULL`, `SET STORAGE` or `SET COMPRESSION` (they re-point only future writes), or a widening from the dialect's explicit allowlist (A.6) — which it may classify `REBUILD`. `SET NOT NULL` always checks existing rows and can fail on them, so it is `DESTRUCTIVE`; the dialect must not bundle it with `REBUILD` operations on the same column. Widening safety is defined by the allowlist, never inferred from PostgreSQL accepting the cast; note that a lossless widening may still physically rewrite the table under the DDL lock (A.6). Adding a missing column to an existing table is a `CREATE` of that column, not a change to an existing one: it is `ADDITIVE` when the column is nullable, and is classified by rule 2 otherwise.
 2. Adding a `NOT NULL` column without a default to an existing table must be classified `DESTRUCTIVE`, because it fails on a non-empty table. Adding a `NOT NULL` column with a default may be `ADDITIVE` where the engine fills it without rewriting existing rows (constant defaults on PostgreSQL 11+); the dialect must classify it by its engine's behaviour.
 3. A dialect may raise a change to a stricter class, never to a looser one.
-4. Adding a constraint that existing rows violate fails at apply time. This is an `ApplyException`, not a misclassification.
+4. Adding a constraint that existing rows violate fails at apply time. This is an `ApplyError`, not a misclassification.
 
 ### 5.7 Fingerprints and stale plans
 
@@ -659,157 +648,74 @@ A snapshot fingerprint is the lowercase hex SHA-256 of the following byte sequen
 
 With this format, a fingerprint depends only on the snapshot's content. Plans can therefore be checked across processes and library versions, as long as the dialect's normalisation rules have not changed (10.4).
 
-`apply(plan)` must first reject the plan with `IllegalArgumentException` if `plan.targetNamespace()` or `plan.dialectId()` does not match this reconciler's configuration — the statements are already bound to a namespace, so a foreign plan would execute against the wrong namespace. It must then re-read the actual snapshot after acquiring the lock and throw `StalePlanException` if its fingerprint differs from `plan.actualFingerprint()`. With `externalPartitions` configured, both fingerprints are fingerprints of the effective actual snapshot after external-partition suppression.
+`apply(plan)` must first reject the plan as an invalid-argument failure if its target namespace or dialect id does not match this reconciler's configuration — the statements are already bound to a namespace, so a foreign plan would execute against the wrong namespace. It must then re-read the actual snapshot after acquiring the lock and throw `StalePlanError` if its fingerprint differs from the plan's actual fingerprint. With `externalPartitions` configured, both fingerprints are fingerprints of the effective actual snapshot after external-partition suppression.
 
 ### 5.8 Dependencies and ordering
 
 1. Dialects must populate `dependsOn` from catalog dependency information, for example view-on-table, view-on-routine, trigger-on-routine, foreign-key-on-referenced-key, and index-on-routine for expression indexes. Self-dependencies (a recursive routine, a self-referencing foreign key) must be recorded but must be ignored by ordering and cycle detection. Two tables with mutually referencing foreign keys do not form a cycle: the foreign keys depend on the tables, never the reverse.
-2. When an object is recreated, every object that depends on it, directly or transitively, must also be recreated if the engine would otherwise drop it or reject the drop. The core obtains these changes by calling `Dialect.render` with a synthetic `DRIFTED` difference whose expected definition is the desired one; the synthetic difference drives rendering only and must not be added to `plan.differences()` unless the object is itself `MISSING` or `DRIFTED`. Such changes carry the reason `dependency of <id>`. Their `CREATE` or `ALTER` change carries the object's desired definition as `expected`, so verification (step 9) can check them.
-3. If an object slated for drop or recreation has dependents that are not themselves in the desired or actual snapshot — objects in other namespaces, or `UNEXPECTED` objects inside the target namespace — the dialect must detect them from catalog dependency data and the core must fail with `PlanningException` naming each such dependent, before anything is applied. Discovering the conflict as a mid-apply error would violate P4.
+2. When an object is recreated, every object that depends on it, directly or transitively, must also be recreated if the engine would otherwise drop it or reject the drop. The core obtains these changes by calling `Dialect.render` with a synthetic `DRIFTED` difference whose expected definition is the desired one; the synthetic difference drives rendering only and must not be added to `plan.differences` unless the object is itself `MISSING` or `DRIFTED`. Such changes carry the reason `dependency of <id>`. Their `CREATE` or `ALTER` change carries the object's desired definition as `expected`, so verification (step 9) can check them.
+3. If an object slated for drop or recreation has dependents that are not themselves in the desired or actual snapshot — objects in other namespaces, or `UNEXPECTED` objects inside the target namespace — the dialect must detect them from catalog dependency data and the core must fail with `PlanningError` naming each such dependent, before anything is applied. Discovering the conflict as a mid-apply error would violate P4.
 4. When a `MISSING` parent is created by a change, differences on the children its create already covers must not produce separate changes. The dialect decides what its creates cover by implementing `Dialect.coveredChildren` (6.1). For each `MISSING` difference the core is about to render, it must call `coveredChildren` with that difference and the desired snapshot, drop every difference whose `ObjectId` is returned (and any change rendered for it), and still order and verify the covered objects as part of the parent's create: after apply, each covered object must be present in the actual snapshot with its desired definition (5.1 step 9). A dialect must not return an `ObjectId` that its `render` output for the parent does not create. The PostgreSQL profile folds columns and serial-owned sequences into the table's create, and renders constraints and indexes as separate changes (A.5, A.6).
 5. Execution order is: all `DROP` changes in reverse dependency order of the *actual* snapshot, then all `CREATE` and `ALTER` changes in dependency order of the *desired* snapshot. A recreate contributes its `DROP` change to the first phase and its `CREATE` change to the second (4.4). Ties are broken by `ObjectKind` order, then by `ObjectId` as in 5.2, then by action (`ALTER` before `CREATE`). For example, recreating view `v` and its dependent view `w` executes `DROP w`, `DROP v`, `CREATE v`, `CREATE w`.
-6. Dependency cycles must be reported as `PlanningException`.
-7. **Name collisions.** For every `CREATE` change, the core must compare `Dialect.nameScopes` of its target with the scopes of every object in the actual snapshot that has a different `ObjectId` and no `DROP` change in the plan. A shared key means the create would fail on an existing name, typically held by an `UNEXPECTED` object. The core must then fail with `PlanningException` naming both objects, before anything is applied, rather than plan the create as `ADDITIVE` and fail mid-apply (P4).
+6. Dependency cycles must be reported as `PlanningError`.
+7. **Name collisions.** For every `CREATE` change, the core must compare `Dialect.nameScopes` of its target with the scopes of every object in the actual snapshot that has a different `ObjectId` and no `DROP` change in the plan. A shared key means the create would fail on an existing name, typically held by an `UNEXPECTED` object. The core must then fail with `PlanningError` naming both objects, before anything is applied, rather than plan the create as `ADDITIVE` and fail mid-apply (P4).
+
 
 ## 6. Service Provider Interface
 
 ### 6.1 `Dialect`
 
-```java
-package studio.epicquest.schema.reconciler.spi;
+A dialect is the database-product-specific provider implementation. Operations that access the database receive a dedicated session. "Optional" in the table means the core must use the specified fallback when the dialect does not provide the operation; the mechanism — default methods, optional interfaces, composition or another idiom — is binding-specific.
 
-public interface Dialect {
+| Operation | Input | Output | Requirement |
+|---|---|---|---|
+| `id` | none | `string` | Stable identifier, for example `postgresql`. Required. |
+| `supports` | database product metadata | `boolean` | Whether the dialect supports the connected product and version. Required. |
+| `coreMajorVersion` | none | `integer` | Major version of the core API the dialect was built against (10.3). Optional; default `1`. |
+| `capabilities` | none | `DialectCapabilities` | Required. |
+| `acquireLock` | session, `namespace`, `timeout` | completion or failure | Acquires the namespace lock. Required. |
+| `releaseLock` | session, `namespace` | completion or failure | Releases the namespace lock. Required. |
+| `bindSessionNamespace` | session, `namespace` | completion or failure | Binds unqualified names on this session to the namespace for the rest of the run (for example `SET LOCAL search_path`). Called before executing the desired script and before applying changes. Optional no-op for dialects that fully qualify every rendered statement. The binding must not outlive the run: transactional dialects should use a transaction-scoped setting; others must restore the previous value on every exit path. |
+| `statementTimeout` | session, `timeout` | completion or failure | Bounds how long any single statement may run during this run. Called once after the namespace lock is acquired, so it never bounds the lock wait itself. Optional no-op for dialects that cannot express the bound. |
+| `checkAccess` | session, `namespace or absent`, `createNamespace: boolean` | completion or failure | Verifies that this session's user holds the privileges a reconcile run needs. Called once per run, before the lock, on the target connection — with `createNamespace` telling it whether that connection must also create the scratch namespace — and again on the scratch connection when a separate `scratchDataSource` is configured, then with an absent namespace and `createNamespace = true`. A missing namespace or insufficient privilege fails the run. Optional no-op for dialects that cannot express the check. |
+| `createScratchNamespace` | session, `targetNamespace` | scratch namespace `string` | Creates a unique scratch namespace. Required. |
+| `dropScratchNamespace` | session, `scratchNamespace` | completion or failure | Removes the scratch namespace. Required. |
+| `executeScript` | session, `script`, `scratchNamespace` | completion or failure | Executes a complete script in the scratch namespace; the dialect decides whether to batch or split it. `scratchNamespace` is the name `createScratchNamespace` returned — qualified object references in the script must resolve to it (3.2). Required. |
+| `readSnapshot` | session, `namespace` | `SchemaSnapshot` | Reads every object in the namespace, normalised per 5.3. Required. |
+| `render` | `difference`, `snapshot`, `targetNamespace`, `options: RenderOptions` | `list of PlannedChange` | Renders the statements and safety class for one difference, bound to the target namespace. For `UNEXPECTED` differences (prune), the snapshot argument is the actual snapshot. Required; options may be ignored only when the dialect declares no behaviour controlled by them. |
+| `renderRename` | `from`, `to`, `actual`, `desired`, `targetNamespace` | `list of PlannedChange` | Renders an explicit rename as a `REBUILD` `ALTER` change. Optional; the fallback fails with `PlanningError` stating that the dialect does not support rename hints. |
+| `dumpStatements` | `object: SchemaObject` | `list of string` | Create-fragment statements for one snapshot object, written with the `${namespace}` token (3.2) so the emitted script is namespace-neutral — the building block of `dump` (3.1). An object that cannot be represented as a create fragment returns an empty list; the core emits it as a comment line instead of dropping it silently (P4). Optional; default empty. |
+| `quoteIdentifier` | `identifier: string` | quoted `string` | Quotes an identifier for safe inclusion in SQL. Fails as an invalid argument if the identifier is not legal in the engine (for example empty, longer than the engine's limit, or containing characters the engine cannot represent); the core relies on this to validate the configured namespace (8.3). Required. |
+| `coveredChildren` | `created: Difference`, `desired: SchemaSnapshot` | `set of ObjectId` | The objects, other than the difference's own object, that this dialect's render output for a `MISSING` difference creates as a side effect (for example the columns of a new table). The core suppresses their own differences and changes (5.8.4). Optional; default empty. A dialect must not return an `ObjectId` that its render output does not create. |
+| `nameScopes` | `id: ObjectId` | `set of string` | The scopes in which the engine requires this object's name to be unique, as opaque keys (for example `relation:plans_pk`). Two objects with different `ObjectId`s that share a key cannot coexist in one namespace (5.8.7). Optional; default empty, meaning the name is unique only within its `ObjectId`. |
 
-    /** Stable identifier, e.g. "postgresql". */
-    String id();
+The dialect also defines two reserved `SchemaObject.attributes` marker keys: `EXTERNAL_DEPENDENT_ATTRIBUTE` (`externalDependent`, 5.8.3) and `CONTENT_COMPARED_ATTRIBUTE` (`contentCompared`, 5.4). Both are marker metadata only and never participate in equality (4.2).
 
-    boolean supports(DatabaseMetaData metaData) throws SQLException;
-
-    /** The major version of the core API this dialect was built against (10.3). */
-    default int coreMajorVersion() { return 1; }
-
-    DialectCapabilities capabilities();
-
-    void acquireLock(Connection connection, String namespace, Duration timeout) throws SQLException;
-
-    void releaseLock(Connection connection, String namespace) throws SQLException;
-
-    /**
-     * Binds unqualified names on this connection to the given namespace for the
-     * rest of the run (for example SET LOCAL search_path). Called before executing the
-     * desired script and before applying changes; a no-op for dialects that
-     * fully qualify every rendered statement. The binding must not outlive the run:
-     * transactional dialects should use a transaction-scoped setting; others must
-     * restore the previous value on every exit path.
-     */
-    default void bindSessionNamespace(Connection connection, String namespace) throws SQLException { }
-
-    /**
-     * Bounds how long any single statement may run during this run (for
-     * example SET LOCAL statement_timeout). Called once after the namespace
-     * lock is acquired, so it never bounds the lock wait itself. A no-op for
-     * dialects that cannot express the bound.
-     */
-    default void statementTimeout(Connection connection, Duration timeout) throws SQLException { }
-
-    /**
-     * Verifies that this connection's user holds the privileges a reconcile run
-     * needs. Called once per run, before the lock, on the target connection —
-     * with {@code createNamespace} telling it whether that connection must
-     * also create the scratch namespace — and again on the scratch connection
-     * when a separate {@code scratchDataSource} is configured, then with
-     * {@code namespace} {@code null} and {@code createNamespace} {@code true}.
-     * A missing namespace or insufficient privilege fails the run. A no-op
-     * for dialects that cannot express the check.
-     */
-    default void checkAccess(Connection connection, String namespace,
-                             boolean createNamespace) throws SQLException { }
-
-    String createScratchNamespace(Connection connection, String targetNamespace) throws SQLException;
-
-    void dropScratchNamespace(Connection connection, String scratchNamespace) throws SQLException;
-
-    /**
-     * Executes a complete script in the scratch namespace; the dialect decides
-     * whether to batch or split it. scratchNamespace is the name
-     * createScratchNamespace returned — qualified object references in the
-     * script must resolve to it (3.2).
-     */
-    void executeScript(Connection connection, String script, String scratchNamespace) throws SQLException;
-
-    /** Reads every object in the namespace, normalised per 5.3. */
-    SchemaSnapshot readSnapshot(Connection connection, String namespace) throws SQLException;
-
-    /** Renders the statements and safety class for one difference, bound to the target namespace.
-     *  For UNEXPECTED differences (prune), the snapshot argument is the actual snapshot. */
-    List<PlannedChange> render(Difference difference, SchemaSnapshot snapshot, String targetNamespace);
-
-    /** Renders with explicit options (e.g. concurrentIndexes). Defaults to 3-arg render. */
-    default List<PlannedChange> render(Difference difference, SchemaSnapshot snapshot,
-                                       String targetNamespace, RenderOptions options) {
-        return render(difference, snapshot, targetNamespace);
-    }
-
-    /** Renders an explicit rename (from -> to) as a REBUILD ALTER change. */
-    default List<PlannedChange> renderRename(ObjectId from, ObjectId to,
-                                             SchemaSnapshot actual, SchemaSnapshot desired,
-                                             String targetNamespace) {
-        throw new PlanningException("dialect '" + id() + "' does not support rename hints");
-    }
-
-    /**
-     * Create-fragment statements for one snapshot object, written with the
-     * {@code ${namespace}} token (3.2) so the emitted script is
-     * namespace-neutral — the building block of {@code dump()} (3.1). An
-     * object that cannot be represented as a create fragment returns an
-     * empty list; the core emits it as a comment line instead of dropping
-     * it silently (P4).
-     */
-    default List<String> dumpStatements(SchemaObject object) { return List.of(); }
-
-    /**
-     * Quotes an identifier for safe inclusion in SQL. Throws
-     * IllegalArgumentException if the identifier is not legal in the engine
-     * (for example empty, longer than the engine's limit, or containing
-     * characters the engine cannot represent); the core relies on this to
-     * validate the configured namespace (8.3).
-     */
-    String quoteIdentifier(String identifier);
-
-    /**
-     * The objects, other than the difference's own object, that this dialect's
-     * render output for a MISSING difference creates as a side effect (for
-     * example the columns of a new table). The core suppresses their own
-     * differences and changes (5.8.4). Empty means the create covers nothing
-     * else.
-     */
-    default Set<ObjectId> coveredChildren(Difference created, SchemaSnapshot desired) { return Set.of(); }
-
-    /**
-     * The scopes in which the engine requires this object's name to be unique,
-     * as opaque keys (for example "relation:plans_pk"). Two objects with different
-     * ObjectIds that share a key cannot coexist in one namespace (5.8.7).
-     * Empty means the name is unique only within its ObjectId.
-     */
-    default Set<String> nameScopes(ObjectId id) { return Set.of(); }
+```text
+structure DialectCapabilities {
+    transactionalDdl: boolean
+    sessionDefaultNamespace: boolean
+    supportedKinds: set of ObjectKind
 }
 
-public record DialectCapabilities(
-        boolean transactionalDdl,
-        boolean sessionDefaultNamespace,
-        Set<ObjectKind> supportedKinds) { }
+structure RenderOptions {
+    concurrentIndexes: boolean                         // default false
+    renamedParents: ordered map of string to string    // default empty; old parent name to new, set on UNEXPECTED renders only
+}
 ```
 
-The core owns diffing, dependency expansion, ordering, policy, verification and transaction control. A dialect owns only vendor-specific SQL. `render` returns changes with `order` set to `0`; the core assigns the final order. If `capabilities().sessionDefaultNamespace()` is false, rendered statements must qualify every reference so they execute correctly without `bindSessionNamespace`.
+`RenderOptions.renamedParents` rewrites parent names under an active rename hint. A pruned child of a renamed parent (a `COLUMN`, `TRIGGER` and the like) must drop through the new parent name: the old one no longer exists once the rename ran.
+
+The core owns diffing, dependency expansion, ordering, policy, verification and transaction control. A dialect owns only vendor-specific SQL. `render` returns changes with `order` set to zero or otherwise unassigned; the core assigns the final order. If `capabilities.sessionDefaultNamespace` is false, rendered statements must qualify every reference so they execute correctly without `bindSessionNamespace`.
 
 ### 6.2 Locking
 
-`acquireLock` must give mutual exclusion between all processes reconciling the same target namespace in the same database, and must honour the timeout. Locks must be released on every exit path, and must not leak onto a pooled connection. Suitable mechanisms are advisory locks (PostgreSQL), `GET_LOCK` (MySQL) and `DBMS_LOCK` (Oracle). A dialect should translate the engine's lock-timeout error (for example SQLSTATE `55P03` on PostgreSQL) into `LockTimeoutException`; the core wraps any other `SQLException`.
+`acquireLock` must give mutual exclusion between all processes reconciling the same target namespace in the same database, and must honour the timeout. Locks must be released on every exit path, and must not leak onto a pooled session. Suitable mechanisms are advisory locks (PostgreSQL), `GET_LOCK` (MySQL) and `DBMS_LOCK` (Oracle). A dialect should translate the engine's lock-timeout error (for example SQLSTATE `55P03` on PostgreSQL) into `LockTimeoutError`; the core wraps any other database/driver failure.
 
 ### 6.3 Scratch namespaces
 
 1. A scratch namespace name must be unique per run and must not collide with an existing namespace. The RECOMMENDED form is `<target>__rcl_<12 hex chars>`, truncated to the engine's identifier limit.
-2. If `scratchDataSource` is configured, the scratch namespace must be created there instead of in the target database. `createScratchNamespace`, `executeScript` for the desired script, the scratch `readSnapshot` and `dropScratchNamespace` then run on connections from `scratchDataSource`; the actual snapshot and all applied changes run on the `dataSource` connection. A scratch database need not contain other namespaces: a desired script that references objects outside its own namespace (cross-schema foreign keys, external routines) will fail to load there with `DesiredStateException`; dialect profiles must document this limitation. This option is required for engines where creating a namespace needs privileges the application should not hold (for example `CREATE USER` in Oracle). Canonical definitions are rendered by the engine and can differ between versions. So on first use the core must check that the scratch database reports the same `DatabaseMetaData.getDatabaseProductName()` and the same major version as the target, and that the dialect's `supports()` accepts it. Otherwise it must fail with `ConfigurationException`.
+2. If `scratchDataSource` is configured, the scratch namespace must be created there instead of in the target database. `createScratchNamespace`, `executeScript` for the desired script, the scratch `readSnapshot` and `dropScratchNamespace` then run on sessions from `scratchDataSource`; the actual snapshot and all applied changes run on the target data-source session. A scratch database need not contain other namespaces: a desired script that references objects outside its own namespace (cross-schema foreign keys, external routines) will fail to load there with `DesiredStateError`; dialect profiles must document this limitation. This option is required for engines where creating a namespace needs privileges the application should not hold (for example `CREATE USER` in Oracle). Canonical definitions are rendered by the engine and can differ between versions. So on first use the core must check that the scratch database reports the same product name and the same major version as the target, and that the dialect's `supports` accepts it. Otherwise it must fail with `ConfigurationError`.
 3. The scratch namespace must be removed on every exit path. In transactional dialects, rolling back to a savepoint that precedes its creation satisfies this. On non-transactional dialects the dialect must drop it with cascade semantics, because the script may have created interdependent objects.
 4. Loading the desired state must not modify the target namespace.
 
@@ -818,38 +724,50 @@ The core owns diffing, dependency expansion, ordering, policy, verification and 
 If `transactionalDdl` is false (for example MySQL and Oracle, where DDL commits implicitly):
 
 1. Each `PlannedChange` must be idempotent with respect to its own target, so that re-running after a partial failure converges.
-2. On failure, `ApplyException` must report the changes already applied and the change that failed.
+2. On failure, `ApplyError` must report the changes already applied and the change that failed.
 3. Verification (step 9) still applies to the changes that completed.
 
-## 7. Exceptions
+## 7. Errors
+
+The language-neutral domain error hierarchy is:
 
 ```text
-SchemaReconcilerException (extends RuntimeException)
-├── ConfigurationException      invalid builder input, no or ambiguous dialect
-├── LockTimeoutException        lock not acquired within lockTimeout
-├── DesiredStateException       script could not be read, substituted or executed in scratch
-├── PlanningException           dependency cycle, external or unexpected dependent, name collision, or unrenderable difference
-├── PolicyViolationException    plan contains changes mapped to FAIL; carries the plan
-├── StalePlanException          target changed between plan() and apply()
-├── ApplyException              a statement failed; carries applied changes and the failed one
-└── VerificationException       applied objects did not converge; carries remaining differences
+ReconcileError (abstract)
+├── ConfigurationError       invalid builder input, no or ambiguous dialect, illegal namespace
+├── LockTimeoutError         lock not acquired within lockTimeout
+├── DesiredStateError        script could not be read, substituted or executed in scratch
+├── PlanningError            dependency cycle, external or unexpected dependent, name collision, or unrenderable difference
+├── UnsafePlanError (abstract)  a plan must not execute
+│   ├── PolicyViolationError    plan contains changes or unsupported differences mapped to FAIL; carries the plan
+│   └── StalePlanError          target changed between plan and apply
+├── ApplyError               a statement, listener, hook or hook store failed; carries applied changes and the failed one when known
+└── VerificationError        applied objects did not converge; carries remaining differences
 ```
 
-Every message raised during a run must name the target namespace and, where applicable, the object id; a component that does not know the namespace (a dialect, the dialect resolver) may omit it, and the core then prefixes it. Messages from the builder and the `DesiredState` factories, which run before any namespace is in play, name the offending property or resource. `DesiredStateException` must include the engine's error message and position when the driver provides them. `SchemaReconcilerException` itself carries `timings()` — the `RunTimings` snapshot taken when the run failed, with the phases that completed and the partial duration of the phase that failed (`Duration.ZERO` where nothing ran yet, `RunTimings.unmeasured()` for exceptions raised outside a run).
+`UnsafePlanError` is an abstract classification, not a replacement for either terminal error: a binding may expose it as a common interface, base type, error-code grouping or pattern-matching category. A conforming binding must make it possible to distinguish the two terminal meanings (`policy-violation` and `stale-plan`).
+
+The canonical terminal error codes are the stable lowercase names `configuration`, `lock-timeout`, `desired-state`, `planning`, `policy-violation`, `stale-plan`, `apply` and `verification`. `unsafe-plan` is the canonical category code for `UnsafePlanError`. A binding may expose a code through type identity rather than a separate field. Stable reason tokens used across the contract include `dependency-cycle`, `external-dependent`, `unexpected-dependent`, `name-collision`, `unrenderable-difference`, `manual-change`, `unsupported-construct`, `statement-failed`, `listener-failed`, `hook-failed` and `hook-checksum-changed`.
+
+Two additional abstract categories complete the taxonomy:
+
+- **`UnsupportedConstructError`** is not normally a terminal error type. Unsupported constructs are first-class `UNSUPPORTED` differences (5.4). When policy resolves such a difference to `FAIL`, the terminal failure is `PolicyViolationError` with reason `unsupported-construct`; when the dialect/model contract itself is broken, the terminal failure is `PlanningError`. A binding may expose `UnsupportedConstructError` as a reason/category marker, but introducing a separate terminal type must not bypass the difference/report semantics.
+- **`DialectError`** denotes a database or driver failure. It is causal information, not an unwrapped public failure: the core must wrap it in the phase-appropriate terminal error (`ConfigurationError`, `DesiredStateError`, `PlanningError`, `ApplyError`, `VerificationError` or `LockTimeoutError`) while preserving the engine's diagnostic message, position, SQLSTATE or vendor code when available. A binding may expose `DialectError` as the wrapped cause's classification.
+
+Every message raised during a run must name the target namespace and, where applicable, the object id; a component that does not know the namespace (a dialect, the dialect resolver) may omit it, and the core then prefixes it. Messages from the builder and the `DesiredState` factories, which run before any namespace is in play, name the offending property or resource. `DesiredStateError` must include the engine's error message and position when the driver provides them. `ReconcileError` itself carries `timings` — the `RunTimings` snapshot taken when the run failed, with the phases that completed and the partial duration of the phase that failed (zero where nothing ran yet, and the unmeasured `RunTimings` value for errors raised outside a run).
 
 ## 8. Security
 
 1. Object names read from the catalog must be quoted with `Dialect.quoteIdentifier` whenever they are placed into SQL.
 2. The library must not build SQL from data supplied at run time other than the configured namespace and the trusted desired script.
-3. The configured namespace must be validated as a legal identifier for the dialect before use: the core passes it to `Dialect.quoteIdentifier` and reports an `IllegalArgumentException` from it as `ConfigurationException`. Because a dialect is selected on first use (3.4), this validation happens then, before any SQL is sent.
+3. The configured namespace must be validated as a legal identifier for the dialect before use: the core passes it to `Dialect.quoteIdentifier` and reports an invalid-argument failure from it as `ConfigurationError`. Because a dialect is selected on first use (3.4), this validation happens then, before any SQL is sent.
 4. Documentation should recommend running reconciliation with a role limited to the target namespace. The run verifies that role's privileges before locking (`Dialect.checkAccess`), so a misconfigured role fails fast rather than mid-apply. When no `scratchDataSource` is configured, that role additionally needs namespace-creation privilege on the target database (for example `CREATE ON DATABASE` in PostgreSQL); `scratchDataSource` exists for environments that cannot grant it.
-5. **Frozen best-effort lexical guard.** The script checks of 3.2 and A.4 (`PgScriptCheck`) are **frozen as a best-effort lexical guard**, not a security sandbox or full SQL parser. They scan top-level statements (and `DO` bodies for common leaks) to catch accidental mistakes; function/procedure bodies and dynamic SQL (`EXECUTE`, `format()`) are opaque and run with the connection's privileges. For untrusted or complex scripts, treat desired scripts as trusted build artifacts and pair `scratchDataSource` with a least-privilege role (rule 4) rather than relying on lexical checks.
+5. **Frozen best-effort lexical guard.** The script checks of 3.2 and A.4 (the PostgreSQL lexical script check) are **frozen as a best-effort lexical guard**, not a security sandbox or full SQL parser. They scan top-level statements (and `DO` bodies for common leaks) to catch accidental mistakes; function/procedure bodies and dynamic SQL (`EXECUTE`, `format()`) are opaque and run with the connection's privileges. For untrusted or complex scripts, treat desired scripts as trusted build artifacts and pair `scratchDataSource` with a least-privilege role (rule 4) rather than relying on lexical checks.
 
 ## 9. Conformance
 
 ### 9.1 The conformance suite
 
-`studio.epicquest.schema:schema-reconciler-tck` provides an abstract JUnit Jupiter class `DialectConformanceTest`. A dialect passes when a subclass that supplies a disposable database passes every test. Dialects may skip tests only for object kinds absent from `supportedKinds()` or for capabilities they do not declare; skips must be reported.
+Every language binding of this project must provide a conformance suite executable with that language's standard test runner. The suite implements the scenario identifiers and expected behaviour of section 9.2 and supplies hooks through which a dialect implementation provides a disposable database, namespace lifecycle, dialect instance and optional capabilities. A dialect passes when the suite runs against its disposable database with no failures. Dialects may skip tests only for object kinds absent from `supportedKinds` or for capabilities they do not declare; skips must be reported.
 
 ### 9.2 Required scenarios
 
@@ -866,38 +784,38 @@ Every message raised during a run must name the target namespace and, where appl
 | C-09 | View recreated with fewer columns | `REBUILD`; dependent views also recreated |
 | C-10 | Routine body changed | `REBUILD`; dependent triggers and indexes handled per 5.8 |
 | C-11 | Trigger dropped | `ADDITIVE`, restored |
-| C-12 | Table with foreign column shape under expected name | `DESTRUCTIVE`; default policy throws `PolicyViolationException`; table and rows untouched |
+| C-12 | Table with foreign column shape under expected name | `DESTRUCTIVE`; default policy fails with `PolicyViolationError`; table and rows untouched |
 | C-13 | Extra table in target | `UNEXPECTED` reported; table untouched |
 | C-14 | Script creates an unsupported object kind | `UNSUPPORTED`; default policy fails |
-| C-15 | Script has a syntax error | `DesiredStateException`; target untouched; no scratch namespace left behind |
+| C-15 | Script has a syntax error | `DesiredStateError`; target untouched; no scratch namespace left behind |
 | C-16 | Two concurrent `reconcile()` calls | serialised; both succeed; one is `UP_TO_DATE` |
-| C-17 | `apply(plan)` after the target changed | `StalePlanException` |
+| C-17 | `apply(plan)` after the target changed | `StalePlanError` |
 | C-18 | `reportOnly()` policy with drift | `REPORTED_ONLY`; nothing executed |
 | C-19 | Same input twice | identical plans (5.2) |
-| C-20 | Lock not available within timeout | `LockTimeoutException` |
+| C-20 | Lock not available within timeout | `LockTimeoutError` |
 | C-21 | Pooled connection after any run | no lock and no session state left behind |
 | C-22 | `plan()` with drift | target unchanged; no scratch namespace or session state left behind |
-| C-23 | Self-referencing foreign key; mutually referencing foreign keys | reconciles; no `PlanningException` |
-| C-24 | `apply(plan)` built for a different namespace or dialect | `IllegalArgumentException`; nothing executed |
-| C-25 | An object outside the namespace, or an `UNEXPECTED` view inside it, depends on an object to be recreated | `PlanningException` naming the dependent; nothing executed; the unexpected view still exists |
+| C-23 | Self-referencing foreign key; mutually referencing foreign keys | reconciles; no `PlanningError` |
+| C-24 | `apply(plan)` built for a different namespace or dialect | invalid-argument failure; nothing executed |
+| C-25 | An object outside the namespace, or an `UNEXPECTED` view inside it, depends on an object to be recreated | `PlanningError` naming the dependent; nothing executed; the unexpected view still exists |
 | C-26 | `scratchDataSource` configured | scratch activity confined to that database; target sees only applied changes |
 | C-27 | Policy `additive = APPLY`, `rebuild = REPORT`; a drifted view `v` and a missing view `w` that depends on `v` | both reported, `w` demoted with `v` named as the blocking object; nothing executed against either |
-| C-28 | Script qualifies an object with the literal target namespace name | `DesiredStateException` with the position; target untouched |
-| C-29 | Policy `unsupported = REPORT`; script creates an unsupported object and a supported object that depends on it | `UNSUPPORTED` difference in `report.unsupported()`; the dependent change demoted to `REPORT`; independent changes applied |
+| C-28 | Script qualifies an object with the literal target namespace name | `DesiredStateError` with the position; target untouched |
+| C-29 | Policy `unsupported = REPORT`; script creates an unsupported object and a supported object that depends on it | `UNSUPPORTED` difference in `report.unsupported`; the dependent change demoted to `REPORT`; independent changes applied |
 | C-30 | Drifted view `v` with dependent view `w` | plan order is `DROP w`, `DROP v`, `CREATE v`, `CREATE w`; both verified |
-| C-31 | Missing index `i` on table `a`, while the target holds an unexpected index `i` on table `b` (where the dialect declares relation-scoped names) | `PlanningException` naming both; nothing executed |
+| C-31 | Missing index `i` on table `a`, while the target holds an unexpected index `i` on table `b` (where the dialect declares relation-scoped names) | `PlanningError` naming both; nothing executed |
 | C-32 | Missing table with a serial-style or identity column | `RECONCILED`; no dependency cycle; the second run is `UP_TO_DATE` |
-| C-33 | Drifted column on a table holding a `NULL` row: default change and `DROP NOT NULL`, then `SET NOT NULL` | default and `DROP NOT NULL` apply in place as `REBUILD` `ALTER COLUMN` changes; `SET NOT NULL` renders `DESTRUCTIVE` and fails with `PolicyViolationException` under the default policy |
-| C-34 | Drifted column: unsafe type change | manual `DESTRUCTIVE` change; default policy throws `PolicyViolationException`; data untouched |
-| C-35 | `unsupportedCategories` reports one category while `unsupported` stays `FAIL` | the tolerated `UNSUPPORTED` difference lands in `report.unsupported()`; a `FAIL`-category one still fails the plan |
-| C-36 | `ReconcileReport.timings()` | every `RunTimings` phase is non-negative; `elapsed` covers their sum |
+| C-33 | Drifted column on a table holding a `NULL` row: default change and `DROP NOT NULL`, then `SET NOT NULL` | default and `DROP NOT NULL` apply in place as `REBUILD` `ALTER COLUMN` changes; `SET NOT NULL` renders `DESTRUCTIVE` and fails with `PolicyViolationError` under the default policy |
+| C-34 | Drifted column: unsafe type change | manual `DESTRUCTIVE` change; default policy fails with `PolicyViolationError`; data untouched |
+| C-35 | `unsupportedCategories` reports one category while `unsupported` stays `FAIL` | the tolerated `UNSUPPORTED` difference lands in `report.unsupported`; a `FAIL`-category one still fails the plan |
+| C-36 | `ReconcileReport.timings` | every `RunTimings` phase is non-negative; `elapsed` covers their sum |
 | C-37 | Materialized view missing | `MISSING` `MATERIALIZED_VIEW`, `ADDITIVE`, created with data; then `UP_TO_DATE` |
 | C-38 | Materialized view drifted (viewdef changed) | `DESTRUCTIVE` `DROP`+`CREATE`+`REFRESH` under a `destructive=APPLY` policy; recreated to canonical form with data |
 | C-39 | Enum type missing; label appended in order | `MISSING` `TYPE`, `ADDITIVE`; then appending one label renders an `ADDITIVE` `ALTER TYPE ... ADD VALUE` |
-| C-40 | Enum with a removed or reordered label | manual `DESTRUCTIVE`; default policy throws `PolicyViolationException`; type untouched |
+| C-40 | Enum with a removed or reordered label | manual `DESTRUCTIVE`; default policy fails with `PolicyViolationError`; type untouched |
 | C-41 | Domain missing | `MISSING` `DOMAIN`, `ADDITIVE`, created; then `UP_TO_DATE` |
 | C-42 | Domain drift limited to safe alterations (default, drop not-null, drop check) | `REBUILD` in-place `ALTER DOMAIN`; converges |
-| C-43 | Domain base-type change | manual `DESTRUCTIVE`; default policy throws `PolicyViolationException` |
+| C-43 | Domain base-type change | manual `DESTRUCTIVE`; default policy fails with `PolicyViolationError` |
 | C-44 | Policy missing; policy drifted | `MISSING` `POLICY`, `ADDITIVE` created; a changed `USING` renders `REBUILD` `DROP`+`CREATE` |
 | C-45 | Extension missing | `MISSING` `EXTENSION`, `ADDITIVE`, created in the target namespace; removed by the scratch rollback |
 | C-46 | Comment missing; comment drifted | `COMMENT` `ALTER` changes (`REBUILD`) converge to the desired text |
@@ -927,34 +845,42 @@ Every message raised during a run must name the target namespace and, where appl
 
 This specification defines two conformance targets:
 
-1. A **conforming core** implements every requirement of sections 2–8 and 10 for the packages listed in 2.2, and passes the core test suite shipped with the reference implementation.
-2. A **conforming dialect** implements `studio.epicquest.schema.reconciler.spi.Dialect` for one database product, honours the declarations of its `DialectCapabilities`, and passes `DialectConformanceTest` (9.1) with only declared skips.
+1. A **conforming core** implements every requirement of sections 2–8 and 10 for its language binding, and passes the core test suite shipped with that binding's implementation.
+2. A **conforming dialect** implements the `Dialect` SPI for one database product, honours the declarations of its `DialectCapabilities`, and passes the conformance suite (9.1) with only declared skips.
 
 A product may be described as implementing this specification only when a core and at least one dialect pass their respective conformance suites. Implementations must not claim compatibility on the basis of a partial pass; skipped scenarios (9.1) are the only permitted deviations, and only for declared-unsupported kinds or capabilities. `OTHER` detection (5.4) is exempt from skipping: every conforming dialect must detect it.
 
 ### 9.4 Deliverables
 
-A release of this project ships three deliverables: this document, the reference implementation (the PostgreSQL dialect on the shared core), and the conformance suite (`schema-reconciler-tck`).
+A release of this project must ship, for each supported language binding:
+
+1. the language-neutral specification (this document) and the binding document,
+2. a packaged core implementation,
+3. at least one packaged dialect implementation — the PostgreSQL dialect for the reference implementations,
+4. a packaged or source-distributed conformance suite implementing every scenario of 9.2, and
+5. the shared SQL, fixture and documentation resources needed to reproduce the conformance run.
+
+Package layout, artifact coordinates and publication mechanics are binding-specific and are documented in the implementation folders, not in this specification.
 
 ## 10. Versioning and compatibility
 
 1. Releases follow Semantic Versioning 2.0.0.
-2. Within a major version, the API and model must stay source- and binary-compatible. New SPI methods must be `default` methods. Before 1.0 the SPI may still change signatures, so dialect implementations must be recompiled against each release.
+2. Within a major version, the API and model must stay compatible according to the binding's normal source and binary/package compatibility rules. New SPI operations must be optional or otherwise non-breaking for existing dialect implementations. Before 1.0 the SPI may still change signatures, so dialect implementations must be recompiled or otherwise revalidated against each release.
    - While the major version is 0 the specification version sets the implementation version: a small spec change — an editorial fix, a clarification, a narrow rule — bumps the patch version (`0.9.1`, `0.9.2`); a bigger spec change — new API surface, newly modeled catalog state, a new feature — bumps the minor version (`0.10.0`).
-3. A dialect declares the core major version it was built against via `Dialect.coreMajorVersion()` (6.1). The core must refuse, with `ConfigurationException`, a dialect reporting a different major version than its own.
+3. A dialect declares the core major version it was built against via `Dialect.coreMajorVersion` (6.1). The core must refuse, with `ConfigurationError`, a dialect reporting a different major version than its own.
 4. Changing a dialect's normalisation rules is a breaking change for that dialect, because it can turn equal objects into drifted ones.
-5. Implementations of this specification must run on Java SE 25 or later and must not rely on preview, incubator or deprecated-for-removal APIs.
+5. Every binding must document its minimum runtime/platform version. Implementations must use only stable standard-library facilities available on that baseline and must not rely on preview, experimental, incubator or deprecated-for-removal platform APIs.
 
 ## 11. Open issues
 
-| ID | Issue | Proposed resolution |
+| ID | Issue | Resolution/status |
 |---|---|---|
 | OI-1 | One script per dialect, or one portable script? | One script per dialect. Translation is a non-goal (1.5). |
-| OI-2 | Should version 1 ever drop unexpected objects? | No. Revisit with an explicit `prune` policy in a later version. |
-| OI-3 | Online index builds (`CREATE INDEX CONCURRENTLY` cannot run in a transaction) | Out of scope for version 1; the PostgreSQL profile rejects it (3.2 rule 3). |
+| OI-2 | Should version 1 ever drop unexpected objects? | Resolved: never by default. Version 0.10 added explicit opt-in `prune`, targeted `retire` and `pruneFilter` controls (3.3, 5.5). |
+| OI-3 | Online index builds (`CREATE INDEX CONCURRENTLY` cannot run in a transaction) | Partially resolved: desired scripts still reject non-transactional DDL inside the scratch transaction (3.2 rule 3), while the explicit `concurrentIndexes` apply option permits supported post-commit concurrent index changes (6.4). |
 | OI-4 | Namespace-token replacement (5.3 rule 1) could also match text inside string literals or routine bodies | Matches require an identifier boundary and scripts may not name the target literally (3.2). Matches inside literals remain possible and are symmetric between desired and actual, so they do not cause drift. |
 | OI-5 | Sequence current values differ between scratch and target | Compare sequence options only, never the current value. |
-| OI-6 | DDL applied in one transaction holds its locks (for example `ACCESS EXCLUSIVE` for recreated constraints and indexes) until commit | Locks release at commit (3.5). Applications should reconcile at startup, before taking traffic. |
+| OI-6 | DDL applied in one transaction holds its locks (for example `ACCESS EXCLUSIVE` for recreated constraints and indexes) until commit | Locks release at commit (3.5). Applications should reconcile at startup, before taking traffic; timings and hazard metadata make the locking window observable. |
 
 ## Appendix A. PostgreSQL profile — reference implementation
 
@@ -962,17 +888,17 @@ A release of this project ships three deliverables: this document, the reference
 
 | Capability | Value |
 |---|---|
-| `id()` | `postgresql` |
-| `supports` | `DatabaseMetaData.getDatabaseProductName()` equals `PostgreSQL` and the major version is 14 or later |
+| `id` | `postgresql` |
+| `supports` | the database product metadata product name equals `PostgreSQL` and the major version is 14 or later |
 | `transactionalDdl` | `true` |
 | `sessionDefaultNamespace` | `true` (`search_path`) |
 | `supportedKinds` | all kinds except `OTHER` |
 
 ### A.2 Locking
 
-**Access preflight (`checkAccess`).** Before the lock, the dialect resolves the target namespace with `to_regnamespace` — a null result fails the run with `ConfigurationException`, because PostgreSQL silently ignores a `search_path` entry that names a missing schema and applied DDL would land in the wrong namespace — and checks `has_schema_privilege(current_user, <namespace>, 'USAGE')` and, separately, `'CREATE'` (a comma-separated list means *any of*, so the two privileges must not share one call), failing with `ConfigurationException` when the connecting role lacks either. The namespace is passed to `to_regnamespace` as a quoted identifier so mixed-case names resolve exactly. When no `scratchDataSource` is configured it also checks `has_database_privilege(current_user, 'CREATE')`, the privilege scratch-schema creation needs, and fails with `ConfigurationException` naming the missing privilege (5.1 step 1).
+**Access preflight (`checkAccess`).** Before the lock, the dialect resolves the target namespace with `to_regnamespace` — a null result fails the run with `ConfigurationError`, because PostgreSQL silently ignores a `search_path` entry that names a missing schema and applied DDL would land in the wrong namespace — and checks `has_schema_privilege(current_user, <namespace>, 'USAGE')` and, separately, `'CREATE'` (a comma-separated list means *any of*, so the two privileges must not share one call), failing with `ConfigurationError` when the connecting role lacks either. The namespace is passed to `to_regnamespace` as a quoted identifier so mixed-case names resolve exactly. When no `scratchDataSource` is configured it also checks `has_database_privilege(current_user, 'CREATE')`, the privilege scratch-schema creation needs, and fails with `ConfigurationError` naming the missing privilege (5.1 step 1).
 
-`SELECT pg_advisory_lock(hashtextextended(:key, 0))` with `:key = 'studio.epicquest.schema.reconciler:' || <database> || ':' || <namespace>`, under `SET LOCAL lock_timeout` set to the reconciler's `lockTimeout`. The namespace lock is session-scoped: it must survive the intermediate commit that precedes `nonTransactional` (`CONCURRENTLY`) work, and the engine must release it — with the matching `pg_advisory_unlock` — in `Session.close()` on every exit path, plan, reconcile, apply, dump, successful or failed. Once the lock is held, the dialect must run `SET LOCAL lock_timeout = DEFAULT`, so that the reconciler's timeout does not also govern lock waits of the applied DDL; those follow the session's own setting. Session-level advisory locks are not undone by a rollback, so a lock taken by the script — directly, or inside a function it invoked — would outlive the scratch run. Immediately after the scratch rollback, and again before returning the scratch connection, the dialect must release every advisory lock held on that connection except the run's own namespace lock when scratch shares the target connection; `pg_advisory_unlock_all()` is permitted only when the scratch work runs on a separate `scratchDataSource` connection that cannot hold the namespace lock. The final `releaseLock` then removes exactly the namespace lock.
+`SELECT pg_advisory_lock(hashtextextended(<key>, 0))` with `<key> = 'studio.epicquest.schema.reconciler:' || <database> || ':' || <namespace>`, under `SET LOCAL lock_timeout` set to the reconciler's `lockTimeout`. The namespace lock is session-scoped: it must survive the intermediate commit that precedes `nonTransactional` (`CONCURRENTLY`) work, and the engine must release it — with the matching `pg_advisory_unlock` — when the session is closed on every exit path, plan, reconcile, apply, dump, successful or failed. Once the lock is held, the dialect must run `SET LOCAL lock_timeout = DEFAULT`, so that the reconciler's timeout does not also govern lock waits of the applied DDL; those follow the session's own setting. Session-level advisory locks are not undone by a rollback, so a lock taken by the script — directly, or inside a function it invoked — would outlive the scratch run. Immediately after the scratch rollback, and again before returning the scratch connection, the dialect must release every advisory lock held on that connection except the run's own namespace lock when scratch shares the target connection; `pg_advisory_unlock_all()` is permitted only when the scratch work runs on a separate `scratchDataSource` connection that cannot hold the namespace lock. The final `releaseLock` then removes exactly the namespace lock.
 
 When `statementTimeout` is configured, the dialect applies it immediately after the lock as `SET LOCAL statement_timeout = <millis>`; being transaction-scoped it needs no explicit restore and never bounds the lock wait itself. With a separate `scratchDataSource` the engine applies the same bound on the scratch connection too — one `SET LOCAL` cannot cross connections, so without this the desired script and scratch snapshot read would run unbounded. It bounds *every* statement of the run — catalog reads included — not the total run duration. Note that inspection itself can stall: catalog getters such as `pg_get_expr` open the relation they deparse with `AccessShareLock`, so reading a schema that holds an `ACCESS EXCLUSIVE`-locked table can block until `statement_timeout` cancels the query.
 
@@ -980,13 +906,13 @@ When `statementTimeout` is configured, the dialect applies it immediately after 
 
 Inside the run's transaction: `SAVEPOINT rcl_scratch`, `CREATE SCHEMA <scratch>`, execute the script, read the snapshot, then `ROLLBACK TO SAVEPOINT rcl_scratch`. The scratch schema never becomes visible to other sessions.
 
-After the script, the dialect must confirm that the transaction is still open and that the savepoint exists (3.2 rule 3), for example by checking that `ROLLBACK TO SAVEPOINT rcl_scratch` succeeds. If the script committed, the dialect must run `DROP SCHEMA <scratch> CASCADE` and raise `DesiredStateException`.
+After the script, the dialect must confirm that the transaction is still open and that the savepoint exists (3.2 rule 3), for example by checking that `ROLLBACK TO SAVEPOINT rcl_scratch` succeeds. If the script committed, the dialect must run `DROP SCHEMA <scratch> CASCADE` and raise `DesiredStateError`.
 
 With `scratchDataSource` (6.3.2), the same sequence runs on the scratch connection in its own transaction: `BEGIN`, `SAVEPOINT rcl_scratch`, `CREATE SCHEMA <scratch>`, execute the script, read the snapshot, `ROLLBACK TO SAVEPOINT rcl_scratch`, after which the engine rolls the scratch transaction back. The namespace lock is taken only on the target connection.
 
 ### A.4 Script execution
 
-The whole script is sent in one `Statement.execute` call. The server parses it, so dollar-quoted bodies need no client-side splitting.
+The whole script is sent in one multi-statement execution request. The server parses it, so dollar-quoted bodies need no client-side splitting.
 
 **Least-privilege role.** The connecting role for `plan()`/`reconcile()`/`apply()` needs exactly `USAGE` and `CREATE` on the target schema plus `CREATE` on the database that hosts the scratch namespace:
 
@@ -1025,7 +951,7 @@ Where `CREATE ON DATABASE` cannot be granted, a separate `scratchDataSource` (6.
 | `STATISTICS` | `pg_statistic_ext` | `pg_get_statisticsobjdef(oid)` — the enabled kinds, column/expression list and source table; `stxstattarget` is a per-column planner property and stays outside the canonical |
 | `RULE` | `pg_rewrite` (`rulename` not `_RETURN`, which is part of its view) | `pg_get_ruledef(oid, true)` plus the enabled state (`ev_enabled`) |
 | `COLLATION` | `pg_collation` (provider `libc`/`icu`, encoding `-1` or this database's) | provider plus the provider-specific fields (`collcollate`/`collctype`, `collencoding`, `colllocale`, `collicurules`, `collisdeterministic`); `collversion` is environment metadata and excluded |
-| `CONVERSION` | `pg_conversion` (`condefault` false — `DEFAULT` is a database-wide object word a script cannot express) | source/target encoding names plus the conversion function (`regproc`) |
+| `CONVERSION` | `pg_conversion` (`condefault` false — `DEFAULT` is database-wide state a script cannot express) | source/target encoding names plus the conversion function (`regproc`) |
 | `TEXT_SEARCH_TEMPLATE` | `pg_ts_template` | `tmplinit` and `tmpllexize` as `regproc` text (`INIT` omitted when unset); composed — no `pg_get_*def` exists |
 | `TEXT_SEARCH_PARSER` | `pg_ts_parser` | `prsstart`, `prstoken`, `prsend`, `prsheadline` (omitted when unset), `prslextype` as `regproc` text; composed |
 | `TEXT_SEARCH_DICTIONARY` | `pg_ts_dict` | the `dicttemplate` reference plus `dictinitoption` verbatim; composed |
@@ -1214,29 +1140,35 @@ Partitioned parent indexes (`pg_class.relkind = 'I'`) are managed `INDEX` object
 
 1. Replace the literal namespace qualifier (for example `svc.`) in the deployment script `db/schema.sql` with `${namespace}.`.
 2. Remove the deployment-only statements that violate the script constraints of 3.2 — `CREATE SCHEMA IF NOT EXISTS svc;` and `SELECT pg_advisory_lock(...)` — because the library owns namespace binding and locking. (`pg_advisory_lock` would otherwise leak a session-level lock onto the pooled connection: it is not released by rollback.)
-3. Replace the hand-written reconcile routine with a `SchemaReconciler.builder()` call configured for the target namespace, and delete the duplicated expected-state maps (of tables, constraints, indexes and views).
+3. Replace the hand-written reconcile routine with a `SchemaReconciler` configured for the target namespace, and delete the duplicated expected-state maps (of tables, constraints, indexes and views).
 4. Keep the application's existing reconcile tests as a regression suite until the TCK covers the same scenarios.
+
 
 ## Appendix B. Example
 
-```java
-var reconciler = SchemaReconciler.builder()
-        .dataSource(dataSource)
-        .namespace("svc")
-        .desiredState(DesiredState.ofResource(getClass().getClassLoader(), "db/schema.sql"))
-        .build();
+The exact construction syntax differs by language binding; the logical configuration is the same:
 
-var report = reconciler.reconcile();
-log.info("schema {}: {} applied, {} reported, {} unexpected",
-        report.outcome(), report.applied().size(), report.reported().size(), report.unexpected().size());
+```text
+reconciler = SchemaReconciler configured with {
+    data source: the application data source,
+    namespace: "svc",
+    desired state: UTF-8 script loaded from "db/schema.sql"
+}
+
+report = execute reconcile(reconciler)
+log("schema svc", count(report.applied), "applied",
+    count(report.reported), "reported",
+    count(report.unexpected), "unexpected")
 ```
 
 Dry run for review:
 
-```java
-var plan = reconciler.plan();
-Files.writeString(Path.of("schema-plan.sql"), plan.toSql());
+```text
+plan = execute plan(reconciler)
+write UTF-8 file "schema-plan.sql" containing toSql(plan)
 ```
+
+See the [Java](java/BINDING.md), [TypeScript](typescript/BINDING.md) and [Go](go/BINDING.md) bindings for executable examples in each implementation language.
 
 ## Appendix C. PostgreSQL 14–19 feature coverage and test corpus
 
@@ -1291,32 +1223,3 @@ A second rejected group is everything whose catalog effect the snapshot cannot r
 | `java/fixtures/corpus/corpus-01.sql` … `corpus-09.sql` | nine anonymized production schemas (all identifiers obfuscated, comments stripped, schema name normalised to `fixture`). corpus-01 exercises extensions (`vector`, `pg_trgm`), generated columns, composite foreign keys over bare unique indexes, triggers and routines; corpus-07 exercises RLS policies, `GRANT`s, `security_invoker` views and a `DO` block reading `pg_catalog`; all exercise `CREATE OR REPLACE` views, expression/partial indexes and dollar-quoted bodies | `CorpusFixtureTest` — auto-discovers every `corpus-*.sql`, reconciles + idempotent re-run; policy-bearing files run under `unsupported=REPORT` |
 
 Dollar-quoted PL/pgSQL bodies in the corpus contain semicolons, so client-side statement splitting is invalid — reinforcing P1. The corpus files are a compatibility corpus, not a migration source of truth.
-
-## Appendix D. TypeScript binding
-
-The TypeScript implementation (`@epicquest-studios/schema-reconciler-core`, `@epicquest-studios/schema-reconciler-postgresql`, `@epicquest-studios/schema-reconciler-tck` — npm workspaces mirroring `schema-reconciler-core`, `schema-reconciler-postgresql`, `schema-reconciler-tck`) binds this specification with the following mechanical mapping. Everything sections 1–11 and Appendix A require applies unchanged; only the API *surface* is transformed, never the behaviour.
-
-### D.1 Asynchrony
-
-Every Java SPI/API method that performs I/O — `SqlConnection` operations, `Dialect` catalog and script methods, `Dialect.resolve`, `plan()`, `planTimed()`, `reconcile()`, `apply()`, `dump()` — returns `Promise` in TypeScript and is awaited at the same point the Java code blocks. Phase order, exception types and listener callbacks are unchanged. `Dialect.supports`, `render`, `quoteIdentifier`, `capabilities`, `nameScopes`, `coveredChildren` and `dumpStatements` stay synchronous, matching their Java signatures. `ReconcileListener` callbacks may return `void` or `Promise<void>` and are always awaited.
-
-### D.2 Platform types
-
-- `javax.sql.DataSource`/`java.sql.Connection` → the SPI's own `SqlDataSource`/`SqlConnection` interfaces (one dedicated session per connection — a `pg.PoolClient`, not a pool handle). `setAutoCommit(false)` maps to explicit `BEGIN`; `commit`/`rollback` end it.
-- `java.util.Optional<T>` → `T | undefined`; `List<T>` → `readonly T[]`; `Set<T>` → `ReadonlySet<T>` or `ObjectSet`; `Map<K,V>` → `ReadonlyMap<K,V>` or `ObjectMap` (value-keyed by `ObjectId`, as Java records key `HashMap` by value).
-- Records → classes with `readonly` fields, defensive copies and `Object.freeze`; enums → `const` object + union type in the same declaration order (ordinal semantics, 5.2, are preserved); `java.time.Duration` → `Duration` with `ofMillis`/`ofSeconds`/`ofNanos`/`ZERO`, stored as fractional milliseconds. `ObjectSet`/`Map` contents inside `SchemaObject` are shallow-frozen at runtime and readonly at compile time.
-- `IllegalArgumentException` → `IllegalArgumentError`; null-argument checks → `TypeError`; `System.Logger` warnings → `console.warn`.
-
-### D.3 API deltas
-
-- `DesiredState.ofResource(ClassLoader, name)` has no analog — Node has no classpath; `ofPath`/`ofScript` cover the contract.
-- Dialect discovery is the explicit `registerDialect`/`registeredDialects` registry plus the `dialect` builder option, replacing `ServiceLoader`; `DialectResolver` selection semantics (explicit first, then single-supports match, identical error shapes) are unchanged.
-- Plan metadata retention uses a `WeakMap` keyed by the plan object — the same identity-keyed, GC-purged semantics the Java `WeakHashMap` + `IdentityKey` wrapper provides.
-- `ReconcileListener.NONE` is replaced by the builder's default `{}` listener.
-- `int8` catalog values may arrive as strings (the `pg` driver's precision-safe default); identity and sequence option reads use exact-string semantics so rendered SQL keeps the full value.
-
-TypeScript exposes the 0.11 additions with idiomatic typing: `externalPartitions(parentTable, match?)` accepts a prefix string, `RegExp`, partition predicate, or a `(parentTable, partitionName)` predicate; `pruneFilter` and `retire` take the same object ids as Java; hooks are async-capable objects `{ id, phase, order?, runOnce?, checksum?, run(ctx) }`, `HookContext.connection` is the `HookSqlExecutor` (`execute`/`query`) surface, and `PgHookStore.inSchema(schema)` / `.of(schema, table?)` implements `HookStore`. Go exposes the same surface as `ExternalPartitions`, `ExternalPartitionsPrefix`, `ExternalPartitionsFunc`, `Retire`, `PruneFilter`, `Hook`, `HookStore`, `SchemaHook`, `HookContext`, and `postgresql.NewHookStore`.
-
-### D.4 Conformance
-
-The TCK package exposes `dialectConformanceSuite(spec)` — the same C-01…C-67 scenario ids the Java `DialectConformanceTest` declares, verified 1:1 against the table in 9.2 — executed under `node:test`. The fixture files, `PgScriptCheck` spec-lists, the fuzz templates and this document's pseudocode are shared verbatim. TypeScript sources are erasable-syntax-only (no `enum`, `namespace` or parameter properties) so in-repo tests run directly under Node's native type stripping and `tsc --noEmit` performs typechecking; published packages ship compiled ESM (`dist/*.js`) plus declarations, because Node does not type-strip files under `node_modules`.

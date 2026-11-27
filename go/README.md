@@ -1,6 +1,7 @@
 # schema-reconciler — Go
 
-Go port of [SPEC.md](../SPEC.md). See the [root README](../README.md)
+Go implementation of the language-neutral [SPEC.md](../SPEC.md), under the
+normative [Go binding](BINDING.md). See the [root README](../README.md)
 for what schema reconciliation is and how the engine works.
 
 ## Packages

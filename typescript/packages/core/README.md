@@ -1,8 +1,8 @@
 # @epicquest-studios/schema-reconciler-core
 
 Vendor-neutral, declarative, data-safe schema reconciliation — API, SPI
-and engine. TypeScript binding of [SPEC.md](../../../SPEC.md)
-(Appendix D).
+and engine. TypeScript implementation of [SPEC.md](../../../SPEC.md)
+under the [TypeScript binding](../../BINDING.md).
 
 Brings a database namespace to the state declared in a SQL script:
 plans, applies and verifies changes, and never drops data by default.

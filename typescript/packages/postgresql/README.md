@@ -1,7 +1,8 @@
 # @epicquest-studios/schema-reconciler-postgresql
 
 PostgreSQL 14+ dialect for the schema reconciler — TypeScript binding
-of [SPEC.md](../../../SPEC.md) (Appendix D, PostgreSQL profile).
+of [SPEC.md](../../../SPEC.md) (PostgreSQL profile) under the
+[TypeScript binding](../../BINDING.md).
 
 ```ts
 import { SchemaReconciler, DesiredState }

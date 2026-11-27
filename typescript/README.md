@@ -1,14 +1,15 @@
 # schema-reconciler — TypeScript
 
-TypeScript port of [SPEC.md](../SPEC.md), following the normative
-binding in **Appendix D**. See the [root README](../README.md) for what
-schema reconciliation is and how the engine works.
+TypeScript implementation of the language-neutral [SPEC.md](../SPEC.md),
+under the normative [TypeScript binding](BINDING.md). See the
+[root README](../README.md) for what schema reconciliation is and how the
+engine works.
 
 ## Packages
 
 | Package | Contents |
 |---|---|
-| `@epicquest-studios/schema-reconciler-core` | API, SPI, core algorithm (Promise-based; see SPEC.md Appendix D) |
+| `@epicquest-studios/schema-reconciler-core` | API, SPI, core algorithm (Promise-based; see [BINDING.md](BINDING.md)) |
 | `@epicquest-studios/schema-reconciler-postgresql` | PostgreSQL dialect |
 | `@epicquest-studios/schema-reconciler-tck` | Dialect conformance suite (`node:test`) |
 

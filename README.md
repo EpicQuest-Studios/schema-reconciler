@@ -22,7 +22,7 @@ What is missing is an embeddable library where the *desired state is declared on
 This repository contains two things:
 
 1. **A specification** ([SPEC.md](SPEC.md)) that defines a vendor-neutral reconciliation contract: an API for applications, a `Dialect` SPI implemented once per database product, the reconciliation algorithm shared by all dialects, a 67-scenario conformance suite (TCK) every dialect must pass, and a PostgreSQL profile. The specification exists so the same contract can be implemented for other relational databases and other languages.
-2. **Two implementations** of that specification: the Java reference implementation ([java/](java/)) and an independent TypeScript port ([typescript/](typescript/)) following the Appendix D binding.
+2. **Three implementations** of that specification: Java ([java/](java/)), TypeScript ([typescript/](typescript/)) and Go ([go/](go/)). Their language-specific API mappings are defined by the binding documents in each implementation directory.
 
 ## How it works
 
@@ -36,14 +36,15 @@ This repository contains two things:
 
 | Path | Contents |
 |---|---|
-| [SPEC.md](SPEC.md) | The vendor-neutral contract (normative; Appendix D is the TypeScript binding) |
+| [SPEC.md](SPEC.md) | The language-neutral, vendor-neutral contract (normative) |
 | [docs/adr/](docs/adr/) | Architectural decision records |
-| [sql/postgresql/](sql/postgresql/) | Shared PostgreSQL catalog SQL queries loaded by both Java and TypeScript |
+| [sql/postgresql/](sql/postgresql/) | Shared PostgreSQL catalog SQL queries loaded by all three implementations |
 | [java/](java/README.md) | Java reference implementation — core, PostgreSQL dialect, TCK |
-| [typescript/](typescript/README.md) | TypeScript port — same three packages on `node:test` |
+| [typescript/](typescript/README.md) | TypeScript implementation — same three packages on `node:test` |
+| [go/](go/README.md) | Go implementation — core, PostgreSQL dialect and `testing`-based TCK |
 | [java/fixtures/](java/fixtures/) | Shared test fixtures (deployment + obfuscated schema corpus) |
 
-Java specifics — artifacts, Maven coordinates, JDBC usage, JPMS — are in [java/README.md](java/README.md). TypeScript specifics — npm packages, the `SqlDataSource` adapter, Promise-based API — are in [typescript/README.md](typescript/README.md).
+Language bindings are normative in [java/BINDING.md](java/BINDING.md), [typescript/BINDING.md](typescript/BINDING.md) and [go/BINDING.md](go/BINDING.md). Implementation usage and release mechanics are documented in [java/README.md](java/README.md), [typescript/README.md](typescript/README.md) and [go/README.md](go/README.md).
 
 See [SPEC.md](SPEC.md) for the full contract — including the PostgreSQL 14–19 feature-coverage matrix and the schema-corpus description in Appendix C.
 
